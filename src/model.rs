@@ -66,6 +66,7 @@ pub struct FileFacts {
 pub enum Lang {
     Rust,
     Python,
+    TypeScript,
 }
 
 #[derive(Serialize)]
@@ -130,7 +131,7 @@ impl Module {
     pub fn name_segs(&self) -> Vec<String> {
         let sep = match self.lang {
             Lang::Rust => "::",
-            Lang::Python => ".",
+            Lang::Python | Lang::TypeScript => ".",
         };
         self.name.split(sep).map(|s| s.to_string()).collect()
     }

@@ -3,8 +3,8 @@
 Deterministic AST skeleton maps of a codebase, built for ultra-dense context
 injection into coding agents (Claude Code in particular).
 
-`ctx` parses Rust and Python sources with tree-sitter, strips every
-implementation body, and emits a compact, deterministic topology map:
+`ctx` parses Rust, Python, and TypeScript/TSX sources with tree-sitter, strips
+every implementation body, and emits a compact, deterministic topology map:
 
 - **Nodes** — modules, structs/enums/traits/impls, classes, functions
   (signature + file + line).
@@ -78,8 +78,9 @@ each level adds a whole category, so token spend buys precision, not noise:
 
 On a mid-size repo (70 files) skeleton is ~3k tokens — cheap enough for the
 first turn of every session. Rust visibility is `pub`-based; Python uses the
-underscore convention (dunders like `__init__` count as public). Trait
-methods and trait impls are always interface.
+underscore convention (dunders like `__init__` count as public); TypeScript
+uses the `export` keyword (public class methods are interface, `private`/`#`
+members are dropped). Trait methods and trait impls are always interface.
 
 ## Output shape
 
@@ -129,7 +130,10 @@ skip the file entirely and have sessions run `ctx map` at boot; generation is
   fields and enum variants are kept inline because they carry architectural
   signal at negligible token cost.
 - **Module names** are path-derived: `src/` components are dropped,
-  `mod.rs`/`lib.rs`/`main.rs`/`__init__.py` collapse into their directory. In
+  `mod.rs`/`lib.rs`/`main.rs`/`__init__.py`/`index.ts`/`index.tsx` collapse into
+  their directory. TypeScript import specifiers are resolved as paths —
+  relative `./x`/`../y` against the importing file's directory, bare names
+  (`react`, `@/…` aliases) as external. In
   workspaces, components before `src/` become the crate prefix
   (`crates/foo/src/bar.rs` → `crates::foo::bar`), and `crate::` paths resolve
   against that prefix.
@@ -165,6 +169,8 @@ skip the file entirely and have sessions run `ctx map` at boot; generation is
   generic bounds stay unresolved unless the method name is unique), calls
   inside nested functions are attributed to the enclosing item.
 
-Adding a language = one extractor file implementing
-`extract(src) -> (Vec<Item>, Vec<String /* raw imports */>)` plus the
-tree-sitter grammar crate.
+Adding a language = one extractor file producing a `FileFacts` (items,
+imports, re-export bindings, defined names) plus the tree-sitter grammar
+crate — and, for a language that resolves imports by path rather than by name
+(as TypeScript does), a `candidates()` branch that maps a specifier to
+absolute module segments.

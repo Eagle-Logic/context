@@ -36,7 +36,7 @@ fn transform_item(mut it: Item, view: View, lang: Lang) -> Option<Item> {
     match view {
         View::Full => Some(it),
         View::Skeleton => match it.kind.as_str() {
-            "struct" | "enum" | "trait" | "class" => {
+            "struct" | "enum" | "trait" | "class" | "interface" | "type" => {
                 if let Some(n) = &it.name {
                     it.signature = format!("{} {}", it.kind, n);
                 }
@@ -82,6 +82,24 @@ fn is_public(it: &Item, lang: Lang) -> bool {
             Some(n) => !n.starts_with('_') || (n.starts_with("__") && n.ends_with("__")),
             None => true,
         },
+        // Exported top-level items are prefixed `export`; a non-exported
+        // top-level declaration starts with a declaration keyword. Anything
+        // else (a public class method like `compute()`) is interface.
+        Lang::TypeScript => {
+            let s = it.signature.as_str();
+            s.starts_with("export")
+                || ![
+                    "function ",
+                    "const ",
+                    "class ",
+                    "abstract ",
+                    "interface ",
+                    "type ",
+                    "enum ",
+                ]
+                .iter()
+                .any(|k| s.starts_with(k))
+        }
     }
 }
 

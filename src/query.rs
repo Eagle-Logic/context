@@ -41,7 +41,7 @@ pub fn neighbors<'a>(
 fn sep_of(m: &Module) -> &'static str {
     match m.lang {
         Lang::Rust => "::",
-        Lang::Python => ".",
+        Lang::Python | Lang::TypeScript => ".",
     }
 }
 
@@ -390,6 +390,23 @@ mod tests {
         assert!(up.iter().any(|m| m.name == "a"), "a is upstream of b");
         assert!(down.iter().any(|m| m.name == "c"), "c is downstream of b");
         assert!(!up.iter().any(|m| m.name == "c"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn typescript_relative_import_resolves_module_and_callers() {
+        let (g, dir) = graph(&[
+            ("src/api/client.ts", "export function apiGet() {}\n"),
+            (
+                "src/App.tsx",
+                "import { apiGet } from './api/client';\nexport function App() { apiGet(); }\n",
+            ),
+        ]);
+        let app = g.modules.iter().find(|m| m.name == "App").unwrap();
+        assert!(app.deps.iter().any(|d| d == "api.client"), "{:?}", app.deps);
+        let out = callers(&g, "apiGet", false);
+        assert!(out.contains("App.App"), "{out}");
+        assert!(out.contains("api.client.apiGet"), "{out}");
         let _ = fs::remove_dir_all(dir);
     }
 

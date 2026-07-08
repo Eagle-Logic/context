@@ -1,6 +1,6 @@
 [package]
 name = "context"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Deterministic AST skeleton maps of a codebase for agent context injection"
 
@@ -17,6 +17,7 @@ serde_json = "1"
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-python = "0.25"
+tree-sitter-typescript = "0.23"
 
 [profile.release]
 lto = true

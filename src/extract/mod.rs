@@ -1,5 +1,6 @@
 pub mod python;
 pub mod rust;
+pub mod typescript;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -44,10 +45,13 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
         {
             continue;
         }
-        if matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("rs") | Some("py")
-        ) {
+        let take = match path.extension().and_then(|e| e.to_str()) {
+            Some("rs") | Some("py") | Some("tsx") => true,
+            // Skip `.d.ts` — ambient type declarations carry no topology.
+            Some("ts") => !path.to_str().is_some_and(|s| s.ends_with(".d.ts")),
+            _ => false,
+        };
+        if take {
             files.push(path.to_path_buf());
         }
     }
@@ -60,9 +64,11 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
             Err(_) => continue,
         };
         let rel = path.strip_prefix(&root).unwrap_or(path);
-        let lang = match path.extension().and_then(|e| e.to_str()) {
+        let ext = path.extension().and_then(|e| e.to_str());
+        let lang = match ext {
             Some("rs") => Lang::Rust,
             Some("py") => Lang::Python,
+            Some("ts") | Some("tsx") => Lang::TypeScript,
             _ => continue,
         };
         let mut facts = match lang {
@@ -72,9 +78,15 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
             Lang::Python => {
                 python::extract(&src).with_context(|| format!("parsing {}", rel.display()))?
             }
+            Lang::TypeScript => typescript::extract(&src, ext == Some("tsx"))
+                .with_context(|| format!("parsing {}", rel.display()))?,
         };
-        let is_package =
-            lang == Lang::Python && rel.file_name().and_then(|f| f.to_str()) == Some("__init__.py");
+        let file_name = rel.file_name().and_then(|f| f.to_str());
+        let is_package = match lang {
+            Lang::Python => file_name == Some("__init__.py"),
+            Lang::TypeScript => matches!(file_name, Some("index.ts") | Some("index.tsx")),
+            _ => false,
+        };
         // Any Python module can be imported through, but only __init__.py
         // bindings read as intentional re-exports worth rendering.
         if lang == Lang::Python && !is_package {
@@ -135,6 +147,7 @@ fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>) {
         let drop = match lang {
             Lang::Rust => matches!(stem, "mod" | "lib" | "main"),
             Lang::Python => stem == "__init__",
+            Lang::TypeScript => stem == "index",
         };
         if !drop {
             segs.push(stem.to_string());
@@ -144,7 +157,7 @@ fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>) {
     let name = if segs.is_empty() {
         match lang {
             Lang::Rust => "crate".to_string(),
-            Lang::Python => "root".to_string(),
+            Lang::Python | Lang::TypeScript => "root".to_string(),
         }
     } else {
         segs.join(sep(lang))
@@ -155,7 +168,7 @@ fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>) {
 fn sep(lang: Lang) -> &'static str {
     match lang {
         Lang::Rust => "::",
-        Lang::Python => ".",
+        Lang::Python | Lang::TypeScript => ".",
     }
 }
 
@@ -258,6 +271,50 @@ fn candidates(imp: &str, m: &Module) -> (Vec<Vec<String>>, bool) {
                     (vec![[base, raw[n..].to_vec()].concat()], true)
                 }
                 _ => (vec![raw], false),
+            }
+        }
+        Lang::TypeScript => {
+            if imp.starts_with('.') {
+                // Relative specifier `./a/b`, `../a`: resolve against the
+                // importing module's directory, one climb per `..`.
+                let parts: Vec<&str> = imp.split('/').collect();
+                let mut climb = 0usize;
+                let mut i = 0;
+                while i < parts.len() && matches!(parts[i], "." | "..") {
+                    if parts[i] == ".." {
+                        climb += 1;
+                    }
+                    i += 1;
+                }
+                let rest: Vec<String> = parts[i..]
+                    .iter()
+                    .flat_map(|p| p.split('.'))
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let cur = m.name_segs();
+                let dir_len = if m.is_package {
+                    cur.len()
+                } else {
+                    cur.len().saturating_sub(1)
+                };
+                let base = cur[..dir_len.saturating_sub(climb)].to_vec();
+                (vec![[base, rest].concat()], true)
+            } else {
+                // Bare/alias/member path (`react`, `a.b.c`): may be external.
+                let segs: Vec<String> = imp
+                    .split(['/', '.'])
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if segs.is_empty() {
+                    return (Vec::new(), false);
+                }
+                let mut cands = vec![segs.clone()];
+                if segs.len() > 1 {
+                    cands.push(segs[1..].to_vec());
+                }
+                (cands, false)
             }
         }
         Lang::Python => {
