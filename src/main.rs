@@ -95,6 +95,8 @@ implementation bodies.
 - `ctx map --view skeleton` — bird's-eye architecture: modules, deps, type names (cheapest)
 - `ctx map --view interface` — + public signatures, struct fields, enum variants (API surface)
 - `ctx map` — + private items and per-function call edges (`→ callee`) for tracing execution
+  (a trailing `~` on an edge means it was inferred from an opaque receiver, not an import/path —
+  trust it less)
 - `ctx modules` — one line per module with dependency edges
 - `ctx subtree <module> [--view ...]` — one module plus its immediate upstream dependencies
   and downstream dependents

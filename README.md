@@ -141,8 +141,15 @@ skip the file entirely and have sessions run `ctx map` at boot; generation is
   method calls (`.steer()`, `obj.method()`) resolve to the enclosing
   impl/class first, else through a global method index **only when the name
   is unique codebase-wide and not a ubiquitous std method** (`push`, `get`,
-  `items`, ...). Ambiguous or unresolvable calls are dropped, never guessed,
-  so every rendered edge is trustworthy.
+  `items`, ...). Ambiguous or unresolvable calls are dropped, never guessed.
+- **Edge confidence**: an edge backed by a resolved import, path, or
+  `self`/`Self` receiver is trusted. An edge attributed from an *opaque*
+  receiver (`expr.method()`, where the type is unknown) — whether matched to
+  the enclosing impl or a unique method name — is a heuristic guess and is
+  marked with a trailing `~` in `map`/`subtree`/`callers` (and `heuristic:
+  true` in JSON). This surfaces exactly the calls a type-blind resolver can
+  get wrong, so a `~`-free edge can be relied on and a `~` edge invites a
+  glance at the source.
 - **Not captured (yet)**: trait-impl resolution (calls through `dyn Trait` /
   generic bounds stay unresolved unless the method name is unique), calls
   inside nested functions are attributed to the enclosing item.

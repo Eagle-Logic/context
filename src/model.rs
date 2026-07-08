@@ -80,7 +80,7 @@ pub struct Item {
     /// Resolved call edges out of this function (empty for non-functions
     /// and for calls that could not be resolved unambiguously).
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub calls: Vec<String>,
+    pub calls: Vec<Call>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<Item>,
     /// Bare symbol name (impl blocks: the type name); used for resolution.
@@ -91,12 +91,39 @@ pub struct Item {
     pub raw_calls: Vec<RawCall>,
 }
 
+/// One resolved outgoing call edge.
+#[derive(Serialize, Clone)]
+pub struct Call {
+    pub to: String,
+    /// True when the edge was inferred by a receiver-type heuristic
+    /// (enclosing-impl attribution of an opaque receiver, or unique
+    /// method-name lookup) rather than a resolved import/path/definition.
+    #[serde(skip_serializing_if = "is_false")]
+    pub heuristic: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// How a callee was referenced — governs how confidently a receiver method
+/// call can be attributed to a container.
+pub enum Receiver {
+    /// A free function or fully-pathed call: `foo()`, `a::b::foo()`.
+    Free,
+    /// An explicit self/Self receiver (`self.f()`, `Self::f()`): the
+    /// enclosing impl/class is the correct container.
+    SelfType,
+    /// An opaque receiver (`expr.f()`): the type is unknown, so any
+    /// attribution is a heuristic guess.
+    Unknown,
+}
+
 /// One call site: `path` is the callee as written (`build`, `helpers::go`,
-/// `a.b.f`); `method` marks receiver-based calls (`.steer()`, `self.helper()`)
-/// whose receiver type is unknown.
+/// `a.b.f`); `recv` records how the receiver was expressed.
 pub struct RawCall {
     pub path: String,
-    pub method: bool,
+    pub recv: Receiver,
 }
 
 impl Module {

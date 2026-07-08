@@ -1,14 +1,14 @@
 pub mod python;
 pub mod rust;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 
-use crate::model::{Binding, Graph, Item, Lang, Module, RawCall};
+use crate::model::{Binding, Call, Graph, Item, Lang, Module, RawCall, Receiver};
 
 const SKIP_DIRS: &[&str] = &[
     "target",
@@ -185,7 +185,7 @@ fn resolve_deps(modules: &mut [Module]) {
         .map(|(i, m)| (m.name.clone(), i))
         .collect();
 
-    type ModuleResult = (BTreeSet<String>, BTreeSet<String>, Vec<String>, Vec<Vec<String>>);
+    type ModuleResult = (BTreeSet<String>, BTreeSet<String>, Vec<String>, Vec<Vec<Call>>);
     let results: Vec<ModuleResult> = {
         let ctx = Ctx {
             modules: &*modules,
@@ -507,11 +507,20 @@ fn resolve_call(
     m: &Module,
     ctx: &Ctx,
     method_index: &MethodIndex,
-) -> Option<(String, Option<String>)> {
+) -> Option<(String, Option<String>, bool)> {
     let s = sep(m.lang);
 
-    if rc.method {
-        return method_edge(&rc.path, container, m, ctx, method_index);
+    match rc.recv {
+        // `self.f()` / `Self::f()`: the enclosing container is the correct
+        // owner, so an enclosing-impl hit is trustworthy.
+        Receiver::SelfType => {
+            return method_edge(&rc.path, container, m, ctx, method_index, false)
+        }
+        // `expr.f()`: receiver type unknown — any attribution is a guess.
+        Receiver::Unknown => {
+            return method_edge(&rc.path, container, m, ctx, method_index, true)
+        }
+        Receiver::Free => {}
     }
 
     let segs: Vec<&str> = rc.path.split(s).map(str::trim).filter(|x| !x.is_empty()).collect();
@@ -520,7 +529,7 @@ fn resolve_call(
         1 => {
             let name = segs[0];
             if m.defined_names.contains(name) {
-                return Some((name.to_string(), None));
+                return Some((name.to_string(), None, false));
             }
             // `use crate::core::build; build()` / `from x import f; f()`
             let b = m.raw_reexports.iter().find(|b| b.name == name)?;
@@ -531,7 +540,7 @@ fn resolve_call(
         _ => {
             // Type-qualified local call: Engine::new() with Engine defined here.
             if m.defined_names.contains(segs[0]) {
-                return Some((segs.join(s), None));
+                return Some((segs.join(s), None, false));
             }
             // First segment bound by use/import: helpers::go(), np-style aliases.
             if let Some(b) = m.raw_reexports.iter().find(|b| b.name == segs[0]) {
@@ -546,10 +555,10 @@ fn resolve_call(
                 return finish_call(&fm, &fr, m, ctx);
             }
             // Python `obj.method()`: the receiver is opaque, but the trailing
-            // name may still resolve like a method call.
+            // name may still resolve like a method call (heuristic).
             if m.lang == Lang::Python {
                 if let Some(last) = segs.last() {
-                    return method_edge(last, container, m, ctx, method_index);
+                    return method_edge(last, container, m, ctx, method_index, true);
                 }
             }
             None
@@ -565,11 +574,13 @@ fn method_edge(
     m: &Module,
     ctx: &Ctx,
     method_index: &MethodIndex,
-) -> Option<(String, Option<String>)> {
+    receiver_unknown: bool,
+) -> Option<(String, Option<String>, bool)> {
     let s = sep(m.lang);
     if let Some(c) = container {
         if container_has_method(m, c, name) {
-            return Some((format!("{c}{s}{name}"), None));
+            // Reliable for a self receiver; a guess for an opaque one.
+            return Some((format!("{c}{s}{name}"), None, receiver_unknown));
         }
     }
     if STD_METHODS.contains(&name) {
@@ -579,12 +590,14 @@ fn method_edge(
     if owners.len() != 1 {
         return None;
     }
+    // Resolved purely because the method name is unique codebase-wide — a
+    // heuristic, since the receiver type was never confirmed.
     let (om, oc) = owners.iter().next().unwrap();
     let os = sep(ctx.modules[*ctx.by_name.get(om)?].lang);
     if om == &m.name {
-        Some((format!("{oc}{os}{name}"), None))
+        Some((format!("{oc}{os}{name}"), None, true))
     } else {
-        Some((format!("{om}{os}{oc}{os}{name}"), Some(om.clone())))
+        Some((format!("{om}{os}{oc}{os}{name}"), Some(om.clone()), true))
     }
 }
 
@@ -593,7 +606,7 @@ fn finish_call(
     fr: &[String],
     m: &Module,
     ctx: &Ctx,
-) -> Option<(String, Option<String>)> {
+) -> Option<(String, Option<String>, bool)> {
     if fr.is_empty() {
         return None;
     }
@@ -601,11 +614,12 @@ fn finish_call(
     if !target.defined_names.contains(&fr[0]) {
         return None;
     }
+    // Backed by a resolved import/path landing on a defined symbol: trusted.
     let s = sep(target.lang);
     if fm == m.name {
-        Some((fr.join(s), None))
+        Some((fr.join(s), None, false))
     } else {
-        Some((format!("{fm}{s}{}", fr.join(s)), Some(fm.to_string())))
+        Some((format!("{fm}{s}{}", fr.join(s)), Some(fm.to_string()), false))
     }
 }
 
@@ -616,27 +630,37 @@ fn compute_calls(
     m: &Module,
     ctx: &Ctx,
     method_index: &MethodIndex,
-) -> (Vec<Vec<String>>, BTreeSet<String>) {
+) -> (Vec<Vec<Call>>, BTreeSet<String>) {
     fn rec(
         items: &[Item],
         container: Option<&str>,
         m: &Module,
         ctx: &Ctx,
         method_index: &MethodIndex,
-        per_item: &mut Vec<Vec<String>>,
+        per_item: &mut Vec<Vec<Call>>,
         deps: &mut BTreeSet<String>,
     ) {
         for it in items {
-            let mut calls = BTreeSet::new();
+            // Dedup by target; if the same edge resolves both ways, the
+            // trusted (non-heuristic) resolution wins.
+            let mut calls: BTreeMap<String, bool> = BTreeMap::new();
             for rc in &it.raw_calls {
-                if let Some((disp, dep)) = resolve_call(rc, container, m, ctx, method_index) {
-                    calls.insert(disp);
+                if let Some((disp, dep, heur)) = resolve_call(rc, container, m, ctx, method_index) {
+                    calls
+                        .entry(disp)
+                        .and_modify(|h| *h = *h && heur)
+                        .or_insert(heur);
                     if let Some(d) = dep {
                         deps.insert(d);
                     }
                 }
             }
-            per_item.push(calls.into_iter().collect());
+            per_item.push(
+                calls
+                    .into_iter()
+                    .map(|(to, heuristic)| Call { to, heuristic })
+                    .collect(),
+            );
             let next = if matches!(it.kind.as_str(), "impl" | "trait" | "class") {
                 it.name.as_deref()
             } else {
@@ -651,7 +675,7 @@ fn compute_calls(
     (per_item, deps)
 }
 
-fn apply_calls(items: &mut [Item], resolved: &mut std::vec::IntoIter<Vec<String>>) {
+fn apply_calls(items: &mut [Item], resolved: &mut std::vec::IntoIter<Vec<Call>>) {
     for it in items {
         it.calls = resolved.next().unwrap_or_default();
         apply_calls(&mut it.children, resolved);

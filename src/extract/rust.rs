@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
 
-use crate::model::{Binding, FileFacts, Item, RawCall};
+use crate::model::{Binding, FileFacts, Item, RawCall, Receiver};
 
 pub fn extract(src: &str) -> Result<FileFacts> {
     let mut parser = Parser::new();
@@ -187,7 +187,7 @@ fn push_callee(f: Node, src: &str, out: &mut Vec<RawCall>) {
     match f.kind() {
         "identifier" => out.push(RawCall {
             path: text(f, src).to_string(),
-            method: false,
+            recv: Receiver::Free,
         }),
         "scoped_identifier" => {
             let t = strip_turbofish(&collapse(text(f, src)));
@@ -197,12 +197,12 @@ fn push_callee(f: Node, src: &str, out: &mut Vec<RawCall>) {
             if let Some(rest) = t.strip_prefix("Self::") {
                 out.push(RawCall {
                     path: rest.to_string(),
-                    method: true,
+                    recv: Receiver::SelfType,
                 });
             } else {
                 out.push(RawCall {
                     path: t,
-                    method: false,
+                    recv: Receiver::Free,
                 });
             }
         }
@@ -213,9 +213,15 @@ fn push_callee(f: Node, src: &str, out: &mut Vec<RawCall>) {
         }
         "field_expression" => {
             if let Some(field) = f.child_by_field_name("field") {
+                // `self.method()` is reliably the enclosing impl; any other
+                // receiver (`expr.method()`) has an unknown type.
+                let recv = match f.child_by_field_name("value") {
+                    Some(v) if text(v, src) == "self" => Receiver::SelfType,
+                    _ => Receiver::Unknown,
+                };
                 out.push(RawCall {
                     path: text(field, src).to_string(),
-                    method: true,
+                    recv,
                 });
             }
         }

@@ -6,6 +6,9 @@ pub fn markdown(g: &Graph) -> String {
     out.push_str(
         "Deterministic AST skeleton: module topology and signatures only, no implementation bodies.\n",
     );
+    out.push_str(
+        "Call edges: `→ name` resolved via import/path; `name~` inferred by receiver heuristic.\n",
+    );
     out.push_str(&format!(
         "root: {} | files: {} | modules: {}\n\n",
         g.root,
@@ -39,7 +42,18 @@ fn item_md(i: &Item, depth: usize, out: &mut String) {
     out.push_str(&"  ".repeat(depth));
     out.push_str(&format!("- {}  [L{}]", i.signature, i.line));
     if !i.calls.is_empty() {
-        out.push_str(&format!(" → {}", i.calls.join(", ")));
+        let edges: Vec<String> = i
+            .calls
+            .iter()
+            .map(|c| {
+                if c.heuristic {
+                    format!("{}~", c.to)
+                } else {
+                    c.to.clone()
+                }
+            })
+            .collect();
+        out.push_str(&format!(" → {}", edges.join(", ")));
     }
     if let Some(d) = &i.doc {
         out.push_str(&format!("  — {d}"));

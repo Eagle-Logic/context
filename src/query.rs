@@ -4,7 +4,7 @@
 
 use serde_json::json;
 
-use crate::model::{Graph, Item, Lang, Module};
+use crate::model::{Call, Graph, Item, Lang, Module};
 
 fn sep_of(m: &Module) -> &'static str {
     match m.lang {
@@ -129,7 +129,7 @@ struct Caller {
     qualname: String,
     file: String,
     line: usize,
-    edges: Vec<String>,
+    edges: Vec<Call>,
 }
 
 fn collect_callers(
@@ -141,10 +141,10 @@ fn collect_callers(
 ) {
     let sep = sep_of(m);
     for it in items {
-        let edges: Vec<String> = it
+        let edges: Vec<Call> = it
             .calls
             .iter()
-            .filter(|e| edge_matches(e, q))
+            .filter(|c| edge_matches(&c.to, q))
             .cloned()
             .collect();
         if !edges.is_empty() {
@@ -214,13 +214,27 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
     }
     let mut out = format!("{} caller(s) of '{}':\n\n", found.len(), query);
     for c in &found {
+        let edges: Vec<String> = c
+            .edges
+            .iter()
+            .map(|e| {
+                if e.heuristic {
+                    format!("{}~", e.to)
+                } else {
+                    e.to.clone()
+                }
+            })
+            .collect();
         out.push_str(&format!(
             "{}  ({}:{})  → {}\n",
             c.qualname,
             c.file,
             c.line,
-            c.edges.join(", ")
+            edges.join(", ")
         ));
+    }
+    if found.iter().any(|c| c.edges.iter().any(|e| e.heuristic)) {
+        out.push_str("\n(~ = heuristic edge: attributed by receiver inference, not import/path)\n");
     }
     out
 }
@@ -315,6 +329,32 @@ mod tests {
     fn callers_none_for_uncalled_symbol() {
         let (g, dir) = graph(&[("src/a.rs", "pub fn lonely() {}\n")]);
         assert!(callers(&g, "lonely", false).contains("no callers"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn opaque_receiver_edge_is_flagged_heuristic() {
+        // `w.frobnicate()` — receiver type unknown; resolved only because the
+        // method name is unique codebase-wide, so it must be marked `~`.
+        let (g, dir) = graph(&[
+            ("src/a.rs", "pub struct Widget;\nimpl Widget { pub fn frobnicate(&self) {} }\n"),
+            ("src/b.rs", "use crate::a::Widget;\npub fn run(w: Widget) { w.frobnicate(); }\n"),
+        ]);
+        let out = callers(&g, "frobnicate", false);
+        assert!(out.contains("b::run"), "{out}");
+        assert!(out.contains("frobnicate~"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn self_receiver_edge_is_trusted() {
+        // `self.helper()` is reliably the enclosing impl — never heuristic.
+        let src = "pub struct A;\n\
+                   impl A { pub fn helper(&self) {} pub fn run(&self) { self.helper(); } }\n";
+        let (g, dir) = graph(&[("src/a.rs", src)]);
+        let out = callers(&g, "helper", false);
+        assert!(out.contains("A::run"), "{out}");
+        assert!(!out.contains('~'), "{out}");
         let _ = fs::remove_dir_all(dir);
     }
 }

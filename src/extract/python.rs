@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
 
-use crate::model::{Binding, FileFacts, Item, RawCall};
+use crate::model::{Binding, FileFacts, Item, RawCall, Receiver};
 
 pub fn extract(src: &str) -> Result<FileFacts> {
     let mut parser = Parser::new();
@@ -185,7 +185,7 @@ fn collect_calls(body: Node, src: &str) -> Vec<RawCall> {
                 match f.kind() {
                     "identifier" => out.push(RawCall {
                         path: text(f, src).to_string(),
-                        method: false,
+                        recv: Receiver::Free,
                     }),
                     "attribute" => {
                         let t = collapse(text(f, src));
@@ -197,13 +197,16 @@ fn collect_calls(body: Node, src: &str) -> Vec<RawCall> {
                             if !rest.contains('.') {
                                 out.push(RawCall {
                                     path: rest.to_string(),
-                                    method: true,
+                                    recv: Receiver::SelfType,
                                 });
                             }
                         } else if !t.contains('(') {
+                            // Dotted path `pkg.mod.func` (module-qualified) or
+                            // `obj.method` (opaque receiver, sorted out at
+                            // resolution by whether the path resolves).
                             out.push(RawCall {
                                 path: t,
-                                method: false,
+                                recv: Receiver::Free,
                             });
                         }
                     }
