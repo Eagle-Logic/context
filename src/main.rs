@@ -1,0 +1,188 @@
+mod extract;
+mod model;
+mod render;
+mod view;
+
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::PathBuf;
+
+use anyhow::{bail, Result};
+use clap::{Parser, Subcommand, ValueEnum};
+
+use model::Module;
+use view::View;
+
+#[derive(Parser)]
+#[command(
+    name = "ctx",
+    version,
+    about = "Deterministic AST skeleton maps of a codebase for agent context injection"
+)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Format {
+    Md,
+    Json,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Generate the full structural map (Strategy A: map-first boot sequence)
+    Map {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, value_enum, default_value_t = Format::Md)]
+        format: Format,
+        /// Detail level: skeleton (architecture only), interface (public API),
+        /// full (private items + call edges)
+        #[arg(long, value_enum, default_value_t = View::Full)]
+        view: View,
+        /// Write to a file instead of stdout (e.g. CODEBASE_MAP.md)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// One module plus its immediate upstream/downstream neighbors (Strategy B: subtree pruning)
+    Subtree {
+        /// Module name or suffix, e.g. "core::inference" or "inference"
+        module: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, value_enum, default_value_t = Format::Md)]
+        format: Format,
+        /// Detail level: skeleton, interface, or full
+        #[arg(long, value_enum, default_value_t = View::Full)]
+        view: View,
+    },
+    /// Top-level module list with dependency edges (the global high-level map)
+    Modules {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Print the recommended CLAUDE.md discovery-protocol block
+    Snippet,
+}
+
+const SNIPPET: &str = r#"## Codebase Discovery Tools
+
+`ctx` is a deterministic static-analysis CLI for this repo (Rust + Python). Use it to
+orient yourself instead of grepping raw source; only read raw files when you need
+implementation bodies.
+
+- `ctx map --view skeleton` — bird's-eye architecture: modules, deps, type names (cheapest)
+- `ctx map --view interface` — + public signatures, struct fields, enum variants (API surface)
+- `ctx map` — + private items and per-function call edges (`→ callee`) for tracing execution
+- `ctx modules` — one line per module with dependency edges
+- `ctx subtree <module> [--view ...]` — one module plus its immediate upstream dependencies
+  and downstream dependents
+- add `--format json` to any of the above for machine-readable output
+
+Protocol: before modifying or analyzing code, run `ctx map --view skeleton` to load the
+topology. To work on a module, run `ctx subtree <module>` first and follow its call edges.
+If you encounter an unfamiliar type or function, run `ctx subtree` on its defining module
+instead of reading the file. Line anchors (`[L42]`) give exact positions for surgical reads.
+"#;
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::Map {
+            path,
+            format,
+            view,
+            output,
+        } => {
+            let mut g = extract::build_graph(&path)?;
+            view::apply(&mut g, view);
+            let rendered = match format {
+                Format::Md => render::markdown(&g),
+                Format::Json => serde_json::to_string_pretty(&g)?,
+            };
+            match output {
+                Some(file) => {
+                    fs::write(&file, &rendered)?;
+                    eprintln!(
+                        "wrote {} ({} modules, {} bytes)",
+                        file.display(),
+                        g.modules.len(),
+                        rendered.len()
+                    );
+                }
+                None => print!("{rendered}"),
+            }
+        }
+        Cmd::Subtree {
+            module,
+            path,
+            format,
+            view,
+        } => {
+            let mut g = extract::build_graph(&path)?;
+            view::apply(&mut g, view);
+            let targets: Vec<&Module> = g
+                .modules
+                .iter()
+                .filter(|m| {
+                    m.name == module
+                        || m.name.ends_with(&format!("::{module}"))
+                        || m.name.ends_with(&format!(".{module}"))
+                })
+                .collect();
+            if targets.is_empty() {
+                let names: Vec<&str> = g.modules.iter().map(|m| m.name.as_str()).collect();
+                bail!(
+                    "no module matching '{}'. Available modules:\n  {}",
+                    module,
+                    names.join("\n  ")
+                );
+            }
+
+            let target_names: BTreeSet<&str> =
+                targets.iter().map(|m| m.name.as_str()).collect();
+            let upstream_names: BTreeSet<&str> = targets
+                .iter()
+                .flat_map(|m| m.deps.iter().map(|d| d.as_str()))
+                .filter(|d| !target_names.contains(d))
+                .collect();
+            let upstream: Vec<&Module> = g
+                .modules
+                .iter()
+                .filter(|m| upstream_names.contains(m.name.as_str()))
+                .collect();
+            let downstream: Vec<&Module> = g
+                .modules
+                .iter()
+                .filter(|m| {
+                    !target_names.contains(m.name.as_str())
+                        && m.deps.iter().any(|d| target_names.contains(d.as_str()))
+                })
+                .collect();
+
+            match format {
+                Format::Md => print!(
+                    "{}",
+                    render::subtree_md(&module, &targets, &upstream, &downstream)
+                ),
+                Format::Json => {
+                    let json = serde_json::json!({
+                        "query": module,
+                        "target": targets,
+                        "upstream": upstream,
+                        "downstream": downstream,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&json)?);
+                }
+            }
+        }
+        Cmd::Modules { path } => {
+            let g = extract::build_graph(&path)?;
+            print!("{}", render::module_list(&g));
+        }
+        Cmd::Snippet => print!("{SNIPPET}"),
+    }
+    Ok(())
+}

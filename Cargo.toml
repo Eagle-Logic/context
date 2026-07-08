@@ -1,0 +1,22 @@
+[package]
+name = "context"
+version = "0.4.0"
+edition = "2021"
+description = "Deterministic AST skeleton maps of a codebase for agent context injection"
+
+[[bin]]
+name = "ctx"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ignore = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+
+[profile.release]
+lto = true
