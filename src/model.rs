@@ -73,6 +73,10 @@ pub struct Item {
     pub kind: String,
     pub signature: String,
     pub line: usize,
+    /// First line of the item's doc comment (Rust `///`) or docstring
+    /// (Python), if present. A cheap semantic label for the signature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
     /// Resolved call edges out of this function (empty for non-functions
     /// and for calls that could not be resolved unambiguously).
     #[serde(skip_serializing_if = "Vec::is_empty")]

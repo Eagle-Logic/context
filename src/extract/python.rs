@@ -89,11 +89,90 @@ fn definition(
         kind: if is_class { "class" } else { "def" }.to_string(),
         signature: clip(&head),
         line: node.start_position().row + 1,
+        doc: body.and_then(|b| docstring(b, src)),
         calls: Vec::new(),
         children,
         name,
         raw_calls,
     });
+}
+
+/// First non-empty line of a def/class docstring: the leading string literal
+/// of the body, if any.
+fn docstring(body: Node, src: &str) -> Option<String> {
+    let mut cursor = body.walk();
+    let first = body.named_children(&mut cursor).next()?;
+    if first.kind() != "expression_statement" {
+        return None;
+    }
+    let mut c2 = first.walk();
+    let s = first.named_children(&mut c2).next()?;
+    if s.kind() != "string" {
+        return None;
+    }
+    strip_py_string(text(s, src))
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(clip_doc)
+}
+
+/// Strip string prefixes (r/b/f/u) and surrounding quotes from a Python
+/// string literal, returning the raw content.
+fn strip_py_string(raw: &str) -> &str {
+    let s = raw.trim_start_matches(['r', 'R', 'b', 'B', 'f', 'F', 'u', 'U']);
+    for q in ["\"\"\"", "'''", "\"", "'"] {
+        if let Some(rest) = s.strip_prefix(q) {
+            return rest.strip_suffix(q).unwrap_or(rest);
+        }
+    }
+    s
+}
+
+fn clip_doc(s: &str) -> String {
+    if s.chars().count() > 100 {
+        let mut out: String = s.chars().take(97).collect();
+        out.push('…');
+        out
+    } else {
+        s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc_of(src: &str) -> Option<String> {
+        extract(src).unwrap().items.into_iter().next().and_then(|i| i.doc)
+    }
+
+    #[test]
+    fn function_docstring_first_line() {
+        let src = "def foo():\n    \"\"\"Summary line.\n\n    More detail.\n    \"\"\"\n    return 1\n";
+        assert_eq!(doc_of(src).as_deref(), Some("Summary line."));
+    }
+
+    #[test]
+    fn class_docstring_single_quotes() {
+        assert_eq!(
+            doc_of("class C:\n    'One liner.'\n    x = 1\n").as_deref(),
+            Some("One liner.")
+        );
+    }
+
+    #[test]
+    fn raw_prefixed_docstring() {
+        assert_eq!(
+            doc_of("def f():\n    r\"\"\"Raw doc.\"\"\"\n    pass\n").as_deref(),
+            Some("Raw doc.")
+        );
+    }
+
+    #[test]
+    fn no_docstring_is_none() {
+        assert_eq!(doc_of("def f():\n    return 1\n"), None);
+    }
 }
 
 /// Walk a function body collecting every call site.

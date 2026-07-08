@@ -37,16 +37,14 @@ pub fn module_md(m: &Module, out: &mut String) {
 
 fn item_md(i: &Item, depth: usize, out: &mut String) {
     out.push_str(&"  ".repeat(depth));
-    if i.calls.is_empty() {
-        out.push_str(&format!("- {}  [L{}]\n", i.signature, i.line));
-    } else {
-        out.push_str(&format!(
-            "- {}  [L{}] → {}\n",
-            i.signature,
-            i.line,
-            i.calls.join(", ")
-        ));
+    out.push_str(&format!("- {}  [L{}]", i.signature, i.line));
+    if !i.calls.is_empty() {
+        out.push_str(&format!(" → {}", i.calls.join(", ")));
     }
+    if let Some(d) = &i.doc {
+        out.push_str(&format!("  — {d}"));
+    }
+    out.push('\n');
     for c in &i.children {
         item_md(c, depth + 1, out);
     }

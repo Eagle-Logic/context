@@ -1,5 +1,6 @@
 mod extract;
 mod model;
+mod query;
 mod render;
 mod view;
 
@@ -63,6 +64,24 @@ enum Cmd {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Locate where a symbol is defined (module, kind, line, signature)
+    Def {
+        /// Symbol name or qualified name, e.g. "SteerConfig" or "Type::method"
+        name: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, value_enum, default_value_t = Format::Md)]
+        format: Format,
+    },
+    /// Reverse call edges: every function that calls the given function/method
+    Callers {
+        /// Callee name or qualified name, e.g. "basename" or "Type::method"
+        name: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, value_enum, default_value_t = Format::Md)]
+        format: Format,
+    },
     /// Print the recommended CLAUDE.md discovery-protocol block
     Snippet,
 }
@@ -79,12 +98,18 @@ implementation bodies.
 - `ctx modules` — one line per module with dependency edges
 - `ctx subtree <module> [--view ...]` — one module plus its immediate upstream dependencies
   and downstream dependents
+- `ctx def <name>` — where a symbol is defined: module, kind, line, and signature (jump-to-def
+  without knowing the module; accepts bare `Foo` or qualified `Type::method`)
+- `ctx callers <name>` — every function that calls the given function/method (resolved reverse
+  call edges — the blast radius before you change a signature; more precise than grep)
 - add `--format json` to any of the above for machine-readable output
 
 Protocol: before modifying or analyzing code, run `ctx map --view skeleton` to load the
 topology. To work on a module, run `ctx subtree <module>` first and follow its call edges.
-If you encounter an unfamiliar type or function, run `ctx subtree` on its defining module
-instead of reading the file. Line anchors (`[L42]`) give exact positions for surgical reads.
+If you encounter an unfamiliar type or function, run `ctx def <name>` (or `ctx subtree` on its
+defining module) instead of reading the file. Before changing a function's signature or
+behavior, run `ctx callers <name>` to see everything that depends on it. Line anchors (`[L42]`)
+give exact positions for surgical reads.
 "#;
 
 fn main() -> Result<()> {
@@ -181,6 +206,17 @@ fn main() -> Result<()> {
         Cmd::Modules { path } => {
             let g = extract::build_graph(&path)?;
             print!("{}", render::module_list(&g));
+        }
+        Cmd::Def { name, path, format } => {
+            let g = extract::build_graph(&path)?;
+            print!("{}", query::def(&g, &name, matches!(format, Format::Json)));
+        }
+        Cmd::Callers { name, path, format } => {
+            let g = extract::build_graph(&path)?;
+            print!(
+                "{}",
+                query::callers(&g, &name, matches!(format, Format::Json))
+            );
         }
         Cmd::Snippet => print!("{SNIPPET}"),
     }

@@ -29,12 +29,27 @@ ctx subtree core::inference ~/projects/myrepo
 # Global high-level view: module list + dependency edges only
 ctx modules ~/projects/myrepo
 
+# Where is a symbol defined? (jump-to-def without knowing the module)
+ctx def SteerConfig ~/projects/myrepo
+ctx def 'Type::method' ~/projects/myrepo   # qualified to disambiguate
+
+# Who calls this? (resolved reverse call edges — the blast radius)
+ctx callers basename ~/projects/myrepo
+
 # Machine-readable graph
 ctx map ~/projects/myrepo --format json
 
 # Print the recommended CLAUDE.md discovery-protocol block
 ctx snippet >> ~/projects/myrepo/CLAUDE.md
 ```
+
+`def` and `callers` accept a bare name (`to_config`) or a qualified name
+(`SteerOverride::to_config`, `pkg.mod.fn`); a bare name lists every match so
+overloads are disambiguated by module + signature. `callers` is the inverse of
+the per-function `→ callee` edges in `map`/`subtree`: it reports only *resolved*
+call sites, so it is precise where a text grep floods on a common method name —
+though it inherits the resolver's heuristics (a receiver `.m()` call is
+attributed to the enclosing impl when the type is unknown).
 
 `subtree` accepts a full module name (`core::inference`, `pkg.utils.validation`)
 or any trailing suffix (`inference`).
@@ -74,6 +89,14 @@ deps: encode
 
 A 71-file Rust repo renders to ~65 KB (~16k tokens) in under half a second —
 the entire architecture fits in one context window with room to spare.
+
+Each item also carries the first line of its doc comment (Rust `///`, Python
+docstring) as a trailing `— summary`, so a signature map doubles as a labeled
+one at negligible token cost:
+
+```markdown
+- pub fn to_config(&self, n_predict: i32) -> SteerConfig  [L317] → NativeSteerInstruction::to_config  — Build a SteerConfig from the explicit knobs (gate bypassed).
+```
 
 ## Claude Code integration
 

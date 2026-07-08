@@ -69,6 +69,7 @@ fn visit(
                         "mod",
                         head_before(child, body, src),
                         child,
+                        src,
                         sub,
                         def_name(child, src),
                     ));
@@ -76,12 +77,12 @@ fn visit(
             }
             "type_item" | "associated_type" | "const_item" | "static_item" => {
                 let sig = clip(collapse(text(child, src)).trim_end_matches(';'));
-                items.push(item(child.kind(), sig, child, Vec::new(), def_name(child, src)));
+                items.push(item(child.kind(), sig, child, src, Vec::new(), def_name(child, src)));
             }
             "macro_definition" => {
                 let name = def_name(child, src);
                 let sig = format!("macro_rules! {}", name.as_deref().unwrap_or("?"));
-                items.push(item("macro", sig, child, Vec::new(), name));
+                items.push(item("macro", sig, child, src, Vec::new(), name));
             }
             _ => {}
         }
@@ -96,7 +97,7 @@ fn function(node: Node, src: &str) -> Item {
             Vec::new(),
         ),
     };
-    let mut it = item("fn", sig, node, Vec::new(), def_name(node, src));
+    let mut it = item("fn", sig, node, src, Vec::new(), def_name(node, src));
     it.raw_calls = raw_calls;
     it
 }
@@ -120,7 +121,7 @@ fn structure(node: Node, src: &str) -> Item {
         // Tuple structs / unit structs: the whole declaration is the signature.
         _ => clip(collapse(text(node, src)).trim_end_matches(';')),
     };
-    item("struct", sig, node, Vec::new(), def_name(node, src))
+    item("struct", sig, node, src, Vec::new(), def_name(node, src))
 }
 
 fn enumeration(node: Node, src: &str) -> Item {
@@ -141,7 +142,7 @@ fn enumeration(node: Node, src: &str) -> Item {
         }
         None => collapse(text(node, src)),
     };
-    item("enum", sig, node, Vec::new(), def_name(node, src))
+    item("enum", sig, node, src, Vec::new(), def_name(node, src))
 }
 
 fn container(node: Node, src: &str, facts: &mut FileFacts) -> Item {
@@ -158,9 +159,9 @@ fn container(node: Node, src: &str, facts: &mut FileFacts) -> Item {
         Some(body) => {
             let mut sub = Vec::new();
             visit(body, src, &mut sub, facts, false);
-            item(kind, head_before(node, body, src), node, sub, name)
+            item(kind, head_before(node, body, src), node, src, sub, name)
         }
-        None => item(kind, collapse(text(node, src)), node, Vec::new(), name),
+        None => item(kind, collapse(text(node, src)), node, src, Vec::new(), name),
     }
 }
 
@@ -338,14 +339,149 @@ fn head_before(node: Node, body: Node, src: &str) -> String {
     collapse(&src[node.start_byte()..body.start_byte()])
 }
 
-fn item(kind: &str, signature: String, node: Node, children: Vec<Item>, name: Option<String>) -> Item {
+fn item(
+    kind: &str,
+    signature: String,
+    node: Node,
+    src: &str,
+    children: Vec<Item>,
+    name: Option<String>,
+) -> Item {
     Item {
         kind: kind.to_string(),
         signature,
         line: node.start_position().row + 1,
+        doc: doc_comment(node, src),
         calls: Vec::new(),
         children,
         name,
         raw_calls: Vec::new(),
+    }
+}
+
+/// First line of the `///` (or `/** */`) doc block immediately preceding an
+/// item. Attributes between the comment and the item are skipped; inner docs
+/// (`//!`), regular comments (`//`, `////`), and blank runs stop the search.
+fn doc_comment(node: Node, src: &str) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut sib = node.prev_sibling();
+    while let Some(s) = sib {
+        match s.kind() {
+            "attribute_item" => {}
+            "line_comment" => match line_doc(text(s, src).trim()) {
+                Some(d) => lines.push(d),
+                None => break,
+            },
+            "block_comment" => {
+                if let Some(d) = block_doc(text(s, src).trim()) {
+                    lines.push(d);
+                }
+                break;
+            }
+            _ => break,
+        }
+        sib = s.prev_sibling();
+    }
+    lines.reverse();
+    lines
+        .into_iter()
+        .find(|l| !l.is_empty())
+        .map(|l| clip_doc(&l))
+}
+
+/// Outer line doc (`/// text`). Returns None for regular (`//`, `////`) or
+/// inner (`//!`) comments so they terminate the run.
+fn line_doc(t: &str) -> Option<String> {
+    let rest = t.strip_prefix("///")?;
+    if rest.starts_with('/') {
+        return None; // //// ... is a normal comment
+    }
+    Some(rest.trim().to_string())
+}
+
+/// First non-empty line of an outer block doc (`/** ... */`).
+fn block_doc(t: &str) -> Option<String> {
+    let rest = t.strip_prefix("/**")?;
+    if rest.starts_with('*') {
+        return None; // /*** or /**/ is not a doc comment
+    }
+    let body = rest.trim_end_matches("*/");
+    Some(
+        body.lines()
+            .map(|l| l.trim().trim_start_matches('*').trim().to_string())
+            .find(|l| !l.is_empty())
+            .unwrap_or_default(),
+    )
+}
+
+fn clip_doc(s: &str) -> String {
+    if s.chars().count() > 100 {
+        let mut out: String = s.chars().take(97).collect();
+        out.push('…');
+        out
+    } else {
+        s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn items(src: &str) -> Vec<Item> {
+        extract(src).unwrap().items
+    }
+
+    fn doc_of(src: &str) -> Option<String> {
+        items(src).into_iter().next().and_then(|i| i.doc)
+    }
+
+    #[test]
+    fn line_doc_takes_first_line() {
+        assert_eq!(
+            doc_of("/// First line.\n/// Second line.\npub fn foo() {}\n").as_deref(),
+            Some("First line.")
+        );
+    }
+
+    #[test]
+    fn doc_skips_intervening_attributes() {
+        assert_eq!(
+            doc_of("/// Docs.\n#[inline]\npub fn foo() {}\n").as_deref(),
+            Some("Docs.")
+        );
+    }
+
+    #[test]
+    fn regular_inner_and_quad_comments_are_not_docs() {
+        // `//`, `//!`, and `////` must not be attributed as item docs.
+        for src in [
+            "// plain\npub fn a() {}\n",
+            "//! inner\npub fn a() {}\n",
+            "//// quad\npub fn a() {}\n",
+        ] {
+            assert_eq!(doc_of(src), None, "{src:?}");
+        }
+    }
+
+    #[test]
+    fn block_doc_first_line() {
+        assert_eq!(
+            doc_of("/** Block summary.\n * more */\npub struct S;\n").as_deref(),
+            Some("Block summary.")
+        );
+    }
+
+    #[test]
+    fn absent_doc_is_none() {
+        assert_eq!(doc_of("pub fn foo() {}\n"), None);
+    }
+
+    #[test]
+    fn struct_and_fn_are_extracted() {
+        let it = items("pub struct S { a: i32 }\npub fn f() {}\n");
+        assert_eq!(it.len(), 2);
+        assert_eq!(it[0].kind, "struct");
+        assert_eq!(it[1].kind, "fn");
     }
 }
