@@ -2,9 +2,41 @@
 //! site) and `callers` (reverse call edges). Both are pure traversals over
 //! the graph `build_graph` already produces — no extra extraction.
 
+use std::collections::BTreeSet;
+
 use serde_json::json;
 
 use crate::model::{Call, Graph, Item, Lang, Module};
+
+/// Split a set of target modules' neighborhood into upstream (modules the
+/// targets depend on) and downstream (modules that depend on a target).
+/// Shared by `subtree` and `changed`.
+pub fn neighbors<'a>(
+    g: &'a Graph,
+    target_names: &BTreeSet<&str>,
+) -> (Vec<&'a Module>, Vec<&'a Module>) {
+    let upstream_names: BTreeSet<&str> = g
+        .modules
+        .iter()
+        .filter(|m| target_names.contains(m.name.as_str()))
+        .flat_map(|m| m.deps.iter().map(|d| d.as_str()))
+        .filter(|d| !target_names.contains(d))
+        .collect();
+    let upstream = g
+        .modules
+        .iter()
+        .filter(|m| upstream_names.contains(m.name.as_str()))
+        .collect();
+    let downstream = g
+        .modules
+        .iter()
+        .filter(|m| {
+            !target_names.contains(m.name.as_str())
+                && m.deps.iter().any(|d| target_names.contains(d.as_str()))
+        })
+        .collect();
+    (upstream, downstream)
+}
 
 fn sep_of(m: &Module) -> &'static str {
     match m.lang {
@@ -343,6 +375,21 @@ mod tests {
         let out = callers(&g, "frobnicate", false);
         assert!(out.contains("b::run"), "{out}");
         assert!(out.contains("frobnicate~"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn neighbors_split_upstream_and_downstream() {
+        let (g, dir) = graph(&[
+            ("src/a.rs", "pub fn base() {}\n"),
+            ("src/b.rs", "use crate::a::base;\npub fn mid() { base(); }\n"),
+            ("src/c.rs", "use crate::b::mid;\npub fn top() { mid(); }\n"),
+        ]);
+        let targets: BTreeSet<&str> = ["b"].into_iter().collect();
+        let (up, down) = neighbors(&g, &targets);
+        assert!(up.iter().any(|m| m.name == "a"), "a is upstream of b");
+        assert!(down.iter().any(|m| m.name == "c"), "c is downstream of b");
+        assert!(!up.iter().any(|m| m.name == "c"));
         let _ = fs::remove_dir_all(dir);
     }
 

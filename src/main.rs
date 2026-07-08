@@ -1,4 +1,5 @@
 mod extract;
+mod git;
 mod model;
 mod query;
 mod render;
@@ -82,6 +83,18 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
     },
+    /// Impact map of a diff: changed modules + upstream deps + downstream callers
+    Changed {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Diff against this git ref instead of the working tree vs HEAD
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, value_enum, default_value_t = Format::Md)]
+        format: Format,
+        #[arg(long, value_enum, default_value_t = View::Full)]
+        view: View,
+    },
     /// Print the recommended CLAUDE.md discovery-protocol block
     Snippet,
 }
@@ -104,6 +117,8 @@ implementation bodies.
   without knowing the module; accepts bare `Foo` or qualified `Type::method`)
 - `ctx callers <name>` — every function that calls the given function/method (resolved reverse
   call edges — the blast radius before you change a signature; more precise than grep)
+- `ctx changed [--since <ref>]` — impact map of your diff: the changed modules plus their
+  dependencies and the callers they may break (defaults to the working tree vs HEAD)
 - add `--format json` to any of the above for machine-readable output
 
 Protocol: before modifying or analyzing code, run `ctx map --view skeleton` to load the
@@ -170,24 +185,7 @@ fn main() -> Result<()> {
 
             let target_names: BTreeSet<&str> =
                 targets.iter().map(|m| m.name.as_str()).collect();
-            let upstream_names: BTreeSet<&str> = targets
-                .iter()
-                .flat_map(|m| m.deps.iter().map(|d| d.as_str()))
-                .filter(|d| !target_names.contains(d))
-                .collect();
-            let upstream: Vec<&Module> = g
-                .modules
-                .iter()
-                .filter(|m| upstream_names.contains(m.name.as_str()))
-                .collect();
-            let downstream: Vec<&Module> = g
-                .modules
-                .iter()
-                .filter(|m| {
-                    !target_names.contains(m.name.as_str())
-                        && m.deps.iter().any(|d| target_names.contains(d.as_str()))
-                })
-                .collect();
+            let (upstream, downstream) = query::neighbors(&g, &target_names);
 
             match format {
                 Format::Md => print!(
@@ -219,6 +217,57 @@ fn main() -> Result<()> {
                 "{}",
                 query::callers(&g, &name, matches!(format, Format::Json))
             );
+        }
+        Cmd::Changed {
+            path,
+            since,
+            format,
+            view,
+        } => {
+            let mut g = extract::build_graph(&path)?;
+            view::apply(&mut g, view);
+            let changed_paths = git::changed_files(&path, since.as_deref())?;
+            let changed_set: std::collections::HashSet<PathBuf> = changed_paths
+                .iter()
+                .filter_map(|p| p.canonicalize().ok())
+                .collect();
+            let root = PathBuf::from(&g.root);
+            let targets: Vec<&Module> = g
+                .modules
+                .iter()
+                .filter(|m| {
+                    root.join(&m.file)
+                        .canonicalize()
+                        .map(|p| changed_set.contains(&p))
+                        .unwrap_or(false)
+                })
+                .collect();
+            let label = since.as_deref().unwrap_or("HEAD");
+            if targets.is_empty() {
+                println!(
+                    "no changed Rust/Python modules vs {} ({} changed path(s) total)",
+                    label,
+                    changed_paths.len()
+                );
+                return Ok(());
+            }
+            let target_names: BTreeSet<&str> = targets.iter().map(|m| m.name.as_str()).collect();
+            let (upstream, downstream) = query::neighbors(&g, &target_names);
+            match format {
+                Format::Md => print!(
+                    "{}",
+                    render::changed_md(label, &targets, &upstream, &downstream)
+                ),
+                Format::Json => {
+                    let json = serde_json::json!({
+                        "since": label,
+                        "changed": targets,
+                        "upstream": upstream,
+                        "downstream": downstream,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&json)?);
+                }
+            }
         }
         Cmd::Snippet => print!("{SNIPPET}"),
     }

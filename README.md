@@ -36,12 +36,23 @@ ctx def 'Type::method' ~/projects/myrepo   # qualified to disambiguate
 # Who calls this? (resolved reverse call edges — the blast radius)
 ctx callers basename ~/projects/myrepo
 
+# Impact map of your current diff: changed modules + deps + callers
+ctx changed ~/projects/myrepo              # working tree vs HEAD
+ctx changed ~/projects/myrepo --since main # vs a ref/branch
+
 # Machine-readable graph
 ctx map ~/projects/myrepo --format json
 
 # Print the recommended CLAUDE.md discovery-protocol block
 ctx snippet >> ~/projects/myrepo/CLAUDE.md
 ```
+
+`changed` turns a diff into an impact map: it runs `git diff` (working tree
+vs HEAD, or vs `--since <ref>`, including untracked files), maps the changed
+files onto modules, and renders those modules plus their upstream
+dependencies and — the point — their **downstream callers**, i.e. everything
+a review should re-check. An unborn HEAD or a clean tree is handled without
+error.
 
 `def` and `callers` accept a bare name (`to_config`) or a qualified name
 (`SteerOverride::to_config`, `pkg.mod.fn`); a bare name lists every match so

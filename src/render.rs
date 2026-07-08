@@ -64,6 +64,19 @@ fn item_md(i: &Item, depth: usize, out: &mut String) {
     }
 }
 
+/// Render titled sections of modules, skipping any that are empty.
+fn sections_md(out: &mut String, sections: &[(&str, &[&Module])]) {
+    for (title, set) in sections {
+        if set.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("---\n### {title}\n\n"));
+        for m in *set {
+            module_md(m, out);
+        }
+    }
+}
+
 pub fn subtree_md(
     query: &str,
     targets: &[&Module],
@@ -75,19 +88,39 @@ pub fn subtree_md(
     out.push_str(
         "Target module(s) plus immediate upstream (dependencies) and downstream (dependents).\n\n",
     );
-    for (title, set) in [
-        ("Target", targets),
-        ("Upstream (dependencies)", upstream),
-        ("Downstream (dependents)", downstream),
-    ] {
-        if set.is_empty() {
-            continue;
-        }
-        out.push_str(&format!("---\n### {title}\n\n"));
-        for m in set {
-            module_md(m, &mut out);
-        }
-    }
+    sections_md(
+        &mut out,
+        &[
+            ("Target", targets),
+            ("Upstream (dependencies)", upstream),
+            ("Downstream (dependents)", downstream),
+        ],
+    );
+    out
+}
+
+/// Impact map for a diff: the changed modules, what they depend on, and the
+/// callers they may break.
+pub fn changed_md(
+    label: &str,
+    changed: &[&Module],
+    upstream: &[&Module],
+    downstream: &[&Module],
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# Changed vs {label}\n"));
+    out.push_str(&format!(
+        "{} changed module(s), their dependencies, and the callers they impact.\n\n",
+        changed.len()
+    ));
+    sections_md(
+        &mut out,
+        &[
+            ("Changed", changed),
+            ("Depends on (upstream)", upstream),
+            ("Impacted callers (downstream)", downstream),
+        ],
+    );
     out
 }
 
