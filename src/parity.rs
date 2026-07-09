@@ -59,6 +59,27 @@ fn last_seg(s: &str) -> &str {
     s.rsplit([':', '.']).next().unwrap_or(s)
 }
 
+/// Systematic Python→Rust renames, as `canon(python) -> [canon(rust)…]`. Only
+/// renames `canon()` does *not* already bridge appear here: it strips the
+/// dunder underscores, so `__len__`↔`len`, `__eq__`↔`eq`, `__hash__`↔`hash`,
+/// `__next__`↔`next`, `__contains__`↔`contains` already align with no entry.
+/// A source name aligns to a target if the target matches any candidate.
+pub fn py_rust_aliases() -> AliasMap {
+    [
+        ("init", vec!["new"]),
+        ("str", vec!["tostring", "fmt", "display"]),
+        ("repr", vec!["fmt", "debug"]),
+        ("getitem", vec!["index", "get"]),
+        ("setitem", vec!["indexmut", "insert", "set"]),
+        ("delitem", vec!["remove"]),
+        ("iter", vec!["iter", "intoiter"]),
+        ("contains", vec!["contains"]),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.into_iter().map(String::from).collect()))
+    .collect()
+}
+
 #[derive(Clone)]
 struct Member {
     /// Original (display) container name; canonicalised at key time.
@@ -74,6 +95,10 @@ struct Member {
 }
 
 type Key = (Option<String>, String, Role);
+
+/// `canon(source-name) -> [canon(target-name) candidates]` for systematic
+/// cross-language renames. Empty = exact-match only.
+pub type AliasMap = BTreeMap<String, Vec<String>>;
 
 impl Member {
     fn key(&self) -> Key {
@@ -147,7 +172,12 @@ pub struct MemberView(Member);
 /// Produce the parity report comparing a source member bag against the union
 /// of target member bags. Returns the rendered text and the count of members
 /// missing from the port (for `--strict`).
-pub fn report(source: &[MemberView], target: &[MemberView], json_out: bool) -> (String, usize) {
+pub fn report(
+    source: &[MemberView],
+    target: &[MemberView],
+    aliases: &AliasMap,
+    json_out: bool,
+) -> (String, usize) {
     let source: Vec<&Member> = source.iter().map(|m| &m.0).collect();
     let target: Vec<&Member> = target.iter().map(|m| &m.0).collect();
 
@@ -156,11 +186,11 @@ pub fn report(source: &[MemberView], target: &[MemberView], json_out: bool) -> (
     for m in &target {
         t_by_nr.entry(m.nr()).or_default().push(m);
     }
-    let s_keys: BTreeSet<Key> = source.iter().map(|m| m.key()).collect();
     let s_nr: BTreeSet<(String, Role)> = source.iter().map(|m| m.nr()).collect();
 
-    // Names that align by full key on both sides — the only callees precise
-    // enough to reason about for call drift.
+    // Names that align by *exact* key on both sides — the only callees precise
+    // enough to reason about for call drift (alias-aligned names excluded, so
+    // a renamed callee is never mis-flagged as dropped).
     let aligned_names: BTreeSet<String> = source
         .iter()
         .filter(|m| t_by_key.contains_key(&m.key()))
@@ -171,37 +201,65 @@ pub fn report(source: &[MemberView], target: &[MemberView], json_out: bool) -> (
     let mut ambiguous: Vec<(&Member, &Member)> = Vec::new();
     let mut arity: Vec<(&Member, &Member)> = Vec::new();
     let mut calls: Vec<(&Member, Vec<String>)> = Vec::new();
+    let mut via_alias: Vec<(&Member, &Member, String)> = Vec::new();
+    let mut consumed: BTreeSet<Key> = BTreeSet::new();
     let mut aligned = 0usize;
 
     for s in &source {
+        // Resolve the target: exact key first, then any aliased key.
+        let mut resolved: Option<(&Member, Option<String>)> = None;
         if let Some(t) = t_by_key.get(&s.key()) {
-            aligned += 1;
-            if let (Some(a), Some(b)) = (s.arity, t.arity) {
-                if a != b {
-                    arity.push((s, t));
+            resolved = Some((t, None));
+        } else if let Some(alts) = aliases.get(&s.name) {
+            for alt in alts {
+                let mut k = s.key();
+                k.1 = alt.clone();
+                if let Some(t) = t_by_key.get(&k) {
+                    resolved = Some((t, Some(alt.clone())));
+                    break;
                 }
             }
-            let dropped: Vec<String> = s
-                .callees
-                .iter()
-                .filter(|c| aligned_names.contains(*c) && !t.callees.contains(*c))
-                .cloned()
-                .collect();
-            if !dropped.is_empty() {
-                calls.push((s, dropped));
+        }
+
+        match resolved {
+            Some((t, alias_used)) => {
+                aligned += 1;
+                consumed.insert(t.key());
+                if let (Some(a), Some(b)) = (s.arity, t.arity) {
+                    if a != b {
+                        arity.push((s, t));
+                    }
+                }
+                match alias_used {
+                    None => {
+                        let dropped: Vec<String> = s
+                            .callees
+                            .iter()
+                            .filter(|c| aligned_names.contains(*c) && !t.callees.contains(*c))
+                            .cloned()
+                            .collect();
+                        if !dropped.is_empty() {
+                            calls.push((s, dropped));
+                        }
+                    }
+                    Some(alt) => via_alias.push((s, t, alt)),
+                }
             }
-        } else if let Some(cands) = t_by_nr.get(&s.nr()) {
-            ambiguous.push((s, cands[0]));
-        } else {
-            missing.push(s);
+            None => {
+                if let Some(cands) = t_by_nr.get(&s.nr()) {
+                    ambiguous.push((s, cands[0]));
+                } else {
+                    missing.push(s);
+                }
+            }
         }
     }
 
-    // Additions: target members that share neither a full key nor a
-    // (name, role) with any source member (so moves aren't counted twice).
+    // Additions: target members not consumed by any alignment and sharing no
+    // (name, role) with the source (so moves aren't counted twice).
     let added: Vec<&Member> = target
         .iter()
-        .filter(|t| !s_keys.contains(&t.key()) && !s_nr.contains(&t.nr()))
+        .filter(|t| !consumed.contains(&t.key()) && !s_nr.contains(&t.nr()))
         .copied()
         .collect();
 
@@ -222,6 +280,9 @@ pub fn report(source: &[MemberView], target: &[MemberView], json_out: bool) -> (
             "ambiguous": ambiguous.iter().map(|(s, t)| json!({
                 "source": s.qual(), "target": t.qual(), "role": s.role.name(),
             })).collect::<Vec<_>>(),
+            "aligned_via_alias": via_alias.iter().map(|(s, t, alt)| json!({
+                "source": s.qual(), "target": t.qual(), "alias": alt,
+            })).collect::<Vec<_>>(),
             "added": added.iter().map(mj).collect::<Vec<_>>(),
         });
         return (
@@ -233,11 +294,16 @@ pub fn report(source: &[MemberView], target: &[MemberView], json_out: bool) -> (
     let mut o = String::new();
     o.push_str("# ctx parity — source → port\n");
     o.push_str(&format!(
-        "source {} members · target {} · aligned {} ({}% of source)\n",
+        "source {} members · target {} · aligned {} ({}% of source){}\n",
         source.len(),
         target.len(),
         aligned,
         pct(aligned, source.len()),
+        if aliases.is_empty() {
+            String::new()
+        } else {
+            format!(" · {} via alias", via_alias.len())
+        },
     ));
 
     if !missing.is_empty() {
@@ -294,6 +360,22 @@ pub fn report(source: &[MemberView], target: &[MemberView], json_out: bool) -> (
                 s.role.name(),
                 s.qual(),
                 t.qual()
+            ));
+        }
+    }
+    if !via_alias.is_empty() {
+        o.push_str(&format!(
+            "\n## Aligned via alias ({}) — matched through a rename rule, not exactly\n",
+            via_alias.len()
+        ));
+        for (s, t, alt) in &via_alias {
+            o.push_str(&format!(
+                "  {:<4} {}  →  {}   (via {} → {})\n",
+                s.role.name(),
+                s.qual(),
+                t.qual(),
+                s.name,
+                alt
             ));
         }
     }
@@ -375,7 +457,7 @@ mod tests {
             "gate.rs",
             "pub struct Gate;\nimpl Gate {\n    pub fn run(&self, x: i32) -> i32 { x }\n}\n",
         );
-        let (out, missing) = report(&py, &rs, false);
+        let (out, missing) = report(&py, &rs, &AliasMap::new(), false);
         assert_eq!(missing, 0, "{out}");
         assert!(out.contains("aligned 2"), "{out}"); // Gate + Gate.run
     }
@@ -390,7 +472,7 @@ mod tests {
             "m.rs",
             "pub fn run(x: i32) -> i32 { x }\npub fn extra() {}\n",
         );
-        let (out, missing) = report(&py, &rs, false);
+        let (out, missing) = report(&py, &rs, &AliasMap::new(), false);
         assert_eq!(missing, 1, "{out}"); // `gone` missing
         assert!(out.contains("Missing in port") && out.contains("gone"), "{out}");
         assert!(out.contains("Arity drift") && out.contains("run"), "{out}"); // 2 → 1
@@ -409,7 +491,25 @@ mod tests {
             "c.rs",
             "pub fn normalize(x: i32) -> i32 { x }\npub fn run(x: i32) -> i32 { x }\n",
         );
-        let (out, _) = report(&py, &rs, false);
+        let (out, _) = report(&py, &rs, &AliasMap::new(), false);
         assert!(out.contains("Call drift") && out.contains("normalize"), "{out}");
+    }
+
+    #[test]
+    fn py_rust_alias_maps_init_to_new() {
+        let py = members("a.py", "class Gate:\n    def __init__(self, cfg):\n        pass\n");
+        let rs = members(
+            "a.rs",
+            "pub struct Gate;\nimpl Gate {\n    pub fn new(cfg: Cfg) -> Self { Gate }\n}\n",
+        );
+        // Without aliases, __init__ has no counterpart → missing.
+        let plain = report(&py, &rs, &AliasMap::new(), false);
+        assert_eq!(plain.1, 1, "{}", plain.0);
+        assert!(plain.0.contains("__init__"), "{}", plain.0);
+        // With the py→rust table, __init__ aligns to new and is shown as such.
+        let aliased = report(&py, &rs, &py_rust_aliases(), false);
+        assert_eq!(aliased.1, 0, "{}", aliased.0);
+        assert!(aliased.0.contains("Aligned via alias"), "{}", aliased.0);
+        assert!(!aliased.0.contains("## Added"), "new must not read as added:\n{}", aliased.0);
     }
 }

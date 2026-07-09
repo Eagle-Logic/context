@@ -34,6 +34,13 @@ enum Format {
     Json,
 }
 
+/// A systematic cross-language rename table for `ctx parity`.
+#[derive(Clone, Copy, ValueEnum)]
+enum AliasSet {
+    /// Python → Rust conventions (e.g. `__init__` → `new`)
+    PyRust,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Generate the full structural map (Strategy A: map-first boot sequence)
@@ -164,6 +171,10 @@ enum Cmd {
         /// Exit non-zero if any source member is missing from the port
         #[arg(long)]
         strict: bool,
+        /// Apply a systematic cross-language rename table (e.g. py-rust maps
+        /// `__init__` → `new`). Alias matches are reported, never silent.
+        #[arg(long, value_enum)]
+        aliases: Option<AliasSet>,
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
     },
@@ -201,7 +212,8 @@ implementation bodies.
   tree): changed modules + who they break; add `--api` for breaking changes across the range
 - `ctx parity <source> <port>...` — cross-language structural check: is a port a faithful
   copy of its source? Flags members missing from the port, arity drift, and dropped internal
-  calls (deterministic, structure-only — e.g. a Python module vs its Rust port)
+  calls (deterministic, structure-only — e.g. a Python module vs its Rust port; add
+  `--aliases py-rust` to bridge systematic renames like `__init__` → `new`)
 - `ctx core` — the modules that matter most, ranked by dependency centrality (where to look
   first in an unfamiliar codebase; add `--churn` to weight by how often they change)
 - `ctx doctor` — coverage report: what fraction of the call graph resolved and which modules/
@@ -460,6 +472,7 @@ fn main() -> Result<()> {
             source,
             target,
             strict,
+            aliases,
             format,
         } => {
             let src = members_for(&source)?;
@@ -467,7 +480,11 @@ fn main() -> Result<()> {
             for t in &target {
                 tgt.extend(members_for(t)?);
             }
-            let (out, missing) = parity::report(&src, &tgt, matches!(format, Format::Json));
+            let amap = match aliases {
+                Some(AliasSet::PyRust) => parity::py_rust_aliases(),
+                None => parity::AliasMap::new(),
+            };
+            let (out, missing) = parity::report(&src, &tgt, &amap, matches!(format, Format::Json));
             print!("{out}");
             if strict && missing > 0 {
                 std::process::exit(1);

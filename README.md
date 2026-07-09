@@ -61,8 +61,9 @@ ctx diff main..feature ~/projects/myrepo --api  # breaking API changes across th
 ctx map ~/projects/myrepo --max-tokens 8000
 
 # Cross-language parity: is the Rust port faithful to the Python source?
-ctx parity research/gate.py src/gate.rs         # missing / arity drift / dropped calls
-ctx parity research/gate.py src/gate.rs --strict # exit non-zero if anything is missing
+ctx parity research/gate.py src/gate.rs                    # missing / arity drift / dropped calls
+ctx parity research/gate.py src/gate.rs --aliases py-rust  # bridge __init__→new etc.
+ctx parity research/gate.py src/gate.rs --strict           # exit non-zero if anything is missing
 
 # Machine-readable graph
 ctx map ~/projects/myrepo --format json
@@ -129,6 +130,15 @@ Python file that split into several Rust modules). `--strict` exits non-zero
 on any missing member, for CI. It is deterministic and **structure-only** —
 never semantics — and it leans on the port preserving names, so it is a
 faithfulness check for mechanical ports, not a similarity score for rewrites.
+
+Because it leans on names, `canon()` alone bridges most Python↔Rust dunder
+renames for free (it strips the underscores, so `__len__`↔`len`, `__eq__`↔`eq`,
+`__hash__`↔`hash`, `__next__`↔`next` already align). For the renames it can't —
+chiefly `__init__`→`new`, plus `__str__`→`fmt`/`to_string`, `__getitem__`→
+`index`, `__iter__`→`into_iter` — pass `--aliases py-rust`. Every alias-based
+match is reported in its own **Aligned via alias** section (`__init__ → new
+(via init → new)`), never silently folded — so the fuzz you opted into is
+always visible.
 
 `def` and `callers` accept a bare name (`to_config`) or a qualified name
 (`SteerOverride::to_config`, `pkg.mod.fn`); a bare name lists every match so
