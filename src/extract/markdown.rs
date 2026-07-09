@@ -84,6 +84,7 @@ pub fn extract(src: &str) -> Result<FileFacts> {
                 doc: None,
                 calls: Vec::new(),
                 children: Vec::new(),
+                arity: None,
                 name: Some(s),
                 raw_calls: Vec::new(),
             };

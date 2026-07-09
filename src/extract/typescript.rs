@@ -150,6 +150,9 @@ fn definition(
     };
     let mut it = mk(kind, signature, outer, src, children, Some(name));
     it.raw_calls = raw_calls;
+    if kind == "fn" {
+        it.arity = arity_from(decl);
+    }
     items.push(it);
 }
 
@@ -195,6 +198,9 @@ fn lexical(
         let sig = if exported { format!("export {sig}") } else { sig };
         let mut it = mk(kind, clip(&sig), outer, src, Vec::new(), Some(name));
         it.raw_calls = calls;
+        if is_fn {
+            it.arity = value.and_then(arity_from);
+        }
         items.push(it);
     }
 }
@@ -223,6 +229,7 @@ fn class_members(body: Node, src: &str) -> Vec<Item> {
             .unwrap_or_default();
         let mut it = mk("fn", head_txt, m, src, Vec::new(), Some(name));
         it.raw_calls = calls;
+        it.arity = arity_from(m);
         out.push(it);
     }
     out
@@ -468,9 +475,31 @@ fn mk(
         doc: doc_comment(node, src),
         calls: Vec::new(),
         children,
+        arity: None,
         name,
         raw_calls: Vec::new(),
     }
+}
+
+/// Count of parameters in a `formal_parameters` / `parameters` node reachable
+/// from `n` (TS has no `self` receiver). None if no param list is found.
+fn arity_from(n: Node) -> Option<usize> {
+    let params = n
+        .child_by_field_name("parameters")
+        .or_else(|| child_of_kind(n, "formal_parameters"))?;
+    let mut cursor = params.walk();
+    Some(
+        params
+            .named_children(&mut cursor)
+            .filter(|c| c.kind() != "comment")
+            .count(),
+    )
+}
+
+fn child_of_kind<'a>(n: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = n.walk();
+    let kids: Vec<Node<'a>> = n.named_children(&mut cursor).collect();
+    kids.into_iter().find(|c| c.kind() == kind)
 }
 
 fn text<'a>(node: Node, src: &'a str) -> &'a str {

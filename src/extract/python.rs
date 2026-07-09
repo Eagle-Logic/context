@@ -92,9 +92,31 @@ fn definition(
         doc: body.and_then(|b| docstring(b, src)),
         calls: Vec::new(),
         children,
+        arity: if is_class { None } else { arity(node, src) },
         name,
         raw_calls,
     });
+}
+
+/// Value-parameter count for a `def`, excluding a leading `self`/`cls`.
+fn arity(node: Node, src: &str) -> Option<usize> {
+    let params = node.child_by_field_name("parameters")?;
+    let mut cursor = params.walk();
+    let ps: Vec<Node> = params.named_children(&mut cursor).collect();
+    let mut count = 0;
+    for (i, p) in ps.iter().enumerate() {
+        if i == 0 {
+            let first = text(*p, src)
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("");
+            if first == "self" || first == "cls" {
+                continue;
+            }
+        }
+        count += 1;
+    }
+    Some(count)
 }
 
 /// First non-empty line of a def/class docstring: the leading string literal

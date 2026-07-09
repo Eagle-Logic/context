@@ -119,6 +119,11 @@ pub struct Item {
     pub calls: Vec<Call>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<Item>,
+    /// Number of value parameters (receiver excluded) for functions/methods;
+    /// None for non-callables. Used by `ctx parity` for cross-language arity
+    /// comparison, where signature text is not comparable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arity: Option<usize>,
     /// Bare symbol name (impl blocks: the type name); used for resolution.
     #[serde(skip)]
     pub name: Option<String>,

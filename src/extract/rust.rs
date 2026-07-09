@@ -99,7 +99,20 @@ fn function(node: Node, src: &str) -> Item {
     };
     let mut it = item("fn", sig, node, src, Vec::new(), def_name(node, src));
     it.raw_calls = raw_calls;
+    it.arity = arity(node);
     it
+}
+
+/// Value-parameter count for a `fn`, excluding a `self` receiver.
+fn arity(node: Node) -> Option<usize> {
+    let params = node.child_by_field_name("parameters")?;
+    let mut cursor = params.walk();
+    Some(
+        params
+            .named_children(&mut cursor)
+            .filter(|c| c.kind() != "self_parameter")
+            .count(),
+    )
 }
 
 fn structure(node: Node, src: &str) -> Item {
@@ -360,6 +373,7 @@ fn item(
         doc: doc_comment(node, src),
         calls: Vec::new(),
         children,
+        arity: None,
         name,
         raw_calls: Vec::new(),
     }

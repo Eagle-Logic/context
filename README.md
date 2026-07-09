@@ -60,6 +60,10 @@ ctx diff main..feature ~/projects/myrepo --api  # breaking API changes across th
 # Fit a map to a token budget (richest view that fits; never truncates)
 ctx map ~/projects/myrepo --max-tokens 8000
 
+# Cross-language parity: is the Rust port faithful to the Python source?
+ctx parity research/gate.py src/gate.rs         # missing / arity drift / dropped calls
+ctx parity research/gate.py src/gate.rs --strict # exit non-zero if anything is missing
+
 # Machine-readable graph
 ctx map ~/projects/myrepo --format json
 
@@ -111,6 +115,20 @@ at or below `--view` whose (~`len/4`) token count fits, and reports the view
 it chose on stderr. It **never truncates** — if even `skeleton` is over
 budget it emits the whole skeleton and says so — so the map an agent receives
 is always structurally complete.
+
+`parity <source> <port>...` answers "is this port a faithful structural copy?"
+across languages. Because the `Item` model is language-neutral, a source
+module and its port are two renderings of one skeleton; parity flattens each
+into a bag of members keyed by `(container, canonical-name, role)` — collapsing
+`camelCase`/`snake_case`/`PascalCase` and treating a Rust `impl Type { fn m }`
+the same as a Python `class Type: def m` — then reports what **diverged**:
+members **missing** from the port, **arity drift** (receiver-excluded param
+count), dropped **internal calls**, **moves** (name matches, container
+differs), and **additions**. Multiple targets are compared as a union (a
+Python file that split into several Rust modules). `--strict` exits non-zero
+on any missing member, for CI. It is deterministic and **structure-only** —
+never semantics — and it leans on the port preserving names, so it is a
+faithfulness check for mechanical ports, not a similarity score for rewrites.
 
 `def` and `callers` accept a bare name (`to_config`) or a qualified name
 (`SteerOverride::to_config`, `pkg.mod.fn`); a bare name lists every match so

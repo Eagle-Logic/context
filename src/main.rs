@@ -2,6 +2,7 @@ mod extract;
 mod git;
 mod mcp;
 mod model;
+mod parity;
 mod query;
 mod render;
 mod view;
@@ -151,6 +152,21 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = View::Full)]
         view: View,
     },
+    /// Cross-language structural parity: is a port a faithful copy of its
+    /// source? Reports members missing from the port, arity drift, dropped
+    /// internal calls, moves, and additions. Structure only — never semantics.
+    Parity {
+        /// The original module (a file or directory)
+        source: PathBuf,
+        /// The port — one or more files/directories (compared as a union)
+        #[arg(required = true)]
+        target: Vec<PathBuf>,
+        /// Exit non-zero if any source member is missing from the port
+        #[arg(long)]
+        strict: bool,
+        #[arg(long, value_enum, default_value_t = Format::Md)]
+        format: Format,
+    },
     /// Run as an MCP server over stdio (exposes the read-only commands as tools)
     Mcp,
     /// Print the recommended CLAUDE.md discovery-protocol block
@@ -183,6 +199,9 @@ implementation bodies.
   signature-changed public items and who breaks (a pre-merge breaking-change check)
 - `ctx diff <A>..<B>` — structural diff between two git refs (B defaults to the working
   tree): changed modules + who they break; add `--api` for breaking changes across the range
+- `ctx parity <source> <port>...` — cross-language structural check: is a port a faithful
+  copy of its source? Flags members missing from the port, arity drift, and dropped internal
+  calls (deterministic, structure-only — e.g. a Python module vs its Rust port)
 - `ctx core` — the modules that matter most, ranked by dependency centrality (where to look
   first in an unfamiliar codebase; add `--churn` to weight by how often they change)
 - `ctx doctor` — coverage report: what fraction of the call graph resolved and which modules/
@@ -437,10 +456,55 @@ fn main() -> Result<()> {
             format,
             view,
         } => run_diff(&range, &path, api, format, view)?,
+        Cmd::Parity {
+            source,
+            target,
+            strict,
+            format,
+        } => {
+            let src = members_for(&source)?;
+            let mut tgt = Vec::new();
+            for t in &target {
+                tgt.extend(members_for(t)?);
+            }
+            let (out, missing) = parity::report(&src, &tgt, matches!(format, Format::Json));
+            print!("{out}");
+            if strict && missing > 0 {
+                std::process::exit(1);
+            }
+        }
         Cmd::Mcp => mcp::run()?,
         Cmd::Snippet => print!("{SNIPPET}"),
     }
     Ok(())
+}
+
+/// Resolve a parity path argument to a flattened member bag. A directory is
+/// flattened whole; a single file builds the graph for its parent directory
+/// and flattens only the module that file produced.
+fn members_for(path: &std::path::Path) -> Result<Vec<parity::MemberView>> {
+    let meta = fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+    if meta.is_dir() {
+        let g = extract::build_graph(path)?;
+        return Ok(g.modules.iter().flat_map(parity::flatten).collect());
+    }
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let g = extract::build_graph(dir)?;
+    let want = path.canonicalize()?;
+    let mut out = Vec::new();
+    for m in &g.modules {
+        if dir.join(&m.file).canonicalize().ok().as_deref() == Some(&want) {
+            out.extend(parity::flatten(m));
+        }
+    }
+    if out.is_empty() {
+        bail!(
+            "no module for {} — unsupported language, empty file, or no definitions",
+            path.display()
+        );
+    }
+    Ok(out)
 }
 
 /// `ctx diff A..B` — map the file changes between two refs onto B's module
