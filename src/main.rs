@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use model::Module;
+use model::{Graph, Module};
 use view::View;
 
 #[derive(Parser)]
@@ -45,6 +45,11 @@ enum Cmd {
         /// full (private items + call edges)
         #[arg(long, value_enum, default_value_t = View::Full)]
         view: View,
+        /// Fit the output to a token budget: emit the richest view at or below
+        /// `--view` whose ~token count fits, reporting the choice on stderr.
+        /// Never truncates. Omit for the exact `--view`.
+        #[arg(long)]
+        max_tokens: Option<usize>,
         /// Write to a file instead of stdout (e.g. CODEBASE_MAP.md)
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -131,6 +136,21 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = View::Full)]
         view: View,
     },
+    /// Structural diff between two git refs: `A..B` (B defaults to the working
+    /// tree). Changed modules + who they break; `--api` for breaking changes.
+    Diff {
+        /// Ref range `A..B`, or a single ref `A` (diffs A against the working tree)
+        range: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Report public-API changes between the refs (removed/changed + who breaks)
+        #[arg(long)]
+        api: bool,
+        #[arg(long, value_enum, default_value_t = Format::Md)]
+        format: Format,
+        #[arg(long, value_enum, default_value_t = View::Full)]
+        view: View,
+    },
     /// Run as an MCP server over stdio (exposes the read-only commands as tools)
     Mcp,
     /// Print the recommended CLAUDE.md discovery-protocol block
@@ -161,6 +181,8 @@ implementation bodies.
   dependencies and the callers they may break (defaults to the working tree vs HEAD)
 - `ctx changed --api [--since <ref>]` — public API changes in your diff: removed or
   signature-changed public items and who breaks (a pre-merge breaking-change check)
+- `ctx diff <A>..<B>` — structural diff between two git refs (B defaults to the working
+  tree): changed modules + who they break; add `--api` for breaking changes across the range
 - `ctx core` — the modules that matter most, ranked by dependency centrality (where to look
   first in an unfamiliar codebase; add `--churn` to weight by how often they change)
 - `ctx doctor` — coverage report: what fraction of the call graph resolved and which modules/
@@ -182,13 +204,29 @@ fn main() -> Result<()> {
             path,
             format,
             view,
+            max_tokens,
             output,
         } => {
             let mut g = extract::build_graph(&path)?;
-            view::apply(&mut g, view);
-            let rendered = match format {
-                Format::Md => render::markdown(&g),
-                Format::Json => serde_json::to_string_pretty(&g)?,
+            let module_count = g.modules.len();
+            let rendered = match max_tokens {
+                Some(budget) => {
+                    let (used, text, fit) = render_budgeted(&g, view, format, budget);
+                    eprintln!(
+                        "budget {budget} tok → {} view (~{} tok){}",
+                        used.name(),
+                        text.len() / 4,
+                        if fit { "" } else { " — still over; coarsest view emitted" }
+                    );
+                    text
+                }
+                None => {
+                    view::apply(&mut g, view);
+                    match format {
+                        Format::Md => render::markdown(&g),
+                        Format::Json => serde_json::to_string_pretty(&g)?,
+                    }
+                }
             };
             match output {
                 Some(file) => {
@@ -196,7 +234,7 @@ fn main() -> Result<()> {
                     eprintln!(
                         "wrote {} ({} modules, {} bytes)",
                         file.display(),
-                        g.modules.len(),
+                        module_count,
                         rendered.len()
                     );
                 }
@@ -392,8 +430,193 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Diff {
+            range,
+            path,
+            api,
+            format,
+            view,
+        } => run_diff(&range, &path, api, format, view)?,
         Cmd::Mcp => mcp::run()?,
         Cmd::Snippet => print!("{SNIPPET}"),
     }
     Ok(())
+}
+
+/// `ctx diff A..B` — map the file changes between two refs onto B's module
+/// graph (B defaults to the working tree). With `--api`, diff the public API
+/// surface between the two refs instead.
+fn run_diff(range: &str, path: &std::path::Path, api: bool, format: Format, view: View) -> Result<()> {
+    let (a, b) = parse_range(range);
+    let repo = git::repo_root(path)?;
+    let rel = path
+        .canonicalize()?
+        .strip_prefix(&repo)
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let json = matches!(format, Format::Json);
+    let label = match &b {
+        Some(b) => format!("{a}..{b}"),
+        None => format!("{a}..<worktree>"),
+    };
+
+    if api {
+        // Public-API diff needs both trees fully built.
+        let (base, wt_a) = graph_at(&repo, &rel, Some(&a), path, "diff-a")?;
+        let (head, wt_b) = match graph_at(&repo, &rel, b.as_deref(), path, "diff-b") {
+            Ok(v) => v,
+            Err(e) => {
+                cleanup(&repo, wt_a);
+                return Err(e);
+            }
+        };
+        let out = query::api_report(&base, &head, &a, json);
+        cleanup(&repo, wt_a);
+        cleanup(&repo, wt_b);
+        print!("{out}");
+        return Ok(());
+    }
+
+    // Structural diff: build B's graph, map the changed files onto it.
+    let (mut head, wt_b) = graph_at(&repo, &rel, b.as_deref(), path, "diff-b")?;
+    view::apply(&mut head, view);
+    let diffs = match git::diff_files(path, &a, b.as_deref()) {
+        Ok(d) => d,
+        Err(e) => {
+            cleanup(&repo, wt_b);
+            return Err(e);
+        }
+    };
+    // Diff paths are repo-relative; resolve them against the tree they belong
+    // to (B's worktree, or the main repo root for the working tree).
+    let diff_base = wt_b.clone().unwrap_or_else(|| repo.clone());
+    let changed_set: std::collections::HashSet<PathBuf> = diffs
+        .iter()
+        .filter_map(|d| diff_base.join(d).canonicalize().ok())
+        .collect();
+    let root = PathBuf::from(&head.root);
+    let targets: Vec<&Module> = head
+        .modules
+        .iter()
+        .filter(|m| {
+            root.join(&m.file)
+                .canonicalize()
+                .map(|p| changed_set.contains(&p))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if targets.is_empty() {
+        println!(
+            "no changed Rust/Python/TS/Markdown modules in {label} ({} changed path(s) total)",
+            diffs.len()
+        );
+    } else {
+        let target_names: BTreeSet<&str> = targets.iter().map(|m| m.name.as_str()).collect();
+        let (upstream, downstream) = query::neighbors(&head, &target_names);
+        match format {
+            Format::Md => print!(
+                "{}",
+                render::changed_md(&label, &targets, &upstream, &downstream)
+            ),
+            Format::Json => {
+                let json = serde_json::json!({
+                    "range": label,
+                    "changed": targets,
+                    "upstream": upstream,
+                    "downstream": downstream,
+                });
+                println!("{}", serde_json::to_string_pretty(&json)?);
+            }
+        }
+    }
+    cleanup(&repo, wt_b);
+    Ok(())
+}
+
+/// Split a `A..B` range into (A, Some(B)); a bare `A` (or `A..`) yields
+/// (A, None), meaning "diff against the working tree". Tolerates `A...B`.
+fn parse_range(range: &str) -> (String, Option<String>) {
+    match range.split_once("..") {
+        Some((a, rest)) => {
+            let b = rest.trim_start_matches('.').trim();
+            (a.trim().to_string(), (!b.is_empty()).then(|| b.to_string()))
+        }
+        None => (range.trim().to_string(), None),
+    }
+}
+
+/// Build the module graph as of `reference` (via a throwaway detached
+/// worktree) or, when `reference` is None, from the live working tree at
+/// `live`. Returns the graph and the worktree dir to clean up, if any.
+fn graph_at(
+    repo: &std::path::Path,
+    rel: &std::path::Path,
+    reference: Option<&str>,
+    live: &std::path::Path,
+    tag: &str,
+) -> Result<(Graph, Option<PathBuf>)> {
+    match reference {
+        Some(r) => {
+            let wt = std::env::temp_dir().join(format!("ctx-{tag}-{}", std::process::id()));
+            git::add_worktree(repo, &wt, r)?;
+            match extract::build_graph(&wt.join(rel)) {
+                Ok(g) => Ok((g, Some(wt))),
+                Err(e) => {
+                    git::remove_worktree(repo, &wt);
+                    Err(e)
+                }
+            }
+        }
+        None => Ok((extract::build_graph(live)?, None)),
+    }
+}
+
+fn cleanup(repo: &std::path::Path, wt: Option<PathBuf>) {
+    if let Some(wt) = wt {
+        git::remove_worktree(repo, &wt);
+    }
+}
+
+/// Render `g` at the richest view at or below `start` whose output fits
+/// `max_tokens` (~len/4). Never truncates; if even skeleton is over budget it
+/// returns skeleton with `fit = false`. Returns (view_used, text, fit).
+fn render_budgeted(g: &Graph, start: View, format: Format, max_tokens: usize) -> (View, String, bool) {
+    let ladder = [View::Full, View::Interface, View::Skeleton];
+    let start_idx = ladder.iter().position(|&v| v == start).unwrap_or(0);
+    let render = |v: View| -> String {
+        let mut gg = g.clone();
+        view::apply(&mut gg, v);
+        match format {
+            Format::Md => render::markdown(&gg),
+            Format::Json => serde_json::to_string_pretty(&gg).unwrap_or_default(),
+        }
+    };
+    let mut coarsest = (View::Skeleton, String::new());
+    for &v in &ladder[start_idx..] {
+        let text = render(v);
+        if text.len() / 4 <= max_tokens {
+            return (v, text, true);
+        }
+        coarsest = (v, text);
+    }
+    (coarsest.0, coarsest.1, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_range;
+
+    #[test]
+    fn parse_range_forms() {
+        assert_eq!(parse_range("a..b"), ("a".into(), Some("b".into())));
+        assert_eq!(parse_range("main..feature"), ("main".into(), Some("feature".into())));
+        // Three-dot range tolerated; leading dots on B stripped.
+        assert_eq!(parse_range("a...b"), ("a".into(), Some("b".into())));
+        // A bare ref or an open-ended `A..` means "vs the working tree".
+        assert_eq!(parse_range("HEAD~1"), ("HEAD~1".into(), None));
+        assert_eq!(parse_range("main.."), ("main".into(), None));
+        // Whitespace is trimmed.
+        assert_eq!(parse_range(" a .. b "), ("a".into(), Some("b".into())));
+    }
 }

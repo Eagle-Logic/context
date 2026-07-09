@@ -14,6 +14,16 @@ pub enum View {
     Full,
 }
 
+impl View {
+    pub fn name(self) -> &'static str {
+        match self {
+            View::Skeleton => "skeleton",
+            View::Interface => "interface",
+            View::Full => "full",
+        }
+    }
+}
+
 pub fn apply(g: &mut Graph, view: View) {
     if view == View::Full {
         return;

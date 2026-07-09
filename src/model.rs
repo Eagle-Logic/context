@@ -2,14 +2,14 @@ use std::collections::BTreeSet;
 
 use serde::Serialize;
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct Graph {
     pub root: String,
     pub file_count: usize,
     pub modules: Vec<Module>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct Module {
     pub name: String,
     pub file: String,
@@ -68,6 +68,7 @@ pub struct Diagnostics {
 
 /// A name made importable from a module via use/import: `name` is the bound
 /// (possibly aliased) name, `path` the source path as written; "*" is a glob.
+#[derive(Clone)]
 pub struct Binding {
     pub name: String,
     pub path: String,
@@ -103,7 +104,7 @@ impl Lang {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct Item {
     pub kind: String,
     pub signature: String,
@@ -143,6 +144,7 @@ fn is_false(b: &bool) -> bool {
 
 /// How a callee was referenced — governs how confidently a receiver method
 /// call can be attributed to a container.
+#[derive(Clone)]
 pub enum Receiver {
     /// A free function or fully-pathed call: `foo()`, `a::b::foo()`.
     Free,
@@ -156,6 +158,7 @@ pub enum Receiver {
 
 /// One call site: `path` is the callee as written (`build`, `helpers::go`,
 /// `a.b.f`); `recv` records how the receiver was expressed.
+#[derive(Clone)]
 pub struct RawCall {
     pub path: String,
     pub recv: Receiver,

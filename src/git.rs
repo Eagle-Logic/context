@@ -72,6 +72,38 @@ pub fn changed_files(path: &Path, since: Option<&str>) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Repo-relative paths that differ between two refs. `b = None` diffs `a`
+/// against the working tree (same base as `changed --since a`, minus the
+/// untracked set). Both refs are validated so a typo fails loudly.
+pub fn diff_files(path: &Path, a: &str, b: Option<&str>) -> Result<Vec<String>> {
+    let root = repo_root(path)?;
+    if !rev_exists(&root, a) {
+        bail!("unknown git ref: '{a}'");
+    }
+    let mut args = vec!["diff", "--name-only", a];
+    if let Some(b) = b {
+        if !rev_exists(&root, b) {
+            bail!("unknown git ref: '{b}'");
+        }
+        args.push(b);
+    }
+    args.push("--");
+    let out = git(&root, &args)?;
+    if !out.status.success() {
+        bail!(
+            "git diff {a}..{} failed: {}",
+            b.unwrap_or("<worktree>"),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect())
+}
+
 /// Commit-touch counts per repo-relative file path across all history —
 /// a cheap churn proxy (how often each file changes).
 pub fn churn(path: &Path) -> Result<HashMap<String, usize>> {
@@ -185,6 +217,29 @@ mod tests {
         let dir = init_repo(&[("src/a.rs", "pub fn a() {}\n")]);
         commit_all(&dir);
         assert!(changed_files(&dir, None).unwrap().is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn diff_between_two_refs_lists_changed_paths() {
+        let dir = init_repo(&[("src/a.rs", "pub fn a() {}\n")]);
+        commit_all(&dir);
+        git(&dir, &["tag", "base"]).unwrap();
+        fs::write(dir.join("src/a.rs"), "pub fn a() { let _ = 1; }\n").unwrap();
+        fs::write(dir.join("src/b.rs"), "pub fn b() {}\n").unwrap();
+        commit_all(&dir);
+        git(&dir, &["tag", "head"]).unwrap();
+        let changed = diff_files(&dir, "base", Some("head")).unwrap();
+        assert!(changed.iter().any(|p| p == "src/a.rs"), "{changed:?}");
+        assert!(changed.iter().any(|p| p == "src/b.rs"), "{changed:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn diff_unknown_ref_errors() {
+        let dir = init_repo(&[("src/a.rs", "pub fn a() {}\n")]);
+        commit_all(&dir);
+        assert!(diff_files(&dir, "nope-ref", None).is_err());
         let _ = fs::remove_dir_all(dir);
     }
 }

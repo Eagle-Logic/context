@@ -53,6 +53,13 @@ ctx doctor ~/projects/myrepo
 ctx changed ~/projects/myrepo              # working tree vs HEAD
 ctx changed ~/projects/myrepo --since main # vs a ref/branch
 
+# Structural diff between two refs (review a whole branch/PR)
+ctx diff main..feature ~/projects/myrepo        # changed modules + who they break
+ctx diff main..feature ~/projects/myrepo --api  # breaking API changes across the range
+
+# Fit a map to a token budget (richest view that fits; never truncates)
+ctx map ~/projects/myrepo --max-tokens 8000
+
 # Machine-readable graph
 ctx map ~/projects/myrepo --format json
 
@@ -91,6 +98,19 @@ files onto modules, and renders those modules plus their upstream
 dependencies and — the point — their **downstream callers**, i.e. everything
 a review should re-check. An unborn HEAD or a clean tree is handled without
 error.
+
+`diff <A>..<B>` is `changed` between two arbitrary refs — the whole-branch /
+whole-PR view. It maps the file changes onto **B's** module graph (built in a
+throwaway worktree when B is a ref; the working tree when B is omitted, as in
+`ctx diff main`), so the topology reflects the target state. `--api` runs the
+breaking-change surface diff across the same range. `A...B` is accepted and
+treated like `A..B`.
+
+`map --max-tokens <N>` fits the output to a budget: it emits the richest view
+at or below `--view` whose (~`len/4`) token count fits, and reports the view
+it chose on stderr. It **never truncates** — if even `skeleton` is over
+budget it emits the whole skeleton and says so — so the map an agent receives
+is always structurally complete.
 
 `def` and `callers` accept a bare name (`to_config`) or a qualified name
 (`SteerOverride::to_config`, `pkg.mod.fn`); a bare name lists every match so
