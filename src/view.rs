@@ -43,7 +43,7 @@ fn transform_item(mut it: Item, view: View, lang: Lang) -> Option<Item> {
                 it.children.clear();
                 Some(it)
             }
-            "mod" => {
+            "mod" | "section" => {
                 it.children = transform(std::mem::take(&mut it.children), view, lang);
                 Some(it)
             }
@@ -58,7 +58,7 @@ fn transform_item(mut it: Item, view: View, lang: Lang) -> Option<Item> {
                 }
                 Some(it)
             }
-            "class" | "mod" => {
+            "class" | "mod" | "section" => {
                 it.children = transform(std::mem::take(&mut it.children), view, lang);
                 Some(it)
             }
@@ -100,6 +100,8 @@ pub fn is_public(it: &Item, lang: Lang) -> bool {
                 .iter()
                 .any(|k| s.starts_with(k))
         }
+        // Every heading is part of the document's structure.
+        Lang::Markdown => true,
     }
 }
 

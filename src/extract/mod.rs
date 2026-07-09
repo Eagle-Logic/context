@@ -1,3 +1,4 @@
+pub mod markdown;
 pub mod python;
 pub mod rust;
 pub mod typescript;
@@ -46,7 +47,7 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
             continue;
         }
         let take = match path.extension().and_then(|e| e.to_str()) {
-            Some("rs") | Some("py") | Some("tsx") => true,
+            Some("rs") | Some("py") | Some("tsx") | Some("md") | Some("markdown") => true,
             // Skip `.d.ts` — ambient type declarations carry no topology.
             Some("ts") => !path.to_str().is_some_and(|s| s.ends_with(".d.ts")),
             _ => false,
@@ -69,6 +70,7 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
             Some("rs") => Lang::Rust,
             Some("py") => Lang::Python,
             Some("ts") | Some("tsx") => Lang::TypeScript,
+            Some("md") | Some("markdown") => Lang::Markdown,
             _ => continue,
         };
         let mut facts = match lang {
@@ -80,11 +82,19 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
             }
             Lang::TypeScript => typescript::extract(&src, ext == Some("tsx"))
                 .with_context(|| format!("parsing {}", rel.display()))?,
+            Lang::Markdown => {
+                markdown::extract(&src).with_context(|| format!("parsing {}", rel.display()))?
+            }
         };
         let file_name = rel.file_name().and_then(|f| f.to_str());
         let is_package = match lang {
             Lang::Python => file_name == Some("__init__.py"),
             Lang::TypeScript => matches!(file_name, Some("index.ts") | Some("index.tsx")),
+            // README / index collapse to their directory, like an index file.
+            Lang::Markdown => file_name.is_some_and(|f| {
+                let stem = f.rsplit_once('.').map_or(f, |(s, _)| s);
+                stem.eq_ignore_ascii_case("readme") || stem.eq_ignore_ascii_case("index")
+            }),
             _ => false,
         };
         // Any Python module can be imported through, but only __init__.py
@@ -182,6 +192,7 @@ fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>) {
             Lang::Rust => matches!(stem, "mod" | "lib" | "main"),
             Lang::Python => stem == "__init__",
             Lang::TypeScript => stem == "index",
+            Lang::Markdown => stem.eq_ignore_ascii_case("readme") || stem.eq_ignore_ascii_case("index"),
         };
         if !drop {
             segs.push(stem.to_string());
@@ -191,7 +202,7 @@ fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>) {
     let name = if segs.is_empty() {
         match lang {
             Lang::Rust => "crate".to_string(),
-            Lang::Python | Lang::TypeScript => "root".to_string(),
+            Lang::Python | Lang::TypeScript | Lang::Markdown => "root".to_string(),
         }
     } else {
         segs.join(sep(lang))
@@ -202,7 +213,7 @@ fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>) {
 fn sep(lang: Lang) -> &'static str {
     match lang {
         Lang::Rust => "::",
-        Lang::Python | Lang::TypeScript => ".",
+        Lang::Python | Lang::TypeScript | Lang::Markdown => ".",
     }
 }
 
@@ -314,7 +325,7 @@ fn candidates(imp: &str, m: &Module) -> (Vec<Vec<String>>, bool) {
                 _ => (vec![raw], false),
             }
         }
-        Lang::TypeScript => {
+        Lang::TypeScript | Lang::Markdown => {
             if imp.starts_with('.') {
                 // Relative specifier `./a/b`, `../a`: resolve against the
                 // importing module's directory, one climb per `..`.
@@ -635,6 +646,11 @@ fn resolve_call(
 ) -> Resolution {
     let s = sep(m.lang);
 
+    // Markdown "calls" are links; resolve them as doc/heading references.
+    if m.lang == Lang::Markdown {
+        return resolve_md_link(&rc.path, m, ctx);
+    }
+
     match rc.recv {
         // `self.f()` / `Self::f()`: the enclosing container is the correct
         // owner, so an enclosing-impl hit is trustworthy.
@@ -703,6 +719,126 @@ fn resolve_call(
             Resolution::Drop
         }
     }
+}
+
+/// Resolve a markdown link to a doc/heading edge, or flag it broken. An
+/// external URL or a link to a non-doc asset is treated like a std/builtin
+/// call (correctly not an internal edge); a relative doc link whose file or
+/// heading doesn't exist becomes a Drop — i.e. a broken link.
+fn resolve_md_link(link: &str, m: &Module, ctx: &Ctx) -> Resolution {
+    if let Some(inner) = link.strip_prefix("[[").and_then(|s| s.strip_suffix("]]")) {
+        return resolve_md_wiki(inner, m, ctx);
+    }
+    if is_external_url(link) {
+        return Resolution::StdBuiltin;
+    }
+    let (file_part, frag) = match link.split_once('#') {
+        Some((f, g)) => (f, Some(g)),
+        None => (link, None),
+    };
+    // Pure anchor `#section` — a heading in this same doc.
+    if file_part.is_empty() {
+        return match frag {
+            Some(g) => md_anchor_edge(&m.name, g, m, ctx),
+            None => Resolution::Drop,
+        };
+    }
+    let (stem, is_doc) = strip_md_ext(file_part.trim_end_matches('/'));
+    match resolve_path(stem, m, ctx) {
+        Some((name, rest)) if rest.is_empty() => match frag {
+            None => md_module_edge(&name, m),
+            Some(g) => md_anchor_edge(&name, g, m, ctx),
+        },
+        // A doc link that resolves to nothing is broken; a non-doc asset
+        // (`.png`, `.rs`) simply isn't a node in the doc graph.
+        _ => {
+            if is_doc {
+                Resolution::Drop
+            } else {
+                Resolution::StdBuiltin
+            }
+        }
+    }
+}
+
+fn resolve_md_wiki(inner: &str, m: &Module, ctx: &Ctx) -> Resolution {
+    let (page, frag) = inner
+        .split_once('#')
+        .map_or((inner, None), |(p, g)| (p, Some(g)));
+    let target = markdown::slug(page);
+    let hit = ctx.modules.iter().find(|mm| {
+        mm.name
+            .rsplit('.')
+            .next()
+            .is_some_and(|last| markdown::slug(last) == target)
+    });
+    match hit {
+        Some(mm) => match frag {
+            None => md_module_edge(&mm.name, m),
+            Some(g) => md_anchor_edge(&mm.name, g, m, ctx),
+        },
+        None => Resolution::Drop,
+    }
+}
+
+/// Edge to a whole document (a link with no `#fragment`).
+fn md_module_edge(name: &str, m: &Module) -> Resolution {
+    if name == m.name {
+        Resolution::Edge {
+            display: name.to_string(),
+            dep: None,
+            heuristic: false,
+        }
+    } else {
+        Resolution::Edge {
+            display: name.to_string(),
+            dep: Some(name.to_string()),
+            heuristic: false,
+        }
+    }
+}
+
+/// Edge to a specific heading; broken (Drop) if that heading slug is absent.
+fn md_anchor_edge(name: &str, frag: &str, m: &Module, ctx: &Ctx) -> Resolution {
+    let s = markdown::slug(frag);
+    let Some(&ni) = ctx.by_name.get(name) else {
+        return Resolution::Drop;
+    };
+    if !ctx.modules[ni].defined_names.contains(&s) {
+        return Resolution::Drop; // file exists, heading doesn't
+    }
+    if name == m.name {
+        Resolution::Edge {
+            display: s,
+            dep: None,
+            heuristic: false,
+        }
+    } else {
+        Resolution::Edge {
+            display: format!("{name}.{s}"),
+            dep: Some(name.to_string()),
+            heuristic: false,
+        }
+    }
+}
+
+fn is_external_url(link: &str) -> bool {
+    link.starts_with("//")
+        || link.starts_with("mailto:")
+        || link.starts_with("tel:")
+        || link.contains("://")
+}
+
+/// Strip a markdown extension; returns (stem, looks_like_a_doc). An
+/// extensionless target is treated as a doc reference (a dir/README).
+fn strip_md_ext(fp: &str) -> (&str, bool) {
+    for ext in [".md", ".markdown", ".mdx"] {
+        if let Some(stem) = fp.strip_suffix(ext) {
+            return (stem, true);
+        }
+    }
+    let has_other_ext = fp.rsplit('/').next().is_some_and(|f| f.contains('.'));
+    (fp, !has_other_ext)
 }
 
 /// Resolve a receiver-less method name: the enclosing impl/class first,

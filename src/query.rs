@@ -41,7 +41,7 @@ pub fn neighbors<'a>(
 fn sep_of(m: &Module) -> &'static str {
     match m.lang {
         Lang::Rust => "::",
-        Lang::Python | Lang::TypeScript => ".",
+        Lang::Python | Lang::TypeScript | Lang::Markdown => ".",
     }
 }
 
@@ -822,7 +822,7 @@ pub fn coverage_report(g: &Graph, unsupported: &[(String, usize)], json_out: boo
             out.push_str(&format!("  .{ext:<8} {n}\n"));
         }
     }
-    out.push_str("  (supported: .rs .py .ts .tsx)\n");
+    out.push_str("  (supported: .rs .py .ts .tsx .md)\n");
     out
 }
 
@@ -1193,6 +1193,25 @@ mod tests {
         assert!(!out.contains("stable"), "unchanged item must not appear:\n{out}");
         let _ = fs::remove_dir_all(base.1);
         let _ = fs::remove_dir_all(cur.1);
+    }
+
+    #[test]
+    fn markdown_links_resolve_headings_and_flag_broken() {
+        let (g, dir) = graph(&[
+            (
+                "guide.md",
+                "# Guide\n\nSee [setup](./setup.md#install) and [ghost](./ghost.md).\n",
+            ),
+            ("setup.md", "# Setup\n\n## Install\n\ndo it\n"),
+        ]);
+        // Resolved cross-doc link forms a dep edge; the missing file does not.
+        let guide = g.modules.iter().find(|m| m.name == "guide").unwrap();
+        assert!(guide.deps.iter().any(|d| d == "setup"), "{:?}", guide.deps);
+        assert!(!guide.deps.iter().any(|d| d == "ghost"), "{:?}", guide.deps);
+        // The heading anchor is a backlink target.
+        let out = callers(&g, "install", false);
+        assert!(out.contains("guide"), "{out}");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

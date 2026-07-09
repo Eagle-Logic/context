@@ -3,8 +3,8 @@
 Deterministic AST skeleton maps of a codebase, built for ultra-dense context
 injection into coding agents (Claude Code in particular).
 
-`ctx` parses Rust, Python, and TypeScript/TSX sources with tree-sitter, strips
-every implementation body, and emits a compact, deterministic topology map:
+`ctx` parses Rust, Python, TypeScript/TSX, and Markdown sources, strips every
+implementation body, and emits a compact, deterministic topology map:
 
 - **Nodes** — modules, structs/enums/traits/impls, classes, functions
   (signature + file + line).
@@ -160,6 +160,28 @@ To keep a committed `CODEBASE_MAP.md` fresh, regenerate it from a git
 pre-commit hook or a Claude Code hook (`ctx map . -o CODEBASE_MAP.md`) — or
 skip the file entirely and have sessions run `ctx map` at boot; generation is
 ~100 ms, so freshness is free.
+
+### Markdown as a graph
+
+A docs tree is a graph too — and unlike JSON/XML (which are trees, no
+cross-references), Markdown has both halves of ctx's model: **headings are
+the nested items** and **links are the edges**. So the same commands answer
+doc questions:
+
+- `ctx map docs/ --view skeleton` — the heading outline of the whole corpus,
+  each section labelled with its first sentence.
+- `ctx subtree <doc>` — a doc plus what it links to and, crucially, its
+  **backlinks** (what links *to* it).
+- `ctx def <heading-slug>` — jump to a heading; `ctx callers <slug>` — inbound
+  links to that section.
+- `ctx core docs/` — the most-linked-to docs (your canonical / index pages).
+
+Files are modules (`README.md`/`index.md` collapse to their directory like an
+index file); links resolve relative to the linking file (`./x.md#section`,
+`../y.md`, `[[WikiPage]]`) against GitHub-style heading slugs. A link whose
+file or heading doesn't exist is a **broken link** (dropped, not edged);
+external URLs are left external. Reference-style links and prose→code
+resolution are not yet modelled.
 
 ### MCP server
 

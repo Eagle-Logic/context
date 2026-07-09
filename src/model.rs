@@ -86,6 +86,7 @@ pub enum Lang {
     Rust,
     Python,
     TypeScript,
+    Markdown,
 }
 
 impl Lang {
@@ -94,6 +95,7 @@ impl Lang {
             Lang::Rust => "rust",
             Lang::Python => "python",
             Lang::TypeScript => "typescript",
+            Lang::Markdown => "markdown",
         }
     }
 }
@@ -160,7 +162,7 @@ impl Module {
     pub fn name_segs(&self) -> Vec<String> {
         let sep = match self.lang {
             Lang::Rust => "::",
-            Lang::Python | Lang::TypeScript => ".",
+            Lang::Python | Lang::TypeScript | Lang::Markdown => ".",
         };
         self.name.split(sep).map(|s| s.to_string()).collect()
     }

@@ -139,7 +139,7 @@ enum Cmd {
 
 const SNIPPET: &str = r#"## Codebase Discovery Tools
 
-`ctx` is a deterministic static-analysis CLI for this repo (Rust, Python, TypeScript). Use it to
+`ctx` is a deterministic static-analysis CLI for this repo (Rust, Python, TypeScript, Markdown). Use it to
 orient yourself instead of grepping raw source; only read raw files when you need
 implementation bodies.
 

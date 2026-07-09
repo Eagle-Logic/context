@@ -1,0 +1,352 @@
+//! Markdown as a graph: files are modules, headings are the nested items,
+//! and links are the edges. A link's target is stored verbatim as a call
+//! path (`./other.md#section`, `#local`, `[[WikiPage]]`); the resolver's
+//! Markdown branch turns it into an edge to a heading — or flags it broken.
+
+use anyhow::Result;
+
+use crate::model::{FileFacts, Item, RawCall, Receiver};
+
+/// GitHub-style heading slug: lowercase, drop punctuation, spaces to hyphens.
+pub fn slug(text: &str) -> String {
+    let mut out = String::new();
+    for ch in text.trim().chars() {
+        if ch.is_alphanumeric() {
+            out.extend(ch.to_lowercase());
+        } else if ch == ' ' || ch == '-' || ch == '_' {
+            out.push('-');
+        }
+        // everything else (punctuation, markdown syntax) is dropped
+    }
+    // collapse runs of hyphens
+    let mut slug = String::new();
+    let mut prev_dash = false;
+    for ch in out.chars() {
+        if ch == '-' {
+            if !prev_dash {
+                slug.push('-');
+            }
+            prev_dash = true;
+        } else {
+            slug.push(ch);
+            prev_dash = false;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+struct Heading {
+    level: usize,
+    item: Item,
+}
+
+pub fn extract(src: &str) -> Result<FileFacts> {
+    let mut facts = FileFacts::default();
+    let mut flat: Vec<Heading> = Vec::new();
+    let mut in_fence = false;
+    let mut fence_marker = "";
+    let mut prev_line: Option<&str> = None;
+
+    for raw in src.lines() {
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+
+        // Fenced code blocks (``` or ~~~) — ignore their content entirely.
+        if let Some(marker) = fence_open(trimmed) {
+            if !in_fence {
+                in_fence = true;
+                fence_marker = marker;
+            } else if trimmed.starts_with(fence_marker) {
+                in_fence = false;
+            }
+            prev_line = Some(line);
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+
+        // Headings: ATX (`## Title`) and Setext (text underlined by === / ---).
+        let heading = atx_heading(trimmed).or_else(|| setext_heading(trimmed, prev_line));
+        if let Some((level, text)) = heading {
+            let s = slug(&text);
+            facts.defined.insert(s.clone());
+            let mut item = Item {
+                kind: "section".to_string(),
+                signature: text.clone(),
+                line: 0, // set below via line count
+                doc: None,
+                calls: Vec::new(),
+                children: Vec::new(),
+                name: Some(s),
+                raw_calls: Vec::new(),
+            };
+            extract_links(&text, &mut item.raw_calls); // links in the heading itself
+            item.line = flat.len(); // placeholder; real line assigned next pass
+            flat.push(Heading { level, item });
+            prev_line = Some(line);
+            continue;
+        }
+
+        // Body line under the current heading: harvest links, and grab the
+        // first prose line as the section's doc.
+        if let Some(h) = flat.last_mut() {
+            extract_links(line, &mut h.item.raw_calls);
+            if h.item.doc.is_none() && !trimmed.is_empty() && !is_structural(trimmed) {
+                h.item.doc = Some(clip(&strip_inline(trimmed)));
+            }
+        }
+        prev_line = Some(line);
+    }
+
+    // Assign real 1-based line numbers by re-scanning for each heading in order.
+    assign_lines(src, &mut flat);
+
+    facts.items = nest(flat);
+    Ok(facts)
+}
+
+/// Re-walk the source assigning each heading its 1-based line. Headings are
+/// unique per (order), so we match sequentially.
+fn assign_lines(src: &str, flat: &mut [Heading]) {
+    let mut idx = 0;
+    let mut in_fence = false;
+    let mut fence_marker = "";
+    let mut prev: Option<&str> = None;
+    for (n, raw) in src.lines().enumerate() {
+        if idx >= flat.len() {
+            break;
+        }
+        let trimmed = raw.trim_start().trim_end();
+        if let Some(marker) = fence_open(trimmed) {
+            if !in_fence {
+                in_fence = true;
+                fence_marker = marker;
+            } else if trimmed.starts_with(fence_marker) {
+                in_fence = false;
+            }
+            prev = Some(raw);
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if atx_heading(trimmed).is_some() {
+            flat[idx].item.line = n + 1;
+            idx += 1;
+        } else if setext_heading(trimmed, prev).is_some() {
+            flat[idx].item.line = n; // the text line, one above the underline
+            idx += 1;
+        }
+        prev = Some(raw);
+    }
+}
+
+/// Turn the flat, level-tagged heading list into a nested item tree.
+fn nest(flat: Vec<Heading>) -> Vec<Item> {
+    let mut iter = flat.into_iter().peekable();
+    take(&mut iter, 0)
+}
+
+fn take(
+    iter: &mut std::iter::Peekable<std::vec::IntoIter<Heading>>,
+    parent_level: usize,
+) -> Vec<Item> {
+    let mut out = Vec::new();
+    while let Some(h) = iter.peek() {
+        if h.level <= parent_level {
+            break;
+        }
+        let Heading { level, mut item } = iter.next().unwrap();
+        item.children = take(iter, level);
+        out.push(item);
+    }
+    out
+}
+
+fn atx_heading(line: &str) -> Option<(usize, String)> {
+    let hashes = line.chars().take_while(|&c| c == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let rest = &line[hashes..];
+    if !rest.starts_with(' ') && !rest.is_empty() {
+        return None; // `#foo` is not a heading
+    }
+    let text = rest.trim().trim_end_matches('#').trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some((hashes, text.to_string()))
+}
+
+fn setext_heading(line: &str, prev: Option<&str>) -> Option<(usize, String)> {
+    let prev = prev?.trim();
+    if prev.is_empty() {
+        return None;
+    }
+    let level = if !line.is_empty() && line.chars().all(|c| c == '=') {
+        1
+    } else if line.len() >= 2 && line.chars().all(|c| c == '-') {
+        2
+    } else {
+        return None;
+    };
+    // Don't mistake a prior heading / list marker for setext content.
+    if prev.starts_with('#') || prev.starts_with('-') || prev.starts_with('|') {
+        return None;
+    }
+    Some((level, prev.to_string()))
+}
+
+fn fence_open(trimmed: &str) -> Option<&'static str> {
+    if trimmed.starts_with("```") {
+        Some("```")
+    } else if trimmed.starts_with("~~~") {
+        Some("~~~")
+    } else {
+        None
+    }
+}
+
+/// Lines that aren't prose worth using as a doc summary.
+fn is_structural(t: &str) -> bool {
+    t.starts_with('|')
+        || t.starts_with('>')
+        || t.starts_with("- ")
+        || t.starts_with("* ")
+        || t.starts_with("<!--")
+        || t.chars().all(|c| c == '-' || c == '=' || c == '*' || c == ' ')
+}
+
+/// Extract link targets from a line: inline `[t](url)`, images `![t](url)`,
+/// and wiki `[[Page]]`. Inline code spans are skipped.
+fn extract_links(line: &str, out: &mut Vec<RawCall>) {
+    let b: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    let mut in_code = false;
+    while i < b.len() {
+        match b[i] {
+            '`' => {
+                in_code = !in_code;
+                i += 1;
+            }
+            _ if in_code => i += 1,
+            '[' if i + 1 < b.len() && b[i + 1] == '[' => {
+                if let Some(close) = find_seq(&b, i + 2, &[']', ']']) {
+                    let inner: String = b[i + 2..close].iter().collect();
+                    let target = inner.split('|').next().unwrap_or("").trim();
+                    if !target.is_empty() {
+                        push_link(&format!("[[{target}]]"), out);
+                    }
+                    i = close + 2;
+                } else {
+                    i += 1;
+                }
+            }
+            '[' => {
+                if let Some((url, next)) = inline_link(&b, i) {
+                    push_link(&url, out);
+                    i = next;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+fn inline_link(b: &[char], open: usize) -> Option<(String, usize)> {
+    let rb = find_char(b, open + 1, ']')?;
+    if rb + 1 >= b.len() || b[rb + 1] != '(' {
+        return None;
+    }
+    let rp = find_char(b, rb + 2, ')')?;
+    let raw: String = b[rb + 2..rp].iter().collect();
+    // Drop an optional title: `(url "title")`.
+    let url = raw.split_whitespace().next().unwrap_or("").to_string();
+    Some((url, rp + 1))
+}
+
+fn push_link(url: &str, out: &mut Vec<RawCall>) {
+    let url = url.trim();
+    if !url.is_empty() {
+        out.push(RawCall {
+            path: url.to_string(),
+            recv: Receiver::Free,
+        });
+    }
+}
+
+fn find_char(b: &[char], from: usize, c: char) -> Option<usize> {
+    (from..b.len()).find(|&i| b[i] == c)
+}
+
+fn find_seq(b: &[char], from: usize, seq: &[char]) -> Option<usize> {
+    (from..b.len().saturating_sub(seq.len() - 1)).find(|&i| b[i..i + seq.len()] == *seq)
+}
+
+/// Strip common inline markdown so a doc line reads as plain prose.
+fn strip_inline(s: &str) -> String {
+    s.replace(['*', '`', '_'], "").trim().to_string()
+}
+
+fn clip(s: &str) -> String {
+    if s.chars().count() > 120 {
+        let mut out: String = s.chars().take(117).collect();
+        out.push('…');
+        out
+    } else {
+        s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slugs_match_github_style() {
+        assert_eq!(slug("Hello, World!"), "hello-world");
+        assert_eq!(slug("API  Reference"), "api-reference");
+        assert_eq!(slug("`ctx` design notes"), "ctx-design-notes");
+    }
+
+    #[test]
+    fn headings_nest_by_level() {
+        let src = "# Top\n\n## A\n\ntext\n\n## B\n\n### B1\n";
+        let items = extract(src).unwrap().items;
+        assert_eq!(items.len(), 1); // one H1
+        assert_eq!(items[0].signature, "Top");
+        assert_eq!(items[0].children.len(), 2); // A, B
+        assert_eq!(items[0].children[1].children.len(), 1); // B1 under B
+    }
+
+    #[test]
+    fn links_become_edges_code_fences_ignored() {
+        let src = "# T\n\nSee [other](./other.md#sec) and [[Wiki]].\n\n```\n[not](a-link.md)\n```\n";
+        let calls = &extract(src).unwrap().items[0].raw_calls;
+        let paths: Vec<&str> = calls.iter().map(|c| c.path.as_str()).collect();
+        assert!(paths.contains(&"./other.md#sec"), "{paths:?}");
+        assert!(paths.contains(&"[[Wiki]]"), "{paths:?}");
+        assert!(!paths.iter().any(|p| p.contains("a-link")), "fenced link leaked: {paths:?}");
+    }
+
+    #[test]
+    fn first_prose_line_is_the_doc() {
+        let src = "# Title\n\nThis is the summary.\n\nMore.\n";
+        assert_eq!(
+            extract(src).unwrap().items[0].doc.as_deref(),
+            Some("This is the summary.")
+        );
+    }
+
+    #[test]
+    fn setext_headings_supported() {
+        let src = "Big Title\n=========\n\nSection\n-------\n";
+        let items = extract(src).unwrap().items;
+        assert_eq!(items[0].signature, "Big Title");
+        assert_eq!(items[0].children[0].signature, "Section");
+    }
+}
