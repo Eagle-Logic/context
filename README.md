@@ -39,6 +39,12 @@ ctx callers basename ~/projects/myrepo
 # Everything needed to edit a symbol, in one call (def + types + callees + callers)
 ctx context streamChat ~/projects/myrepo --max-tokens 4000
 
+# The modules that matter most (dependency centrality)
+ctx core ~/projects/myrepo
+
+# Breaking-change check: public API removed/changed since a ref + who breaks
+ctx changed --api ~/projects/myrepo --since main
+
 # Coverage / blind-spot report: how much resolved, where to distrust
 ctx doctor ~/projects/myrepo
 
@@ -52,6 +58,18 @@ ctx map ~/projects/myrepo --format json
 # Print the recommended CLAUDE.md discovery-protocol block
 ctx snippet >> ~/projects/myrepo/CLAUDE.md
 ```
+
+`core` ranks modules by dependency centrality — PageRank over the module
+graph, so the modules everything else leans on float to the top. It's the
+"where's the heart of this codebase" answer for an unfamiliar repo, computed
+deterministically rather than guessed.
+
+`changed --api` is a pre-merge safety gate: it builds the public API surface
+both at a base ref (in a throwaway detached worktree) and in the working
+tree, then reports the public items that were **removed** or whose
+**signature changed** — each with the callers it breaks — plus additions as
+non-breaking. Turns "did I break the API?" into a one-command check for CI or
+a pre-push hook.
 
 `context` is the agent-native command: one call returns the definition, the
 type definitions referenced in its signature, its callees, and its callers —

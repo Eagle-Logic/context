@@ -545,6 +545,102 @@ fn append_capped(out: &mut String, lines: impl Iterator<Item = String>, cap: usi
     }
 }
 
+// ---- core (centrality) -----------------------------------------------------
+
+/// Rank modules by dependency centrality — PageRank over the module graph
+/// (edge `m -> d` for each dep `d` of `m`), so heavily-depended-upon modules
+/// score highest. Deterministic: fixed damping and iteration count.
+pub fn core(g: &Graph, limit: usize, json_out: bool) -> String {
+    let n = g.modules.len();
+    if n == 0 {
+        return "no modules\n".to_string();
+    }
+    let index: HashMap<&str, usize> = g
+        .modules
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.name.as_str(), i))
+        .collect();
+    let out: Vec<Vec<usize>> = g
+        .modules
+        .iter()
+        .map(|m| {
+            m.deps
+                .iter()
+                .filter_map(|d| index.get(d.as_str()).copied())
+                .collect()
+        })
+        .collect();
+    let outdeg: Vec<usize> = out.iter().map(Vec::len).collect();
+
+    let damping = 0.85;
+    let base = (1.0 - damping) / n as f64;
+    let mut rank = vec![1.0 / n as f64; n];
+    for _ in 0..50 {
+        let dangling: f64 = (0..n).filter(|&i| outdeg[i] == 0).map(|i| rank[i]).sum();
+        let mut next = vec![base + damping * dangling / n as f64; n];
+        for i in 0..n {
+            if outdeg[i] > 0 {
+                let share = damping * rank[i] / outdeg[i] as f64;
+                for &j in &out[i] {
+                    next[j] += share;
+                }
+            }
+        }
+        rank = next;
+    }
+
+    let mut indeg = vec![0usize; n];
+    for edges in &out {
+        for &j in edges {
+            indeg[j] += 1;
+        }
+    }
+
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        rank[b]
+            .partial_cmp(&rank[a])
+            .unwrap()
+            .then(g.modules[a].name.cmp(&g.modules[b].name))
+    });
+    order.truncate(limit);
+
+    if json_out {
+        let arr: Vec<_> = order
+            .iter()
+            .map(|&i| {
+                json!({
+                    "module": g.modules[i].name,
+                    "file": g.modules[i].file,
+                    "score": rank[i],
+                    "dependents": indeg[i],
+                    "dependencies": outdeg[i],
+                    "items": g.modules[i].item_count(),
+                })
+            })
+            .collect();
+        return serde_json::to_string_pretty(&json!({"root": g.root, "core": arr}))
+            .unwrap_or_default()
+            + "\n";
+    }
+
+    let mut s = format!("# Core modules — {}\n", g.root);
+    s.push_str("Ranked by dependency centrality (PageRank); higher = more depended-upon.\n\n");
+    s.push_str("  score    in  out  module\n");
+    for &i in &order {
+        s.push_str(&format!(
+            "  {:.4}  {:>4} {:>4}  {}  [{} items]\n",
+            rank[i],
+            indeg[i],
+            outdeg[i],
+            g.modules[i].name,
+            g.modules[i].item_count()
+        ));
+    }
+    s
+}
+
 // ---- coverage --------------------------------------------------------------
 
 /// A completeness/blind-spot report: how much of the call graph resolved,
@@ -654,6 +750,163 @@ pub fn coverage_report(g: &Graph, unsupported: &[(String, usize)], json_out: boo
         }
     }
     out.push_str("  (supported: .rs .py .ts .tsx)\n");
+    out
+}
+
+// ---- api diff (breaking-change detector) -----------------------------------
+
+struct Surface {
+    kind: String,
+    signature: String,
+    file: String,
+    line: usize,
+    /// Segments to match call edges against (container + name, or just name).
+    match_q: Vec<String>,
+}
+
+fn is_surface_kind(k: &str) -> bool {
+    matches!(
+        k,
+        "fn" | "def" | "struct" | "enum" | "trait" | "interface" | "type" | "class" | "const"
+            | "macro"
+    )
+}
+
+/// The public API surface of a graph: every exported/`pub` item (and public
+/// methods of public types) keyed by qualified name, with its signature.
+fn public_surface(g: &Graph) -> BTreeMap<String, Surface> {
+    fn rec(
+        items: &[Item],
+        m: &Module,
+        container: Option<&str>,
+        sep: &str,
+        force_public: bool,
+        map: &mut BTreeMap<String, Surface>,
+    ) {
+        for it in items {
+            let public = force_public || crate::view::is_public(it, m.lang);
+            if let (Some(name), true) = (&it.name, public) {
+                if is_surface_kind(&it.kind) {
+                    let qual = match container {
+                        Some(c) => format!("{}{sep}{c}{sep}{name}", m.name),
+                        None => format!("{}{sep}{name}", m.name),
+                    };
+                    let match_q = match container {
+                        Some(c) => vec![c.to_string(), name.clone()],
+                        None => vec![name.clone()],
+                    };
+                    map.insert(
+                        qual,
+                        Surface {
+                            kind: it.kind.clone(),
+                            signature: it.signature.clone(),
+                            file: m.file.clone(),
+                            line: it.line,
+                            match_q,
+                        },
+                    );
+                }
+            }
+            if matches!(it.kind.as_str(), "impl" | "trait" | "class" | "mod") {
+                let next = it.name.as_deref().or(container);
+                // Trait methods have no `pub` but are part of the trait's API.
+                let child_force = it.kind == "trait" && crate::view::is_public(it, m.lang);
+                rec(&it.children, m, next, sep, child_force, map);
+            }
+        }
+    }
+    let mut map = BTreeMap::new();
+    for m in &g.modules {
+        rec(&m.items, m, None, sep_of(m), false, &mut map);
+    }
+    map
+}
+
+fn caller_names(g: &Graph, q: &[String]) -> Vec<String> {
+    let refs: Vec<&str> = q.iter().map(String::as_str).collect();
+    callers_of(g, &refs).into_iter().map(|c| c.qualname).collect()
+}
+
+fn fmt_callers(names: &[String]) -> String {
+    if names.is_empty() {
+        "    callers: none found in this tree\n".to_string()
+    } else {
+        let shown: Vec<&str> = names.iter().take(8).map(String::as_str).collect();
+        let more = names.len().saturating_sub(shown.len());
+        let suffix = if more > 0 {
+            format!(", +{more} more")
+        } else {
+            String::new()
+        };
+        format!("    callers ({}): {}{}\n", names.len(), shown.join(", "), suffix)
+    }
+}
+
+/// Diff the public API surface between `base` and `current`: removed and
+/// signature-changed public items are (potentially) breaking; each is listed
+/// with the callers it affects (removed → who used it in `base`; changed →
+/// who uses it in `current`).
+pub fn api_report(base: &Graph, current: &Graph, label: &str, json_out: bool) -> String {
+    let bs = public_surface(base);
+    let cs = public_surface(current);
+
+    let mut removed: Vec<(&String, &Surface)> = Vec::new();
+    let mut changed: Vec<(&String, &Surface, &Surface)> = Vec::new();
+    for (q, b) in &bs {
+        match cs.get(q) {
+            None => removed.push((q, b)),
+            Some(c) if c.signature != b.signature => changed.push((q, b, c)),
+            _ => {}
+        }
+    }
+    let added: Vec<(&String, &Surface)> = cs.iter().filter(|(q, _)| !bs.contains_key(*q)).collect();
+
+    if json_out {
+        return serde_json::to_string_pretty(&json!({
+            "since": label,
+            "removed": removed.iter().map(|(q, b)| json!({"name": q, "kind": b.kind, "signature": b.signature, "callers": caller_names(base, &b.match_q)})).collect::<Vec<_>>(),
+            "changed": changed.iter().map(|(q, b, c)| json!({"name": q, "kind": c.kind, "was": b.signature, "now": c.signature, "callers": caller_names(current, &c.match_q)})).collect::<Vec<_>>(),
+            "added": added.iter().map(|(q, c)| json!({"name": q, "kind": c.kind, "signature": c.signature})).collect::<Vec<_>>(),
+        }))
+        .unwrap_or_default()
+            + "\n";
+    }
+
+    if removed.is_empty() && changed.is_empty() && added.is_empty() {
+        return format!("no public API changes vs {label}\n");
+    }
+
+    let mut out = format!("# API changes vs {label}\n");
+    out.push_str(&format!(
+        "{} removed, {} changed, {} added.\n",
+        removed.len(),
+        changed.len(),
+        added.len()
+    ));
+
+    if !removed.is_empty() {
+        out.push_str("\n## Removed — breaking\n");
+        for (q, b) in &removed {
+            out.push_str(&format!("- {q}  [{}]  ({}:{})\n", b.kind, b.file, b.line));
+            out.push_str(&format!("    was: {}\n", b.signature));
+            out.push_str(&fmt_callers(&caller_names(base, &b.match_q)));
+        }
+    }
+    if !changed.is_empty() {
+        out.push_str("\n## Changed signature — potentially breaking\n");
+        for (q, b, c) in &changed {
+            out.push_str(&format!("- {q}  [{}]  ({}:{})\n", c.kind, c.file, c.line));
+            out.push_str(&format!("    was: {}\n", b.signature));
+            out.push_str(&format!("    now: {}\n", c.signature));
+            out.push_str(&fmt_callers(&caller_names(current, &c.match_q)));
+        }
+    }
+    if !added.is_empty() {
+        out.push_str("\n## Added — non-breaking\n");
+        for (q, c) in &added {
+            out.push_str(&format!("- {q}  [{}]  {}\n", c.kind, c.signature));
+        }
+    }
     out
 }
 
@@ -834,6 +1087,39 @@ mod tests {
         assert!(out.contains("a::Widget [struct]"), "{out}");
         assert!(!out.contains("## Signature types\n- a::count"), "{out}");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn core_ranks_hub_above_leaves() {
+        let (g, dir) = graph(&[
+            ("src/hub.rs", "pub fn h() {}\n"),
+            ("src/a.rs", "use crate::hub::h;\npub fn a() { h(); }\n"),
+            ("src/b.rs", "use crate::hub::h;\npub fn b() { h(); }\n"),
+        ]);
+        let out = core(&g, 10, false);
+        let hub = out.find("  hub  [").unwrap();
+        let a = out.find("  a  [").unwrap();
+        assert!(hub < a, "hub (2 dependents) should outrank a:\n{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn api_report_flags_removed_changed_added() {
+        let base = graph(&[(
+            "src/api.rs",
+            "pub fn stable() {}\npub fn gone() {}\npub fn morph(a: i32) {}\n",
+        )]);
+        let cur = graph(&[(
+            "src/api.rs",
+            "pub fn stable() {}\npub fn morph(a: i32, b: i32) {}\npub fn fresh() {}\n",
+        )]);
+        let out = api_report(&base.0, &cur.0, "HEAD", false);
+        assert!(out.contains("## Removed") && out.contains("api::gone"), "{out}");
+        assert!(out.contains("## Changed") && out.contains("api::morph"), "{out}");
+        assert!(out.contains("## Added") && out.contains("api::fresh"), "{out}");
+        assert!(!out.contains("stable"), "unchanged item must not appear:\n{out}");
+        let _ = fs::remove_dir_all(base.1);
+        let _ = fs::remove_dir_all(cur.1);
     }
 
     #[test]

@@ -74,7 +74,7 @@ fn transform_item(mut it: Item, view: View, lang: Lang) -> Option<Item> {
     }
 }
 
-fn is_public(it: &Item, lang: Lang) -> bool {
+pub fn is_public(it: &Item, lang: Lang) -> bool {
     match lang {
         Lang::Rust => it.signature.starts_with("pub"),
         Lang::Python => match &it.name {

@@ -95,6 +95,16 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
     },
+    /// Rank modules by dependency centrality — the heart of the codebase
+    Core {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// How many modules to show
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+        #[arg(long, value_enum, default_value_t = Format::Md)]
+        format: Format,
+    },
     /// Coverage report: how much of the call graph resolved, and blind spots
     Doctor {
         #[arg(default_value = ".")]
@@ -109,6 +119,9 @@ enum Cmd {
         /// Diff against this git ref instead of the working tree vs HEAD
         #[arg(long)]
         since: Option<String>,
+        /// Report public-API changes (removed/changed signatures + who breaks)
+        #[arg(long)]
+        api: bool,
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
         #[arg(long, value_enum, default_value_t = View::Full)]
@@ -140,6 +153,10 @@ implementation bodies.
   types in its signature, what it calls, and what calls it (token-budgeted via `--max-tokens`)
 - `ctx changed [--since <ref>]` — impact map of your diff: the changed modules plus their
   dependencies and the callers they may break (defaults to the working tree vs HEAD)
+- `ctx changed --api [--since <ref>]` — public API changes in your diff: removed or
+  signature-changed public items and who breaks (a pre-merge breaking-change check)
+- `ctx core` — the modules that matter most, ranked by dependency centrality (where to look
+  first in an unfamiliar codebase)
 - `ctx doctor` — coverage report: what fraction of the call graph resolved and which modules/
   edges to distrust (run once to calibrate how much to lean on ctx for this repo)
 - add `--format json` to any of the above for machine-readable output
@@ -253,6 +270,14 @@ fn main() -> Result<()> {
                 query::context(&g, &name, max_tokens, matches!(format, Format::Json))
             );
         }
+        Cmd::Core {
+            path,
+            limit,
+            format,
+        } => {
+            let g = extract::build_graph(&path)?;
+            print!("{}", query::core(&g, limit, matches!(format, Format::Json)));
+        }
         Cmd::Doctor { path, format } => {
             let g = extract::build_graph(&path)?;
             let unsupported = extract::unsupported_census(&path);
@@ -264,6 +289,34 @@ fn main() -> Result<()> {
         Cmd::Changed {
             path,
             since,
+            api,
+            format,
+            view: _,
+        } if api => {
+            // Compare the public API surface now vs a base ref, building the
+            // base tree in a throwaway detached worktree.
+            let current = extract::build_graph(&path)?;
+            let label = since.as_deref().unwrap_or("HEAD");
+            let repo = git::repo_root(&path)?;
+            let rel = path
+                .canonicalize()?
+                .strip_prefix(&repo)
+                .map(|p| p.to_path_buf())
+                .unwrap_or_default();
+            let wt = std::env::temp_dir().join(format!("ctx-api-{}", std::process::id()));
+            git::add_worktree(&repo, &wt, label)?;
+            let base = extract::build_graph(&wt.join(&rel));
+            git::remove_worktree(&repo, &wt);
+            let base = base?;
+            print!(
+                "{}",
+                query::api_report(&base, &current, label, matches!(format, Format::Json))
+            );
+        }
+        Cmd::Changed {
+            path,
+            since,
+            api: _,
             format,
             view,
         } => {

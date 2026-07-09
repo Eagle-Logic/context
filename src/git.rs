@@ -71,6 +71,35 @@ pub fn changed_files(path: &Path, since: Option<&str>) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Check out `refname` into a detached worktree at `at` so a graph can be
+/// built from the tree as it was at that ref.
+pub fn add_worktree(repo: &Path, at: &Path, refname: &str) -> Result<()> {
+    let out = git(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            "--quiet",
+            &at.to_string_lossy(),
+            refname,
+        ],
+    )?;
+    if !out.status.success() {
+        bail!(
+            "git worktree add for '{}' failed: {}",
+            refname,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Remove a worktree created by [`add_worktree`]. Best-effort.
+pub fn remove_worktree(repo: &Path, at: &Path) {
+    let _ = git(repo, &["worktree", "remove", "--force", &at.to_string_lossy()]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
