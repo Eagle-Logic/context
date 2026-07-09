@@ -3,6 +3,8 @@
 //! path (`./other.md#section`, `#local`, `[[WikiPage]]`); the resolver's
 //! Markdown branch turns it into an edge to a heading — or flags it broken.
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 
 use crate::model::{FileFacts, Item, RawCall, Receiver};
@@ -47,6 +49,10 @@ pub fn extract(src: &str) -> Result<FileFacts> {
     let mut fence_marker = "";
     let mut prev_line: Option<&str> = None;
 
+    // Reference-style link definitions (`[label]: url`) can appear anywhere in
+    // the file, so gather them all up front before harvesting link uses.
+    let defs = collect_link_defs(src);
+
     for raw in src.lines() {
         let line = raw.trim_end();
         let trimmed = line.trim_start();
@@ -81,7 +87,7 @@ pub fn extract(src: &str) -> Result<FileFacts> {
                 name: Some(s),
                 raw_calls: Vec::new(),
             };
-            extract_links(&text, &mut item.raw_calls); // links in the heading itself
+            extract_links(&text, &defs, &mut item.raw_calls); // links in the heading itself
             item.line = flat.len(); // placeholder; real line assigned next pass
             flat.push(Heading { level, item });
             prev_line = Some(line);
@@ -91,9 +97,13 @@ pub fn extract(src: &str) -> Result<FileFacts> {
         // Body line under the current heading: harvest links, and grab the
         // first prose line as the section's doc.
         if let Some(h) = flat.last_mut() {
-            extract_links(line, &mut h.item.raw_calls);
-            if h.item.doc.is_none() && !trimmed.is_empty() && !is_structural(trimmed) {
-                h.item.doc = Some(clip(&strip_inline(trimmed)));
+            // A `[label]: url` definition line is metadata, not prose or a link
+            // use — don't harvest it and don't let it become the section doc.
+            if link_def(line).is_none() {
+                extract_links(line, &defs, &mut h.item.raw_calls);
+                if h.item.doc.is_none() && !trimmed.is_empty() && !is_structural(trimmed) {
+                    h.item.doc = Some(clip(&strip_inline(trimmed)));
+                }
             }
         }
         prev_line = Some(line);
@@ -220,8 +230,9 @@ fn is_structural(t: &str) -> bool {
 }
 
 /// Extract link targets from a line: inline `[t](url)`, images `![t](url)`,
-/// and wiki `[[Page]]`. Inline code spans are skipped.
-fn extract_links(line: &str, out: &mut Vec<RawCall>) {
+/// wiki `[[Page]]`, and reference-style `[t][ref]` / `[t][]` / `[ref]`
+/// resolved against `defs`. Inline code spans are skipped.
+fn extract_links(line: &str, defs: &HashMap<String, String>, out: &mut Vec<RawCall>) {
     let b: Vec<char> = line.chars().collect();
     let mut i = 0;
     let mut in_code = false;
@@ -245,7 +256,7 @@ fn extract_links(line: &str, out: &mut Vec<RawCall>) {
                 }
             }
             '[' => {
-                if let Some((url, next)) = inline_link(&b, i) {
+                if let Some((url, next)) = bracket_link(&b, i, defs) {
                     push_link(&url, out);
                     i = next;
                 } else {
@@ -257,16 +268,64 @@ fn extract_links(line: &str, out: &mut Vec<RawCall>) {
     }
 }
 
-fn inline_link(b: &[char], open: usize) -> Option<(String, usize)> {
+/// Resolve a `[...]`-opened link, trying inline, then reference, then shortcut
+/// forms. Returns the target URL and the index just past the whole construct.
+fn bracket_link(b: &[char], open: usize, defs: &HashMap<String, String>) -> Option<(String, usize)> {
     let rb = find_char(b, open + 1, ']')?;
-    if rb + 1 >= b.len() || b[rb + 1] != '(' {
+    // Inline: `[text](url "title")`.
+    if b.get(rb + 1) == Some(&'(') {
+        let rp = find_char(b, rb + 2, ')')?;
+        let raw: String = b[rb + 2..rp].iter().collect();
+        let url = raw.split_whitespace().next().unwrap_or("").to_string();
+        return Some((url, rp + 1));
+    }
+    // Reference: `[text][label]` or collapsed `[text][]` (label = text).
+    if b.get(rb + 1) == Some(&'[') {
+        let rb2 = find_char(b, rb + 2, ']')?;
+        let label: String = b[rb + 2..rb2].iter().collect();
+        let text: String = b[open + 1..rb].iter().collect();
+        let key = if label.trim().is_empty() {
+            text.trim().to_lowercase()
+        } else {
+            label.trim().to_lowercase()
+        };
+        return defs.get(&key).map(|url| (url.clone(), rb2 + 1));
+    }
+    // Shortcut: `[label]` used on its own, resolved only if a def exists.
+    let text: String = b[open + 1..rb].iter().collect();
+    let key = text.trim().to_lowercase();
+    defs.get(&key).map(|url| (url.clone(), rb + 1))
+}
+
+/// Collect every reference-style link definition (`[label]: url`) in the file,
+/// keyed by lowercased label (matching CommonMark's case-insensitive labels).
+fn collect_link_defs(src: &str) -> HashMap<String, String> {
+    let mut defs = HashMap::new();
+    for line in src.lines() {
+        if let Some((label, url)) = link_def(line) {
+            defs.entry(label.to_lowercase()).or_insert(url);
+        }
+    }
+    defs
+}
+
+/// Parse a single reference-definition line `[label]: url "optional title"`;
+/// returns the (label, url) or None if the line isn't a definition.
+fn link_def(line: &str) -> Option<(String, String)> {
+    let rest = line.trim_start().strip_prefix('[')?;
+    let close = rest.find("]:")?;
+    let label = &rest[..close];
+    if label.is_empty() || label.contains('[') {
+        return None; // empty or a `[[wiki]]`-style bracket, not a link label
+    }
+    let url = rest[close + 2..]
+        .split_whitespace()
+        .next()?
+        .trim_matches(|c| c == '<' || c == '>');
+    if url.is_empty() {
         return None;
     }
-    let rp = find_char(b, rb + 2, ')')?;
-    let raw: String = b[rb + 2..rp].iter().collect();
-    // Drop an optional title: `(url "title")`.
-    let url = raw.split_whitespace().next().unwrap_or("").to_string();
-    Some((url, rp + 1))
+    Some((label.to_string(), url.to_string()))
 }
 
 fn push_link(url: &str, out: &mut Vec<RawCall>) {
@@ -339,6 +398,44 @@ mod tests {
         assert_eq!(
             extract(src).unwrap().items[0].doc.as_deref(),
             Some("This is the summary.")
+        );
+    }
+
+    #[test]
+    fn reference_style_links_resolve_via_defs() {
+        let src = "\
+# T
+
+See the [design doc][design] and the [guide][] and a [shortcut].
+
+[design]: ./design.md#goals
+[guide]: ./guide.md
+[shortcut]: https://example.com
+";
+        let paths: Vec<String> = extract(src).unwrap().items[0]
+            .raw_calls
+            .iter()
+            .map(|c| c.path.clone())
+            .collect();
+        assert!(paths.contains(&"./design.md#goals".to_string()), "{paths:?}");
+        assert!(paths.contains(&"./guide.md".to_string()), "{paths:?}");
+        assert!(paths.contains(&"https://example.com".to_string()), "{paths:?}");
+        // The definition lines themselves must not leak in as prose or links.
+        assert_eq!(paths.len(), 3, "{paths:?}");
+    }
+
+    #[test]
+    fn unresolved_reference_label_is_not_a_link() {
+        let src = "# T\n\nText with [dangling] brackets and a task - [ ] item.\n";
+        assert!(extract(src).unwrap().items[0].raw_calls.is_empty());
+    }
+
+    #[test]
+    fn definition_line_is_not_the_doc() {
+        let src = "# T\n\n[ref]: ./x.md\n\nReal summary here.\n";
+        assert_eq!(
+            extract(src).unwrap().items[0].doc.as_deref(),
+            Some("Real summary here.")
         );
     }
 

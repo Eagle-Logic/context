@@ -61,6 +61,9 @@ pub struct Diagnostics {
     /// Ubiquitous std/builtin method names (`push`, `iter`, `map`, …) that are
     /// intentionally never edged — not a blind spot.
     pub std_builtin: usize,
+    /// Markdown only: (line, target) of links that resolve to no existing
+    /// file or heading — i.e. genuinely broken links.
+    pub broken_links: Vec<(usize, String)>,
 }
 
 /// A name made importable from a module via use/import: `name` is the bound

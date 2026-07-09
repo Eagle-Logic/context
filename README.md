@@ -178,10 +178,12 @@ doc questions:
 
 Files are modules (`README.md`/`index.md` collapse to their directory like an
 index file); links resolve relative to the linking file (`./x.md#section`,
-`../y.md`, `[[WikiPage]]`) against GitHub-style heading slugs. A link whose
-file or heading doesn't exist is a **broken link** (dropped, not edged);
-external URLs are left external. Reference-style links and prose→code
-resolution are not yet modelled.
+`../y.md`, `[[WikiPage]]`, and reference-style `[text][ref]` / `[ref]`)
+against GitHub-style heading slugs. A link whose file or heading doesn't exist
+is a **broken link**; external URLs are left external. `ctx doctor` lists every
+broken link (file:line → target) in its own section — an out-of-scope `../`
+link is only flagged when its target is genuinely absent from disk, not merely
+outside the scanned subtree. Prose→code resolution is not yet modelled.
 
 ### MCP server
 

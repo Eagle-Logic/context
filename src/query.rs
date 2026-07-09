@@ -748,6 +748,21 @@ pub fn coverage_report(g: &Graph, unsupported: &[(String, usize)], json_out: boo
     let mut drop_zones: Vec<&Module> = g.modules.iter().filter(|m| miss(m) > 0).collect();
     drop_zones.sort_by_key(|&m| std::cmp::Reverse(miss(m)));
 
+    // Markdown broken links: targets that resolve to no file or heading. These
+    // are true dead links (out-of-scope `../` links that exist on disk are not
+    // counted), so they warrant a dedicated report rather than the generic
+    // "external/unpinned" bucket that suits code.
+    let broken: Vec<(&str, usize, &str)> = g
+        .modules
+        .iter()
+        .flat_map(|m| {
+            m.diag
+                .broken_links
+                .iter()
+                .map(move |(line, target)| (m.file.as_str(), *line, target.as_str()))
+        })
+        .collect();
+
     if json_out {
         return serde_json::to_string_pretty(&json!({
             "root": g.root,
@@ -758,6 +773,7 @@ pub fn coverage_report(g: &Graph, unsupported: &[(String, usize)], json_out: boo
             "heuristic": heuristic,
             "std_builtin": std_builtin,
             "dropped": dropped,
+            "broken_links": broken.iter().map(|(f, l, t)| json!({"file": f, "line": l, "target": t})).collect::<Vec<_>>(),
             "unsupported_files": unsupported.iter().map(|(e, n)| json!({"ext": e, "count": n})).collect::<Vec<_>>(),
         }))
         .unwrap_or_default()
@@ -810,6 +826,17 @@ pub fn coverage_report(g: &Graph, unsupported: &[(String, usize)], json_out: boo
                 miss(m),
                 m.diag.call_sites
             ));
+        }
+    }
+
+    if !broken.is_empty() {
+        out.push_str(&format!("\n## Broken links ({}, Markdown)\n", broken.len()));
+        out.push_str("targets pointing at no file or heading (existing out-of-scope links excluded):\n");
+        for (file, line, target) in broken.iter().take(20) {
+            out.push_str(&format!("  {file}:{line}  →  {target}\n"));
+        }
+        if broken.len() > 20 {
+            out.push_str(&format!("  … and {} more\n", broken.len() - 20));
         }
     }
 
@@ -1211,6 +1238,11 @@ mod tests {
         // The heading anchor is a backlink target.
         let out = callers(&g, "install", false);
         assert!(out.contains("guide"), "{out}");
+        // The dead link surfaces in the coverage report's broken-links section.
+        let cov = coverage_report(&g, &[], false);
+        assert!(cov.contains("## Broken links"), "{cov}");
+        assert!(cov.contains("./ghost.md"), "{cov}");
+        assert!(!cov.contains("./setup.md"), "resolved link must not be broken:\n{cov}");
         let _ = fs::remove_dir_all(dir);
     }
 

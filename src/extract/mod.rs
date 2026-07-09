@@ -122,7 +122,7 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
         });
     }
 
-    resolve_deps(&mut modules);
+    resolve_deps(&mut modules, &root);
     modules.sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(Graph {
@@ -223,6 +223,8 @@ struct Ctx<'a> {
     /// prefix wins.
     index: Vec<(Vec<String>, String)>,
     by_name: HashMap<String, usize>,
+    /// Canonical scan root, for on-disk checks (markdown link targets).
+    root: &'a Path,
 }
 
 enum Resolved {
@@ -231,7 +233,7 @@ enum Resolved {
     Ignore,
 }
 
-fn resolve_deps(modules: &mut [Module]) {
+fn resolve_deps(modules: &mut [Module], root: &Path) {
     let mut index: Vec<(Vec<String>, String)> = modules
         .iter()
         .map(|m| (m.name_segs(), m.name.clone()))
@@ -255,6 +257,7 @@ fn resolve_deps(modules: &mut [Module]) {
             modules: &*modules,
             index,
             by_name,
+            root,
         };
         let method_index = build_method_index(ctx.modules);
         ctx.modules
@@ -749,16 +752,36 @@ fn resolve_md_link(link: &str, m: &Module, ctx: &Ctx) -> Resolution {
             None => md_module_edge(&name, m),
             Some(g) => md_anchor_edge(&name, g, m, ctx),
         },
-        // A doc link that resolves to nothing is broken; a non-doc asset
-        // (`.png`, `.rs`) simply isn't a node in the doc graph.
+        // A doc link that resolves to no module is broken — unless the file
+        // exists on disk but simply wasn't scanned (e.g. linking out of a
+        // subdir); then it's out-of-scope, not broken. Non-doc assets
+        // (`.png`, `.rs`) are never doc nodes.
         _ => {
-            if is_doc {
+            if is_doc && !md_target_on_disk(ctx.root, &m.file, file_part) {
                 Resolution::Drop
             } else {
                 Resolution::StdBuiltin
             }
         }
     }
+}
+
+/// Does a relative markdown link target exist on disk, relative to the
+/// linking file? Tries the path as-is, with an `.md`/`.markdown` extension,
+/// and as a directory with a README/index.
+fn md_target_on_disk(root: &Path, m_file: &str, file_part: &str) -> bool {
+    let dir = root.join(m_file);
+    let dir = dir.parent().unwrap_or(root);
+    let target = dir.join(file_part);
+    if target.exists() {
+        return true;
+    }
+    for ext in ["md", "markdown"] {
+        if dir.join(format!("{file_part}.{ext}")).exists() {
+            return true;
+        }
+    }
+    target.join("README.md").exists() || target.join("index.md").exists()
 }
 
 fn resolve_md_wiki(inner: &str, m: &Module, ctx: &Ctx) -> Resolution {
@@ -959,7 +982,12 @@ fn compute_calls(
                         }
                     }
                     Resolution::StdBuiltin => diag.std_builtin += 1,
-                    Resolution::Drop => {}
+                    Resolution::Drop => {
+                        // For markdown, a drop is a genuine broken link.
+                        if m.lang == Lang::Markdown {
+                            diag.broken_links.push((it.line, rc.path.clone()));
+                        }
+                    }
                 }
             }
             per_item.push(
