@@ -42,6 +42,25 @@ pub struct Module {
     /// name rather than its parent.
     #[serde(skip)]
     pub is_package: bool,
+    /// Call-edge resolution stats for this module (for `ctx doctor`).
+    #[serde(skip)]
+    pub diag: Diagnostics,
+}
+
+/// How completely a module's call sites resolved — the raw material for the
+/// coverage report. `dropped = call_sites - resolved`.
+#[derive(Default, Clone)]
+pub struct Diagnostics {
+    /// Call sites seen (post-extract, so `<T as Trait>::f` and other
+    /// extract-time drops are not counted here).
+    pub call_sites: usize,
+    /// Call sites that produced an edge.
+    pub resolved: usize,
+    /// Of the resolved, how many are heuristic (receiver-inferred).
+    pub heuristic: usize,
+    /// Ubiquitous std/builtin method names (`push`, `iter`, `map`, …) that are
+    /// intentionally never edged — not a blind spot.
+    pub std_builtin: usize,
 }
 
 /// A name made importable from a module via use/import: `name` is the bound
@@ -67,6 +86,16 @@ pub enum Lang {
     Rust,
     Python,
     TypeScript,
+}
+
+impl Lang {
+    pub fn name(self) -> &'static str {
+        match self {
+            Lang::Rust => "rust",
+            Lang::Python => "python",
+            Lang::TypeScript => "typescript",
+        }
+    }
 }
 
 #[derive(Serialize)]

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 
-use crate::model::{Binding, Call, Graph, Item, Lang, Module, RawCall, Receiver};
+use crate::model::{Binding, Call, Diagnostics, Graph, Item, Lang, Module, RawCall, Receiver};
 
 const SKIP_DIRS: &[&str] = &[
     "target",
@@ -108,6 +108,7 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
             defined_names: facts.defined,
             crate_prefix,
             is_package,
+            diag: Diagnostics::default(),
         });
     }
 
@@ -119,6 +120,39 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
         file_count: files.len(),
         modules,
     })
+}
+
+/// Source-language extensions `ctx` does not (yet) model — used by the
+/// coverage report to name its blind spots honestly.
+const UNSUPPORTED_SOURCE_EXTS: &[&str] = &[
+    "js", "jsx", "mjs", "cjs", "go", "java", "kt", "kts", "rb", "c", "cc", "cpp", "cxx", "h",
+    "hpp", "cs", "swift", "php", "scala", "clj", "ex", "exs", "lua", "vue", "svelte", "sql",
+];
+
+/// Count unmodeled source files by extension under `root`, honoring the same
+/// directory-skip rules as the graph walk. Returns (ext, count), descending.
+pub fn unsupported_census(root: &Path) -> Vec<(String, usize)> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for entry in WalkBuilder::new(root).build().flatten() {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if path
+            .components()
+            .any(|c| SKIP_DIRS.contains(&c.as_os_str().to_str().unwrap_or("")))
+        {
+            continue;
+        }
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if UNSUPPORTED_SOURCE_EXTS.contains(&ext) {
+                *counts.entry(ext.to_string()).or_default() += 1;
+            }
+        }
+    }
+    let mut v: Vec<(String, usize)> = counts.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    v
 }
 
 /// Derive a stable module name from the file path. "src" components are
@@ -198,7 +232,13 @@ fn resolve_deps(modules: &mut [Module]) {
         .map(|(i, m)| (m.name.clone(), i))
         .collect();
 
-    type ModuleResult = (BTreeSet<String>, BTreeSet<String>, Vec<String>, Vec<Vec<Call>>);
+    type ModuleResult = (
+        BTreeSet<String>,
+        BTreeSet<String>,
+        Vec<String>,
+        Vec<Vec<Call>>,
+        Diagnostics,
+    );
     let results: Vec<ModuleResult> = {
         let ctx = Ctx {
             modules: &*modules,
@@ -228,17 +268,18 @@ fn resolve_deps(modules: &mut [Module]) {
                     .filter(|b| b.public)
                     .map(|b| display_reexport(b, m, &ctx))
                     .collect();
-                let (calls_per_item, call_deps) = compute_calls(m, &ctx, &method_index);
+                let (calls_per_item, call_deps, diag) = compute_calls(m, &ctx, &method_index);
                 deps.extend(call_deps.into_iter().filter(|d| d != &m.name));
-                (deps, ext, reex, calls_per_item)
+                (deps, ext, reex, calls_per_item, diag)
             })
             .collect()
     };
 
-    for (m, (deps, ext, reex, calls)) in modules.iter_mut().zip(results) {
+    for (m, (deps, ext, reex, calls, diag)) in modules.iter_mut().zip(results) {
         m.deps = deps.into_iter().collect();
         m.extern_deps = ext.into_iter().collect();
         m.reexports = reex;
+        m.diag = diag;
         let mut it = calls.into_iter();
         apply_calls(&mut m.items, &mut it);
     }
@@ -558,13 +599,40 @@ fn container_has_method(m: &Module, container: &str, name: &str) -> bool {
 /// Resolve one call site to (display string, dep module). Same-module edges
 /// display without the module prefix and carry no dep. Unresolvable or
 /// ambiguous calls return None — never guessed.
+/// The outcome of resolving one call site — richer than an Option so the
+/// coverage report can separate std/builtin calls from genuine misses.
+enum Resolution {
+    Edge {
+        display: String,
+        dep: Option<String>,
+        heuristic: bool,
+    },
+    /// A ubiquitous std/builtin method — intentionally not edged.
+    StdBuiltin,
+    /// Could not be resolved to an internal edge (ambiguous, external, or
+    /// unknown receiver).
+    Drop,
+}
+
+/// Wrap `finish_call`'s Option into a Resolution.
+fn finished(fm: &str, fr: &[String], m: &Module, ctx: &Ctx) -> Resolution {
+    match finish_call(fm, fr, m, ctx) {
+        Some((display, dep, heuristic)) => Resolution::Edge {
+            display,
+            dep,
+            heuristic,
+        },
+        None => Resolution::Drop,
+    }
+}
+
 fn resolve_call(
     rc: &RawCall,
     container: Option<&str>,
     m: &Module,
     ctx: &Ctx,
     method_index: &MethodIndex,
-) -> Option<(String, Option<String>, bool)> {
+) -> Resolution {
     let s = sep(m.lang);
 
     match rc.recv {
@@ -582,34 +650,48 @@ fn resolve_call(
 
     let segs: Vec<&str> = rc.path.split(s).map(str::trim).filter(|x| !x.is_empty()).collect();
     match segs.len() {
-        0 => None,
+        0 => Resolution::Drop,
         1 => {
             let name = segs[0];
             if m.defined_names.contains(name) {
-                return Some((name.to_string(), None, false));
+                return Resolution::Edge {
+                    display: name.to_string(),
+                    dep: None,
+                    heuristic: false,
+                };
             }
             // `use crate::core::build; build()` / `from x import f; f()`
-            let b = m.raw_reexports.iter().find(|b| b.name == name)?;
-            let (n2, r2) = resolve_path(&b.path, m, ctx)?;
+            let Some(b) = m.raw_reexports.iter().find(|b| b.name == name) else {
+                return Resolution::Drop;
+            };
+            let Some((n2, r2)) = resolve_path(&b.path, m, ctx) else {
+                return Resolution::Drop;
+            };
             let (fm, fr) = chase(&n2, &r2, ctx, CHASE_DEPTH);
-            finish_call(&fm, &fr, m, ctx)
+            finished(&fm, &fr, m, ctx)
         }
         _ => {
             // Type-qualified local call: Engine::new() with Engine defined here.
             if m.defined_names.contains(segs[0]) {
-                return Some((segs.join(s), None, false));
+                return Resolution::Edge {
+                    display: segs.join(s),
+                    dep: None,
+                    heuristic: false,
+                };
             }
             // First segment bound by use/import: helpers::go(), np-style aliases.
             if let Some(b) = m.raw_reexports.iter().find(|b| b.name == segs[0]) {
                 let full = format!("{}{s}{}", b.path, segs[1..].join(s));
-                let (n2, r2) = resolve_path(&full, m, ctx)?;
+                let Some((n2, r2)) = resolve_path(&full, m, ctx) else {
+                    return Resolution::Drop;
+                };
                 let (fm, fr) = chase(&n2, &r2, ctx, CHASE_DEPTH);
-                return finish_call(&fm, &fr, m, ctx);
+                return finished(&fm, &fr, m, ctx);
             }
             // Direct path: crate::core::build(), pkg.utils.helper().
             if let Some((n2, r2)) = resolve_path(&rc.path, m, ctx) {
                 let (fm, fr) = chase(&n2, &r2, ctx, CHASE_DEPTH);
-                return finish_call(&fm, &fr, m, ctx);
+                return finished(&fm, &fr, m, ctx);
             }
             // Python `obj.method()`: the receiver is opaque, but the trailing
             // name may still resolve like a method call (heuristic).
@@ -618,7 +700,7 @@ fn resolve_call(
                     return method_edge(last, container, m, ctx, method_index, true);
                 }
             }
-            None
+            Resolution::Drop
         }
     }
 }
@@ -632,29 +714,46 @@ fn method_edge(
     ctx: &Ctx,
     method_index: &MethodIndex,
     receiver_unknown: bool,
-) -> Option<(String, Option<String>, bool)> {
+) -> Resolution {
     let s = sep(m.lang);
     if let Some(c) = container {
         if container_has_method(m, c, name) {
             // Reliable for a self receiver; a guess for an opaque one.
-            return Some((format!("{c}{s}{name}"), None, receiver_unknown));
+            return Resolution::Edge {
+                display: format!("{c}{s}{name}"),
+                dep: None,
+                heuristic: receiver_unknown,
+            };
         }
     }
     if STD_METHODS.contains(&name) {
-        return None;
+        return Resolution::StdBuiltin;
     }
-    let owners = method_index.get(name)?;
+    let Some(owners) = method_index.get(name) else {
+        return Resolution::Drop;
+    };
     if owners.len() != 1 {
-        return None;
+        return Resolution::Drop;
     }
     // Resolved purely because the method name is unique codebase-wide — a
     // heuristic, since the receiver type was never confirmed.
     let (om, oc) = owners.iter().next().unwrap();
-    let os = sep(ctx.modules[*ctx.by_name.get(om)?].lang);
+    let Some(&omi) = ctx.by_name.get(om) else {
+        return Resolution::Drop;
+    };
+    let os = sep(ctx.modules[omi].lang);
     if om == &m.name {
-        Some((format!("{oc}{os}{name}"), None, true))
+        Resolution::Edge {
+            display: format!("{oc}{os}{name}"),
+            dep: None,
+            heuristic: true,
+        }
     } else {
-        Some((format!("{om}{os}{oc}{os}{name}"), Some(om.clone()), true))
+        Resolution::Edge {
+            display: format!("{om}{os}{oc}{os}{name}"),
+            dep: Some(om.clone()),
+            heuristic: true,
+        }
     }
 }
 
@@ -687,7 +786,8 @@ fn compute_calls(
     m: &Module,
     ctx: &Ctx,
     method_index: &MethodIndex,
-) -> (Vec<Vec<Call>>, BTreeSet<String>) {
+) -> (Vec<Vec<Call>>, BTreeSet<String>, Diagnostics) {
+    #[allow(clippy::too_many_arguments)]
     fn rec(
         items: &[Item],
         container: Option<&str>,
@@ -696,20 +796,34 @@ fn compute_calls(
         method_index: &MethodIndex,
         per_item: &mut Vec<Vec<Call>>,
         deps: &mut BTreeSet<String>,
+        diag: &mut Diagnostics,
     ) {
         for it in items {
             // Dedup by target; if the same edge resolves both ways, the
             // trusted (non-heuristic) resolution wins.
             let mut calls: BTreeMap<String, bool> = BTreeMap::new();
             for rc in &it.raw_calls {
-                if let Some((disp, dep, heur)) = resolve_call(rc, container, m, ctx, method_index) {
-                    calls
-                        .entry(disp)
-                        .and_modify(|h| *h = *h && heur)
-                        .or_insert(heur);
-                    if let Some(d) = dep {
-                        deps.insert(d);
+                diag.call_sites += 1;
+                match resolve_call(rc, container, m, ctx, method_index) {
+                    Resolution::Edge {
+                        display,
+                        dep,
+                        heuristic,
+                    } => {
+                        diag.resolved += 1;
+                        if heuristic {
+                            diag.heuristic += 1;
+                        }
+                        calls
+                            .entry(display)
+                            .and_modify(|h| *h = *h && heuristic)
+                            .or_insert(heuristic);
+                        if let Some(d) = dep {
+                            deps.insert(d);
+                        }
                     }
+                    Resolution::StdBuiltin => diag.std_builtin += 1,
+                    Resolution::Drop => {}
                 }
             }
             per_item.push(
@@ -723,13 +837,14 @@ fn compute_calls(
             } else {
                 container
             };
-            rec(&it.children, next, m, ctx, method_index, per_item, deps);
+            rec(&it.children, next, m, ctx, method_index, per_item, deps, diag);
         }
     }
     let mut per_item = Vec::new();
     let mut deps = BTreeSet::new();
-    rec(&m.items, None, m, ctx, method_index, &mut per_item, &mut deps);
-    (per_item, deps)
+    let mut diag = Diagnostics::default();
+    rec(&m.items, None, m, ctx, method_index, &mut per_item, &mut deps, &mut diag);
+    (per_item, deps, diag)
 }
 
 fn apply_calls(items: &mut [Item], resolved: &mut std::vec::IntoIter<Vec<Call>>) {

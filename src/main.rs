@@ -83,6 +83,25 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
     },
+    /// Everything needed to edit a symbol: definition, signature types, callees, callers
+    Context {
+        /// Symbol name or qualified name, e.g. "SteerConfig" or "Type::method"
+        name: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Approximate token budget for the assembled context
+        #[arg(long, default_value_t = 4000)]
+        max_tokens: usize,
+        #[arg(long, value_enum, default_value_t = Format::Md)]
+        format: Format,
+    },
+    /// Coverage report: how much of the call graph resolved, and blind spots
+    Doctor {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, value_enum, default_value_t = Format::Md)]
+        format: Format,
+    },
     /// Impact map of a diff: changed modules + upstream deps + downstream callers
     Changed {
         #[arg(default_value = ".")]
@@ -117,15 +136,19 @@ implementation bodies.
   without knowing the module; accepts bare `Foo` or qualified `Type::method`)
 - `ctx callers <name>` — every function that calls the given function/method (resolved reverse
   call edges — the blast radius before you change a signature; more precise than grep)
+- `ctx context <name>` — everything needed to edit a symbol in one shot: its definition, the
+  types in its signature, what it calls, and what calls it (token-budgeted via `--max-tokens`)
 - `ctx changed [--since <ref>]` — impact map of your diff: the changed modules plus their
   dependencies and the callers they may break (defaults to the working tree vs HEAD)
+- `ctx doctor` — coverage report: what fraction of the call graph resolved and which modules/
+  edges to distrust (run once to calibrate how much to lean on ctx for this repo)
 - add `--format json` to any of the above for machine-readable output
 
 Protocol: before modifying or analyzing code, run `ctx map --view skeleton` to load the
-topology. To work on a module, run `ctx subtree <module>` first and follow its call edges.
-If you encounter an unfamiliar type or function, run `ctx def <name>` (or `ctx subtree` on its
-defining module) instead of reading the file. Before changing a function's signature or
-behavior, run `ctx callers <name>` to see everything that depends on it. Line anchors (`[L42]`)
+topology. When you're about to work on a specific symbol, run `ctx context <name>` — it bundles
+the definition, signature types, callees, and callers in one call, so you rarely need to open the
+file until you're editing its body. For broader orientation use `ctx subtree <module>`; before
+changing a signature run `ctx callers <name>` to see the blast radius. Line anchors (`[L42]`)
 give exact positions for surgical reads.
 "#;
 
@@ -216,6 +239,26 @@ fn main() -> Result<()> {
             print!(
                 "{}",
                 query::callers(&g, &name, matches!(format, Format::Json))
+            );
+        }
+        Cmd::Context {
+            name,
+            path,
+            max_tokens,
+            format,
+        } => {
+            let g = extract::build_graph(&path)?;
+            print!(
+                "{}",
+                query::context(&g, &name, max_tokens, matches!(format, Format::Json))
+            );
+        }
+        Cmd::Doctor { path, format } => {
+            let g = extract::build_graph(&path)?;
+            let unsupported = extract::unsupported_census(&path);
+            print!(
+                "{}",
+                query::coverage_report(&g, &unsupported, matches!(format, Format::Json))
             );
         }
         Cmd::Changed {

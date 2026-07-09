@@ -2,7 +2,7 @@
 //! site) and `callers` (reverse call edges). Both are pure traversals over
 //! the graph `build_graph` already produces — no extra extraction.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::json;
 
@@ -271,6 +271,392 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
     out
 }
 
+fn callers_of(g: &Graph, q: &[&str]) -> Vec<Caller> {
+    let mut found = Vec::new();
+    for m in &g.modules {
+        let mut path = Vec::new();
+        collect_callers(&m.items, m, &mut path, q, &mut found);
+    }
+    found.sort_by(|a, b| (&a.qualname, a.line).cmp(&(&b.qualname, b.line)));
+    found
+}
+
+// ---- context ---------------------------------------------------------------
+
+/// Type/keyword names never worth resolving as a signature reference.
+const NOISE: &[&str] = &[
+    "self", "Self", "str", "String", "bool", "char", "usize", "isize", "u8", "u16", "u32", "u64",
+    "u128", "i8", "i16", "i32", "i64", "i128", "f32", "f64", "Vec", "Option", "Result", "Box",
+    "Rc", "Arc", "HashMap", "BTreeMap", "HashSet", "BTreeSet", "string", "number", "boolean",
+    "void", "unknown", "any", "Promise", "Record", "Array", "object", "null", "undefined",
+    "never", "export", "function", "const", "class", "interface", "type", "enum", "pub", "fn",
+    "async", "await", "impl", "def", "struct", "trait", "mut", "dyn", "where", "return", "true",
+    "false", "None", "Some", "Ok", "Err",
+];
+
+struct DefLite {
+    qualname: String,
+    kind: String,
+    file: String,
+    line: usize,
+    doc: Option<String>,
+}
+
+/// Index every named item by bare name (first definition wins) for resolving
+/// the types that appear in a signature.
+fn def_index(g: &Graph) -> HashMap<String, DefLite> {
+    fn rec<'a>(
+        items: &'a [Item],
+        m: &'a Module,
+        container: Option<&str>,
+        sep: &str,
+        idx: &mut HashMap<String, DefLite>,
+    ) {
+        for it in items {
+            if let Some(name) = &it.name {
+                idx.entry(name.clone()).or_insert_with(|| {
+                    let qualname = match container {
+                        Some(c) => format!("{}{sep}{c}{sep}{name}", m.name),
+                        None => format!("{}{sep}{name}", m.name),
+                    };
+                    DefLite {
+                        qualname,
+                        kind: it.kind.clone(),
+                        file: m.file.clone(),
+                        line: it.line,
+                        doc: it.doc.clone(),
+                    }
+                });
+            }
+            let next = if matches!(it.kind.as_str(), "impl" | "trait" | "class" | "mod") {
+                it.name.as_deref().or(container)
+            } else {
+                container
+            };
+            rec(&it.children, m, next, sep, idx);
+        }
+    }
+    let mut idx = HashMap::new();
+    for m in &g.modules {
+        rec(&m.items, m, None, sep_of(m), &mut idx);
+    }
+    idx
+}
+
+/// Locate the target items (with their enclosing container) for a query.
+#[allow(clippy::type_complexity)]
+fn find_targets<'a>(
+    g: &'a Graph,
+    last: &str,
+    parent: Option<&str>,
+) -> Vec<(String, Option<String>, &'a Item, &'a Module)> {
+    fn rec<'a>(
+        items: &'a [Item],
+        m: &'a Module,
+        container: Option<&str>,
+        sep: &str,
+        last: &str,
+        parent: Option<&str>,
+        out: &mut Vec<(String, Option<String>, &'a Item, &'a Module)>,
+    ) {
+        for it in items {
+            if it.name.as_deref() == Some(last) && parent.is_none_or(|p| container == Some(p)) {
+                let qualname = match container {
+                    Some(c) => format!("{}{sep}{c}{sep}{last}", m.name),
+                    None => format!("{}{sep}{last}", m.name),
+                };
+                out.push((qualname, container.map(str::to_string), it, m));
+            }
+            let next = if matches!(it.kind.as_str(), "impl" | "trait" | "class" | "mod") {
+                it.name.as_deref().or(container)
+            } else {
+                container
+            };
+            rec(&it.children, m, next, sep, last, parent, out);
+        }
+    }
+    let mut out = Vec::new();
+    for m in &g.modules {
+        rec(&m.items, m, None, sep_of(m), last, parent, &mut out);
+    }
+    out
+}
+
+/// Distinct identifiers appearing in a signature, in order.
+fn identifiers(sig: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for ch in sig.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            cur.push(ch);
+        } else if !cur.is_empty() {
+            if !out.contains(&cur) {
+                out.push(cur.clone());
+            }
+            cur.clear();
+        }
+    }
+    if !cur.is_empty() && !out.contains(&cur) {
+        out.push(cur);
+    }
+    out
+}
+
+/// The type-like definitions referenced by a signature: PascalCase
+/// identifiers that resolve to a type/struct/enum/etc. (not the symbol
+/// itself, param names, or noise).
+fn signature_types<'a>(
+    sig: &str,
+    self_name: &str,
+    idx: &'a HashMap<String, DefLite>,
+) -> Vec<&'a DefLite> {
+    identifiers(sig)
+        .into_iter()
+        .filter(|n| n != self_name)
+        .filter(|n| n.chars().next().is_some_and(char::is_uppercase))
+        .filter(|n| !NOISE.contains(&n.as_str()))
+        .filter_map(|n| idx.get(&n))
+        .filter(|d| {
+            matches!(
+                d.kind.as_str(),
+                "struct" | "enum" | "trait" | "interface" | "type" | "class"
+            )
+        })
+        .take(8)
+        .collect()
+}
+
+fn edge_str(c: &Call) -> String {
+    if c.heuristic {
+        format!("{}~", c.to)
+    } else {
+        c.to.clone()
+    }
+}
+
+/// Assemble everything needed to edit a symbol — definition, the types in its
+/// signature, what it calls, and what calls it — trimmed to a token budget.
+pub fn context(g: &Graph, query: &str, max_tokens: usize, json_out: bool) -> String {
+    let q = segments(query);
+    let Some(&last) = q.last() else {
+        return "empty query\n".to_string();
+    };
+    let parent = if q.len() >= 2 { Some(q[q.len() - 2]) } else { None };
+    let targets = find_targets(g, last, parent);
+    if targets.is_empty() {
+        return format!("no definition found for '{query}'\n");
+    }
+    let idx = def_index(g);
+    let budget = max_tokens.saturating_mul(4).max(400);
+
+    if json_out {
+        let blocks: Vec<_> = targets
+            .iter()
+            .take(3)
+            .map(|(qual, container, it, m)| {
+                let q_caller: Vec<&str> = match container {
+                    Some(c) => vec![c.as_str(), last],
+                    None => vec![last],
+                };
+                let callers = callers_of(g, &q_caller);
+                let types: Vec<_> = signature_types(&it.signature, last, &idx)
+                    .iter()
+                    .map(|d| {
+                        json!({"name": d.qualname, "kind": d.kind, "file": d.file, "line": d.line})
+                    })
+                    .collect();
+                json!({
+                    "definition": {"qualname": qual, "kind": it.kind, "file": m.file, "line": it.line, "signature": it.signature, "doc": it.doc},
+                    "signature_types": types,
+                    "calls": it.calls.iter().map(|c| json!({"to": c.to, "heuristic": c.heuristic})).collect::<Vec<_>>(),
+                    "callers": callers.iter().map(|c| json!({"caller": c.qualname, "file": c.file, "line": c.line})).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        return serde_json::to_string_pretty(&json!({"query": query, "context": blocks}))
+            .unwrap_or_default()
+            + "\n";
+    }
+
+    let mut out = String::new();
+    if targets.len() > 1 {
+        out.push_str(&format!(
+            "{} definitions match '{}' (showing up to 3; qualify to narrow):\n",
+            targets.len(),
+            query
+        ));
+    }
+    for (qual, container, it, m) in targets.iter().take(3) {
+        out.push_str(&format!("\n# Context: {qual}\n\n"));
+        out.push_str(&format!("## Definition\n{qual}   [{}]   {}:{}\n", it.kind, m.file, it.line));
+        let doc = it.doc.as_deref().map(|d| format!("  — {d}")).unwrap_or_default();
+        out.push_str(&format!("    {}{}\n", it.signature, doc));
+
+        // Signature types.
+        let types = signature_types(&it.signature, last, &idx);
+        if !types.is_empty() {
+            out.push_str("\n## Signature types\n");
+            for d in types {
+                let doc = d.doc.as_deref().map(|s| format!("  — {s}")).unwrap_or_default();
+                out.push_str(&format!("- {} [{}]  {}:{}{}\n", d.qualname, d.kind, d.file, d.line, doc));
+            }
+        }
+
+        // Callees.
+        if !it.calls.is_empty() {
+            out.push_str(&format!("\n## Calls ({})\n", it.calls.len()));
+            append_capped(&mut out, it.calls.iter().map(|c| format!("- {}", edge_str(c))), 30, budget);
+        }
+
+        // Callers (blast radius).
+        let q_caller: Vec<&str> = match container {
+            Some(c) => vec![c.as_str(), last],
+            None => vec![last],
+        };
+        let callers = callers_of(g, &q_caller);
+        if !callers.is_empty() {
+            out.push_str(&format!("\n## Callers ({})\n", callers.len()));
+            append_capped(
+                &mut out,
+                callers.iter().map(|c| format!("- {}  ({}:{})", c.qualname, c.file, c.line)),
+                30,
+                budget,
+            );
+        }
+    }
+    out
+}
+
+/// Push up to `cap` lines, stopping early if the byte budget is hit; notes
+/// how many were elided.
+fn append_capped(out: &mut String, lines: impl Iterator<Item = String>, cap: usize, budget: usize) {
+    let mut shown = 0;
+    let mut total = 0;
+    for line in lines {
+        total += 1;
+        if shown < cap && out.len() + line.len() < budget {
+            out.push_str(&line);
+            out.push('\n');
+            shown += 1;
+        }
+    }
+    if shown < total {
+        out.push_str(&format!("- … (+{} more)\n", total - shown));
+    }
+}
+
+// ---- coverage --------------------------------------------------------------
+
+/// A completeness/blind-spot report: how much of the call graph resolved,
+/// where confidence is low, and which source files are not modeled at all.
+pub fn coverage_report(g: &Graph, unsupported: &[(String, usize)], json_out: bool) -> String {
+    let (mut sites, mut resolved, mut heuristic, mut std_builtin) = (0usize, 0usize, 0usize, 0usize);
+    let mut by_lang: BTreeMap<&str, usize> = BTreeMap::new();
+    for m in &g.modules {
+        sites += m.diag.call_sites;
+        resolved += m.diag.resolved;
+        heuristic += m.diag.heuristic;
+        std_builtin += m.diag.std_builtin;
+        *by_lang.entry(m.lang.name()).or_default() += 1;
+    }
+    // Genuine misses: neither an internal edge nor a known std/builtin call.
+    let dropped = sites.saturating_sub(resolved).saturating_sub(std_builtin);
+    let pct = |n: usize, d: usize| if d == 0 { 0.0 } else { 100.0 * n as f64 / d as f64 };
+    let miss = |m: &Module| m.diag.call_sites - m.diag.resolved - m.diag.std_builtin;
+
+    // Low-confidence zones: high heuristic ratio (min 10 resolved), and most
+    // genuinely-unresolved call sites.
+    let mut heur_zones: Vec<&Module> = g
+        .modules
+        .iter()
+        .filter(|m| m.diag.resolved >= 10)
+        .collect();
+    heur_zones.sort_by(|a, b| {
+        pct(b.diag.heuristic, b.diag.resolved)
+            .partial_cmp(&pct(a.diag.heuristic, a.diag.resolved))
+            .unwrap()
+    });
+    let mut drop_zones: Vec<&Module> = g.modules.iter().filter(|m| miss(m) > 0).collect();
+    drop_zones.sort_by_key(|&m| std::cmp::Reverse(miss(m)));
+
+    if json_out {
+        return serde_json::to_string_pretty(&json!({
+            "root": g.root,
+            "modules": g.modules.len(),
+            "modules_by_lang": by_lang,
+            "call_sites": sites,
+            "resolved": resolved,
+            "heuristic": heuristic,
+            "std_builtin": std_builtin,
+            "dropped": dropped,
+            "unsupported_files": unsupported.iter().map(|(e, n)| json!({"ext": e, "count": n})).collect::<Vec<_>>(),
+        }))
+        .unwrap_or_default()
+            + "\n";
+    }
+
+    let mut out = format!("# ctx coverage report — {}\n\n", g.root);
+    let langs: Vec<String> = by_lang.iter().map(|(l, n)| format!("{l} {n}")).collect();
+    out.push_str(&format!(
+        "Modules: {}  ({})\n\n",
+        g.modules.len(),
+        langs.join(", ")
+    ));
+    out.push_str("## Call-edge resolution\n");
+    out.push_str("ctx only draws edges it can prove; std/builtin and external-crate calls are\n");
+    out.push_str("intentionally not edged, so a low internal-edge fraction is expected, not a defect.\n\n");
+    out.push_str(&format!("call sites:          {sites}\n"));
+    out.push_str(&format!(
+        "  internal edges:    {resolved} ({:.1}%)   [{heuristic} heuristic (~), {:.1}% of edges]\n",
+        pct(resolved, sites),
+        pct(heuristic, resolved)
+    ));
+    out.push_str(&format!(
+        "  std / builtin:     {std_builtin} ({:.1}%)   [push/iter/map/… — never edged by design]\n",
+        pct(std_builtin, sites)
+    ));
+    out.push_str(&format!(
+        "  external / unpinned: {dropped} ({:.1}%)   [external-crate, dynamic, or ambiguous]\n",
+        pct(dropped, sites)
+    ));
+
+    if !heur_zones.is_empty() {
+        out.push_str("\n## Low-confidence zones (edges to distrust — grep to confirm)\n");
+        for m in heur_zones.iter().take(8) {
+            out.push_str(&format!(
+                "  {:<32} {:.0}% heuristic ({}/{} edges)\n",
+                m.name,
+                pct(m.diag.heuristic, m.diag.resolved),
+                m.diag.heuristic,
+                m.diag.resolved
+            ));
+        }
+    }
+    if !drop_zones.is_empty() {
+        out.push_str("\n## Most external/unpinned calls (mapped least completely — relative signal)\n");
+        for m in drop_zones.iter().take(8) {
+            out.push_str(&format!(
+                "  {:<32} {} unpinned of {} sites\n",
+                m.name,
+                miss(m),
+                m.diag.call_sites
+            ));
+        }
+    }
+
+    out.push_str("\n## Not modeled (blind spots)\n");
+    if unsupported.is_empty() {
+        out.push_str("  none — every source file under this root is a supported language\n");
+    } else {
+        out.push_str("  source files present that ctx does not parse:\n");
+        for (ext, n) in unsupported {
+            out.push_str(&format!("  .{ext:<8} {n}\n"));
+        }
+    }
+    out.push_str("  (supported: .rs .py .ts .tsx)\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +805,46 @@ mod tests {
         let out = callers(&g, "helper", false);
         assert!(out.contains("A::run"), "{out}");
         assert!(!out.contains('~'), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn context_bundles_def_callees_and_callers() {
+        let (g, dir) = graph(&[
+            ("src/a.rs", "pub fn helper() {}\n"),
+            ("src/b.rs", "use crate::a::helper;\npub fn run() { helper(); }\n"),
+        ]);
+        let out = context(&g, "run", 4000, false);
+        assert!(out.contains("# Context: b::run"), "{out}");
+        assert!(out.contains("## Calls"), "{out}");
+        assert!(out.contains("a::helper"), "{out}");
+        let out2 = context(&g, "helper", 4000, false);
+        assert!(out2.contains("## Callers"), "{out2}");
+        assert!(out2.contains("b::run"), "{out2}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn context_signature_types_are_pascal_case_types_only() {
+        let src = "pub struct Widget { n: i32 }\n\
+                   pub fn make(count: i32, w: Widget) -> Widget { w }\n";
+        let (g, dir) = graph(&[("src/a.rs", src)]);
+        let out = context(&g, "make", 4000, false);
+        // `Widget` is a type ref; `count`/`w`/`i32` must not appear as types.
+        assert!(out.contains("a::Widget [struct]"), "{out}");
+        assert!(!out.contains("## Signature types\n- a::count"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn coverage_separates_internal_std_and_blind_spots() {
+        let src = "pub fn helper() {}\n\
+                   pub fn run() { helper(); let v: Vec<i32> = Vec::new(); v.len(); }\n";
+        let (g, dir) = graph(&[("src/a.rs", src)]);
+        let out = coverage_report(&g, &[("cpp".to_string(), 2)], false);
+        assert!(out.contains("internal edges:"), "{out}");
+        assert!(out.contains("std / builtin:"), "{out}"); // v.len()
+        assert!(out.contains(".cpp"), "{out}"); // blind spot listed
         let _ = fs::remove_dir_all(dir);
     }
 }

@@ -36,6 +36,12 @@ ctx def 'Type::method' ~/projects/myrepo   # qualified to disambiguate
 # Who calls this? (resolved reverse call edges — the blast radius)
 ctx callers basename ~/projects/myrepo
 
+# Everything needed to edit a symbol, in one call (def + types + callees + callers)
+ctx context streamChat ~/projects/myrepo --max-tokens 4000
+
+# Coverage / blind-spot report: how much resolved, where to distrust
+ctx doctor ~/projects/myrepo
+
 # Impact map of your current diff: changed modules + deps + callers
 ctx changed ~/projects/myrepo              # working tree vs HEAD
 ctx changed ~/projects/myrepo --since main # vs a ref/branch
@@ -46,6 +52,19 @@ ctx map ~/projects/myrepo --format json
 # Print the recommended CLAUDE.md discovery-protocol block
 ctx snippet >> ~/projects/myrepo/CLAUDE.md
 ```
+
+`context` is the agent-native command: one call returns the definition, the
+type definitions referenced in its signature, its callees, and its callers —
+trimmed to `--max-tokens` — so an agent can gather the full editing context
+for a symbol without a map→def→callers→subtree dance.
+
+`doctor` is a coverage/blind-spot report — deliberately honest about what `ctx`
+does *not* model. It splits every call site into internal edges resolved
+(with the heuristic `~` share), ubiquitous std/builtin calls (never edged by
+design), and external/unpinned calls, then lists the low-confidence modules
+(high `~` ratio) and the source files it can't parse at all (`.cpp`, `.go`,
+…). Run it once on a new repo to calibrate how much to trust the map — and to
+know exactly when to fall back to grep.
 
 `changed` turns a diff into an impact map: it runs `git diff` (working tree
 vs HEAD, or vs `--since <ref>`, including untracked files), maps the changed
