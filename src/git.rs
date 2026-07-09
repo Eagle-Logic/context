@@ -2,6 +2,7 @@
 //! the files that differ from a ref (or the working tree), so a diff can be
 //! mapped onto the module graph. Shells out to `git`; no dependency.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -69,6 +70,27 @@ pub fn changed_files(path: &Path, since: Option<&str>) -> Result<Vec<PathBuf>> {
     collect(&out.stdout, &root, &mut files);
 
     Ok(files)
+}
+
+/// Commit-touch counts per repo-relative file path across all history —
+/// a cheap churn proxy (how often each file changes).
+pub fn churn(path: &Path) -> Result<HashMap<String, usize>> {
+    let root = repo_root(path)?;
+    let out = git(&root, &["log", "--format=", "--name-only"])?;
+    if !out.status.success() {
+        bail!(
+            "git log failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            *counts.entry(line.to_string()).or_default() += 1;
+        }
+    }
+    Ok(counts)
 }
 
 /// Check out `refname` into a detached worktree at `at` so a graph can be

@@ -1,5 +1,6 @@
 mod extract;
 mod git;
+mod mcp;
 mod model;
 mod query;
 mod render;
@@ -102,6 +103,9 @@ enum Cmd {
         /// How many modules to show
         #[arg(long, default_value_t = 30)]
         limit: usize,
+        /// Weight centrality by git churn: rank hotspots (central AND volatile)
+        #[arg(long)]
+        churn: bool,
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
     },
@@ -127,6 +131,8 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = View::Full)]
         view: View,
     },
+    /// Run as an MCP server over stdio (exposes the read-only commands as tools)
+    Mcp,
     /// Print the recommended CLAUDE.md discovery-protocol block
     Snippet,
 }
@@ -156,7 +162,7 @@ implementation bodies.
 - `ctx changed --api [--since <ref>]` — public API changes in your diff: removed or
   signature-changed public items and who breaks (a pre-merge breaking-change check)
 - `ctx core` — the modules that matter most, ranked by dependency centrality (where to look
-  first in an unfamiliar codebase)
+  first in an unfamiliar codebase; add `--churn` to weight by how often they change)
 - `ctx doctor` — coverage report: what fraction of the call graph resolved and which modules/
   edges to distrust (run once to calibrate how much to lean on ctx for this repo)
 - add `--format json` to any of the above for machine-readable output
@@ -273,10 +279,31 @@ fn main() -> Result<()> {
         Cmd::Core {
             path,
             limit,
+            churn,
             format,
         } => {
             let g = extract::build_graph(&path)?;
-            print!("{}", query::core(&g, limit, matches!(format, Format::Json)));
+            // Map git's repo-relative churn counts onto module names.
+            let churn_map = if churn {
+                let raw = git::churn(&path)?;
+                let repo = git::repo_root(&path)?;
+                let scan = path.canonicalize()?;
+                let prefix = scan.strip_prefix(&repo).unwrap_or(std::path::Path::new(""));
+                let mut mm = std::collections::HashMap::new();
+                for m in &g.modules {
+                    let rel = prefix.join(&m.file);
+                    if let Some(&c) = raw.get(rel.to_string_lossy().as_ref()) {
+                        mm.insert(m.name.clone(), c);
+                    }
+                }
+                Some(mm)
+            } else {
+                None
+            };
+            print!(
+                "{}",
+                query::core(&g, limit, churn_map.as_ref(), matches!(format, Format::Json))
+            );
         }
         Cmd::Doctor { path, format } => {
             let g = extract::build_graph(&path)?;
@@ -365,6 +392,7 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Mcp => mcp::run()?,
         Cmd::Snippet => print!("{SNIPPET}"),
     }
     Ok(())

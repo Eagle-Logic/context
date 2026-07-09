@@ -545,12 +545,48 @@ fn append_capped(out: &mut String, lines: impl Iterator<Item = String>, cap: usi
     }
 }
 
+/// A module plus its immediate upstream/downstream neighbors, rendered.
+/// Shared by the CLI `subtree` command and the MCP server.
+pub fn subtree(g: &Graph, module: &str, json_out: bool) -> String {
+    let targets: Vec<&Module> = g
+        .modules
+        .iter()
+        .filter(|m| {
+            m.name == module
+                || m.name.ends_with(&format!("::{module}"))
+                || m.name.ends_with(&format!(".{module}"))
+        })
+        .collect();
+    if targets.is_empty() {
+        return format!("no module matching '{module}'\n");
+    }
+    let target_names: BTreeSet<&str> = targets.iter().map(|m| m.name.as_str()).collect();
+    let (upstream, downstream) = neighbors(g, &target_names);
+    if json_out {
+        serde_json::to_string_pretty(&json!({
+            "query": module,
+            "target": targets,
+            "upstream": upstream,
+            "downstream": downstream,
+        }))
+        .unwrap_or_default()
+            + "\n"
+    } else {
+        crate::render::subtree_md(module, &targets, &upstream, &downstream)
+    }
+}
+
 // ---- core (centrality) -----------------------------------------------------
 
 /// Rank modules by dependency centrality — PageRank over the module graph
 /// (edge `m -> d` for each dep `d` of `m`), so heavily-depended-upon modules
 /// score highest. Deterministic: fixed damping and iteration count.
-pub fn core(g: &Graph, limit: usize, json_out: bool) -> String {
+pub fn core(
+    g: &Graph,
+    limit: usize,
+    churn: Option<&HashMap<String, usize>>,
+    json_out: bool,
+) -> String {
     let n = g.modules.len();
     if n == 0 {
         return "no modules\n".to_string();
@@ -597,10 +633,29 @@ pub fn core(g: &Graph, limit: usize, json_out: bool) -> String {
         }
     }
 
+    // Per-module churn and the combined "hotspot" score: central AND volatile.
+    let churn_of: Vec<usize> = g
+        .modules
+        .iter()
+        .map(|m| churn.and_then(|c| c.get(&m.name)).copied().unwrap_or(0))
+        .collect();
+    let max_rank = rank.iter().cloned().fold(0.0_f64, f64::max).max(f64::MIN_POSITIVE);
+    let max_churn = *churn_of.iter().max().unwrap_or(&0);
+    let hotspot: Vec<f64> = (0..n)
+        .map(|i| {
+            if max_churn == 0 {
+                rank[i]
+            } else {
+                (rank[i] / max_rank) * (churn_of[i] as f64 / max_churn as f64)
+            }
+        })
+        .collect();
+
+    let key = |i: usize| if churn.is_some() { hotspot[i] } else { rank[i] };
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| {
-        rank[b]
-            .partial_cmp(&rank[a])
+        key(b)
+            .partial_cmp(&key(a))
             .unwrap()
             .then(g.modules[a].name.cmp(&g.modules[b].name))
     });
@@ -616,6 +671,8 @@ pub fn core(g: &Graph, limit: usize, json_out: bool) -> String {
                     "score": rank[i],
                     "dependents": indeg[i],
                     "dependencies": outdeg[i],
+                    "churn": churn_of[i],
+                    "hotspot": hotspot[i],
                     "items": g.modules[i].item_count(),
                 })
             })
@@ -626,17 +683,33 @@ pub fn core(g: &Graph, limit: usize, json_out: bool) -> String {
     }
 
     let mut s = format!("# Core modules — {}\n", g.root);
-    s.push_str("Ranked by dependency centrality (PageRank); higher = more depended-upon.\n\n");
-    s.push_str("  score    in  out  module\n");
-    for &i in &order {
-        s.push_str(&format!(
-            "  {:.4}  {:>4} {:>4}  {}  [{} items]\n",
-            rank[i],
-            indeg[i],
-            outdeg[i],
-            g.modules[i].name,
-            g.modules[i].item_count()
-        ));
+    if churn.is_some() {
+        s.push_str("Ranked by hotspot = centrality × churn (central AND frequently changed).\n\n");
+        s.push_str("  score    in  out  churn  module\n");
+        for &i in &order {
+            s.push_str(&format!(
+                "  {:.4}  {:>4} {:>4}  {:>5}  {}  [{} items]\n",
+                rank[i],
+                indeg[i],
+                outdeg[i],
+                churn_of[i],
+                g.modules[i].name,
+                g.modules[i].item_count()
+            ));
+        }
+    } else {
+        s.push_str("Ranked by dependency centrality (PageRank); higher = more depended-upon.\n\n");
+        s.push_str("  score    in  out  module\n");
+        for &i in &order {
+            s.push_str(&format!(
+                "  {:.4}  {:>4} {:>4}  {}  [{} items]\n",
+                rank[i],
+                indeg[i],
+                outdeg[i],
+                g.modules[i].name,
+                g.modules[i].item_count()
+            ));
+        }
     }
     s
 }
@@ -1096,7 +1169,7 @@ mod tests {
             ("src/a.rs", "use crate::hub::h;\npub fn a() { h(); }\n"),
             ("src/b.rs", "use crate::hub::h;\npub fn b() { h(); }\n"),
         ]);
-        let out = core(&g, 10, false);
+        let out = core(&g, 10, None, false);
         let hub = out.find("  hub  [").unwrap();
         let a = out.find("  a  [").unwrap();
         assert!(hub < a, "hub (2 dependents) should outrank a:\n{out}");

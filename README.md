@@ -39,8 +39,9 @@ ctx callers basename ~/projects/myrepo
 # Everything needed to edit a symbol, in one call (def + types + callees + callers)
 ctx context streamChat ~/projects/myrepo --max-tokens 4000
 
-# The modules that matter most (dependency centrality)
+# The modules that matter most (dependency centrality; --churn weights by volatility)
 ctx core ~/projects/myrepo
+ctx core ~/projects/myrepo --churn
 
 # Breaking-change check: public API removed/changed since a ref + who breaks
 ctx changed --api ~/projects/myrepo --since main
@@ -159,6 +160,22 @@ To keep a committed `CODEBASE_MAP.md` fresh, regenerate it from a git
 pre-commit hook or a Claude Code hook (`ctx map . -o CODEBASE_MAP.md`) — or
 skip the file entirely and have sessions run `ctx map` at boot; generation is
 ~100 ms, so freshness is free.
+
+### MCP server
+
+`ctx mcp` runs a minimal MCP server over stdio (newline-delimited JSON-RPC,
+no dependencies) exposing the read-only commands as typed tools — `map`,
+`modules`, `subtree`, `def`, `callers`, `context`, `core`, `doctor` — so an
+agent calls them structured, without shelling out or a permission prompt.
+Register it once with Claude Code:
+
+```sh
+claude mcp add ctx -- ctx mcp
+```
+
+Each tool takes a `path` argument (default `.`); `def`/`callers`/`context`
+also take `name`, and `subtree` takes `module`. The server builds the graph
+per call (~100 ms), so results are always current.
 
 ## Design notes
 
