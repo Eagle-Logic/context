@@ -161,42 +161,6 @@ fn clip_doc(s: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn doc_of(src: &str) -> Option<String> {
-        extract(src).unwrap().items.into_iter().next().and_then(|i| i.doc)
-    }
-
-    #[test]
-    fn function_docstring_first_line() {
-        let src = "def foo():\n    \"\"\"Summary line.\n\n    More detail.\n    \"\"\"\n    return 1\n";
-        assert_eq!(doc_of(src).as_deref(), Some("Summary line."));
-    }
-
-    #[test]
-    fn class_docstring_single_quotes() {
-        assert_eq!(
-            doc_of("class C:\n    'One liner.'\n    x = 1\n").as_deref(),
-            Some("One liner.")
-        );
-    }
-
-    #[test]
-    fn raw_prefixed_docstring() {
-        assert_eq!(
-            doc_of("def f():\n    r\"\"\"Raw doc.\"\"\"\n    pass\n").as_deref(),
-            Some("Raw doc.")
-        );
-    }
-
-    #[test]
-    fn no_docstring_is_none() {
-        assert_eq!(doc_of("def f():\n    return 1\n"), None);
-    }
-}
-
 /// Walk a function body collecting every call site.
 fn collect_calls(body: Node, src: &str) -> Vec<RawCall> {
     let mut out = Vec::new();
@@ -328,5 +292,41 @@ fn clip(s: &str) -> String {
         out
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc_of(src: &str) -> Option<String> {
+        extract(src).unwrap().items.into_iter().next().and_then(|i| i.doc)
+    }
+
+    #[test]
+    fn function_docstring_first_line() {
+        let src = "def foo():\n    \"\"\"Summary line.\n\n    More detail.\n    \"\"\"\n    return 1\n";
+        assert_eq!(doc_of(src).as_deref(), Some("Summary line."));
+    }
+
+    #[test]
+    fn class_docstring_single_quotes() {
+        assert_eq!(
+            doc_of("class C:\n    'One liner.'\n    x = 1\n").as_deref(),
+            Some("One liner.")
+        );
+    }
+
+    #[test]
+    fn raw_prefixed_docstring() {
+        assert_eq!(
+            doc_of("def f():\n    r\"\"\"Raw doc.\"\"\"\n    pass\n").as_deref(),
+            Some("Raw doc.")
+        );
+    }
+
+    #[test]
+    fn no_docstring_is_none() {
+        assert_eq!(doc_of("def f():\n    return 1\n"), None);
     }
 }

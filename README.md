@@ -1,5 +1,7 @@
 # context (`ctx`)
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Deterministic AST skeleton maps of a codebase, built for ultra-dense context
 injection into coding agents (Claude Code in particular).
 
@@ -14,11 +16,24 @@ implementation body, and emits a compact, deterministic topology map:
 No embeddings, no fuzzy retrieval. The map is a pure function of the source
 tree: same code in, same map out.
 
+## Install
+
+Requires a Rust toolchain (1.85+).
+
+```sh
+cargo install --git https://github.com/Eagle-Logic/context
+
+# or from a clone
+git clone https://github.com/Eagle-Logic/context
+cd context && cargo install --path .
+```
+
+This installs a single binary, `ctx`. No runtime dependencies — the
+tree-sitter grammars are compiled in.
+
 ## Usage
 
 ```sh
-cargo install --path .
-
 # Strategy A: full map for session boot (small/medium repos)
 ctx map ~/projects/myrepo -o CODEBASE_MAP.md
 
@@ -156,7 +171,7 @@ or any trailing suffix (`inference`).
 `map` and `subtree` take `--view` to scale detail to informational need —
 each level adds a whole category, so token spend buys precision, not noise:
 
-| view | contents | eagle-logits-native (419 modules) |
+| view | contents | a 419-module Rust workspace |
 |---|---|---|
 | `skeleton` | modules, deps, re-exports, type names | 79 KB (~19k tok) |
 | `interface` | + public signatures, struct fields, enum variants | 301 KB (~75k tok) |
@@ -251,7 +266,8 @@ per call (~100 ms), so results are always current.
 
 ## Design notes
 
-- **Parsing**: tree-sitter (`tree-sitter-rust`, `tree-sitter-python`). Bodies
+- **Parsing**: tree-sitter (`tree-sitter-rust`, `tree-sitter-python`,
+  `tree-sitter-typescript`); Markdown is parsed directly. Bodies
   are dropped by slicing each definition node up to its `body` field; struct
   fields and enum variants are kept inline because they carry architectural
   signal at negligible token cost.
@@ -300,3 +316,24 @@ imports, re-export bindings, defined names) plus the tree-sitter grammar
 crate — and, for a language that resolves imports by path rather than by name
 (as TypeScript does), a `candidates()` branch that maps a specifier to
 absolute module segments.
+
+## Contributing
+
+Issues and pull requests are welcome. `cargo test` covers the extractors, the
+resolver, and every query command; `cargo clippy` should stay clean.
+
+Two properties are load-bearing, and a change that breaks either needs a good
+reason:
+
+- **Determinism.** The map is a pure function of the source tree. No clocks, no
+  hash-order iteration, no network.
+- **No guessing.** An edge is either proven, marked heuristic with `~`, or
+  dropped. `ctx doctor` exists so the map can be honest about its blind spots —
+  a change that raises coverage by guessing is a regression.
+
+`ctx` is used against its own source, so `ctx doctor .` and `ctx diff main` are
+a reasonable first review of any patch.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -2,7 +2,13 @@
 name = "context"
 version = "0.16.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Deterministic AST skeleton maps of a codebase for agent context injection"
+license = "MIT"
+repository = "https://github.com/Eagle-Logic/context"
+readme = "README.md"
+keywords = ["ast", "codebase", "context", "llm", "tree-sitter"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "ctx"
