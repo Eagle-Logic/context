@@ -578,27 +578,16 @@ pub fn subtree(g: &Graph, module: &str, json_out: bool) -> String {
 
 // ---- core (centrality) -----------------------------------------------------
 
-/// Rank modules by dependency centrality — PageRank over the module graph
-/// (edge `m -> d` for each dep `d` of `m`), so heavily-depended-upon modules
-/// score highest. Deterministic: fixed damping and iteration count.
-pub fn core(
-    g: &Graph,
-    limit: usize,
-    churn: Option<&HashMap<String, usize>>,
-    json_out: bool,
-) -> String {
-    let n = g.modules.len();
-    if n == 0 {
-        return "no modules\n".to_string();
-    }
+/// Out-edges as module indices: `m -> d` for each dep `d` of `m` that resolves
+/// to a module in this graph.
+fn out_edges(g: &Graph) -> Vec<Vec<usize>> {
     let index: HashMap<&str, usize> = g
         .modules
         .iter()
         .enumerate()
         .map(|(i, m)| (m.name.as_str(), i))
         .collect();
-    let out: Vec<Vec<usize>> = g
-        .modules
+    g.modules
         .iter()
         .map(|m| {
             m.deps
@@ -606,7 +595,21 @@ pub fn core(
                 .filter_map(|d| index.get(d.as_str()).copied())
                 .collect()
         })
-        .collect();
+        .collect()
+}
+
+/// PageRank over the module graph (edge `m -> d` for each dep `d` of `m`), so
+/// heavily-depended-upon modules score highest. Deterministic: fixed damping
+/// and iteration count, so the same graph always yields the same ranks.
+///
+/// Shared by `core` and by budget-driven pruning, so "central" means the same
+/// thing whether you are ranking modules or deciding which to drop.
+pub fn pagerank(g: &Graph) -> Vec<f64> {
+    let n = g.modules.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let out = out_edges(g);
     let outdeg: Vec<usize> = out.iter().map(Vec::len).collect();
 
     let damping = 0.85;
@@ -625,6 +628,45 @@ pub fn core(
         }
         rank = next;
     }
+    rank
+}
+
+/// Module indices ordered most- to least-central.
+///
+/// Modules with no resolved dependency edges all sit at the same PageRank
+/// baseline, and on a large repo that tie group is most of the tree. Breaking
+/// those ties by name alone would fill a budget with whatever sorts first, so
+/// code outranks prose within a tie: a Markdown heading map is orientation, but
+/// a `CHANGELOG` should not displace a module something actually imports.
+/// Ties then fall back to name, keeping the order stable across runs.
+pub fn centrality_order(g: &Graph) -> Vec<usize> {
+    let rank = pagerank(g);
+    let is_code = |i: usize| g.modules[i].lang != Lang::Markdown;
+    let mut order: Vec<usize> = (0..g.modules.len()).collect();
+    order.sort_by(|&a, &b| {
+        rank[b]
+            .partial_cmp(&rank[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(is_code(b).cmp(&is_code(a)))
+            .then(g.modules[a].name.cmp(&g.modules[b].name))
+    });
+    order
+}
+
+/// Rank modules by dependency centrality, optionally weighted by git churn.
+pub fn core(
+    g: &Graph,
+    limit: usize,
+    churn: Option<&HashMap<String, usize>>,
+    json_out: bool,
+) -> String {
+    let n = g.modules.len();
+    if n == 0 {
+        return "no modules\n".to_string();
+    }
+    let out = out_edges(g);
+    let outdeg: Vec<usize> = out.iter().map(Vec::len).collect();
+    let rank = pagerank(g);
 
     let mut indeg = vec![0usize; n];
     for edges in &out {
@@ -1033,6 +1075,159 @@ mod tests {
         }
         let g = build_graph(&dir).unwrap();
         (g, dir)
+    }
+
+    #[test]
+    fn centrality_ranks_depended_upon_modules_first() {
+        // b and c both import a; a imports nothing. a is the most depended-upon.
+        let (g, dir) = graph(&[
+            ("a.py", "def core():\n    pass\n"),
+            ("b.py", "from a import core\n\ndef useb():\n    core()\n"),
+            ("c.py", "from a import core\n\ndef usec():\n    core()\n"),
+        ]);
+        let order = centrality_order(&g);
+        let top = g.modules[order[0]].name.clone();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(top, "a", "most depended-upon module should rank first");
+    }
+
+    #[test]
+    fn centrality_prefers_code_over_prose_on_ties() {
+        // Neither has dependency edges, so both sit at the PageRank baseline and
+        // the tie-break decides. Name order alone would put the doc first.
+        let (g, dir) = graph(&[
+            ("aaa_doc.md", "# Doc\n\n## A section\n"),
+            ("zzz_code.py", "def solo():\n    pass\n"),
+        ]);
+        let order = centrality_order(&g);
+        let first = g.modules[order[0]].name.clone();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(first, "zzz_code", "code should outrank prose at equal rank");
+    }
+
+    #[test]
+    fn prune_keeps_the_most_central_and_counts_the_rest() {
+        let (mut g, dir) = graph(&[
+            ("a.py", "def core():\n    pass\n"),
+            ("b.py", "from a import core\n\ndef useb():\n    core()\n"),
+            ("c.py", "from a import core\n\ndef usec():\n    core()\n"),
+        ]);
+        let total = g.modules.len();
+        let stats = crate::view::prune_to_central(&mut g, 1, 0.10);
+        let kept: Vec<String> = g.modules.iter().map(|m| m.name.clone()).collect();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(stats.omitted, total - 1);
+        assert_eq!(kept, ["a"], "the single kept module should be the central one");
+    }
+
+    /// A repo full of cross-linked docs and code that imports only external
+    /// packages: which side "wins" a naive ranking is luck, so a codebase map
+    /// must never come back as pure prose.
+    #[test]
+    fn pruned_map_always_retains_code_when_code_exists() {
+        let mut files: Vec<(String, String)> = Vec::new();
+        // Docs that link each other, so they earn real (non-baseline) PageRank.
+        let index: String = (0..12)
+            .map(|i| format!("- [Guide {i}](guide_{i}.md)\n"))
+            .collect();
+        files.push(("README.md".into(), format!("# Index\n\n{index}")));
+        for i in 0..12 {
+            let body: String = (0..30)
+                .map(|j| format!("## Guide {i} section {j} with a long heading\n\n"))
+                .collect();
+            files.push((
+                format!("guide_{i}.md"),
+                format!("# Guide {i}\n\n{body}\nSee [index](README.md)\n"),
+            ));
+        }
+        for i in 0..6 {
+            files.push((
+                format!("mod_{i}.py"),
+                "import os, json\n\nclass Worker:\n    def run(self):\n        pass\n".into(),
+            ));
+        }
+        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let (mut g, dir) = graph(&refs);
+
+        // Every nontrivial keep count must retain at least one code module.
+        for keep in [1usize, 2, 5, 10] {
+            let mut gg = g.clone();
+            crate::view::prune_to_central(&mut gg, keep, 0.10);
+            let code = gg.modules.iter().filter(|m| m.lang != Lang::Markdown).count();
+            assert!(
+                code > 0,
+                "keep={keep} produced a map with no code modules at all"
+            );
+        }
+        let stats = crate::view::prune_to_central(&mut g, 4, 0.10);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(stats.omitted > 0);
+    }
+
+    #[test]
+    fn prose_is_held_to_its_share_of_a_pruned_map() {
+        // One small code module against several large docs: uncapped, prose would
+        // dominate the map.
+        let mut files: Vec<(String, String)> = vec![(
+            "code.py".to_string(),
+            "class TheOnlyClassHere:\n    pass\n".to_string(),
+        )];
+        for i in 0..8 {
+            let body: String = (0..30)
+                .map(|j| format!("## Heading number {i}_{j} with a fairly long title\n\n"))
+                .collect();
+            files.push((format!("doc_{i}.md"), format!("# Doc {i}\n\n{body}")));
+        }
+        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let (mut g, dir) = graph(&refs);
+        // keep must be < module count, or pruning is not required and the
+        // ceiling deliberately does not engage.
+        let stats = crate::view::prune_to_central(&mut g, 8, 0.10);
+        let prose_left = g.modules.iter().filter(|m| m.lang == Lang::Markdown).count();
+        let code_left = g.modules.iter().filter(|m| m.lang != Lang::Markdown).count();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(stats.prose_capped > 0, "oversized prose should be capped");
+        assert_eq!(code_left, 1, "code must survive the prose ceiling");
+        assert!(prose_left < 8, "some docs should have been dropped");
+    }
+
+    #[test]
+    fn docs_only_repo_is_exempt_from_the_prose_ceiling() {
+        // No code to balance against: emptying the map would be worse than an
+        // unbalanced one.
+        let (mut g, dir) = graph(&[
+            ("a.md", "# A\n\n## One\n\n## Two\n"),
+            ("b.md", "# B\n\n## Three\n"),
+        ]);
+        let stats = crate::view::prune_to_central(&mut g, 2, 0.10);
+        let left = g.modules.len();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(stats.prose_capped, 0, "a docs-only repo keeps its docs");
+        assert_eq!(left, 2);
+    }
+
+    #[test]
+    fn small_docs_survive_alongside_dominant_code() {
+        // The allowance is 10% of the *code* size, so code has to genuinely
+        // dominate for a doc to fit.
+        let big: String = (0..60)
+            .map(|j| format!("class ClassWithAGenerouslyLongName_{j}:\n    pass\n\n"))
+            .collect();
+        let (mut g, dir) = graph(&[("code.py", big.as_str()), ("tiny.md", "# T\n")]);
+        let stats = crate::view::prune_to_central(&mut g, 2, 0.10);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(stats.prose_capped, 0, "a doc well under 10% must be kept");
+        assert_eq!(g.modules.len(), 2);
+    }
+
+    #[test]
+    fn prune_is_a_noop_when_keep_covers_everything() {
+        let (mut g, dir) = graph(&[("a.py", "def f():\n    pass\n")]);
+        let before = g.modules.len();
+        let stats = crate::view::prune_to_central(&mut g, before + 10, 0.10);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(stats.omitted, 0);
+        assert_eq!(g.modules.len(), before);
     }
 
     #[test]

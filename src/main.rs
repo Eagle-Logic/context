@@ -54,8 +54,10 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = View::Full)]
         view: View,
         /// Fit the output to a token budget: emit the richest view at or below
-        /// `--view` whose ~token count fits, reporting the choice on stderr.
-        /// Never truncates. Omit for the exact `--view`.
+        /// `--view` whose ~token count fits, reporting the choice on stderr. If
+        /// even `skeleton` is over budget, the least-central modules are pruned
+        /// until it fits, so the budget is a hard cap. Items inside a kept
+        /// module are never truncated. Omit for the exact `--view`.
         #[arg(long)]
         max_tokens: Option<usize>,
         /// Write to a file instead of stdout (e.g. CODEBASE_MAP.md)
@@ -190,7 +192,11 @@ const SNIPPET: &str = r#"## Codebase Discovery Tools
 orient yourself instead of grepping raw source; only read raw files when you need
 implementation bodies.
 
-- `ctx map --view skeleton` — bird's-eye architecture: modules, deps, type names (cheapest)
+- `ctx map --max-tokens <N>` — a map guaranteed to fit N tokens: reduces detail first, then
+  prunes the least-central modules, stating what it omitted. On a large repo an unbudgeted
+  map can be 100k+ tokens, so pass a budget whenever you are just orienting
+- `ctx map --view skeleton` — bird's-eye architecture: modules, deps, type names (cheapest
+  view, but still proportional to repo size — combine with `--max-tokens`)
 - `ctx map --view interface` — + public signatures, struct fields, enum variants (API surface)
 - `ctx map` — + private items and per-function call edges (`→ callee`) for tracing execution
   (a trailing `~` on an edge means it was inferred from an opaque receiver, not an import/path —
@@ -220,12 +226,14 @@ implementation bodies.
   edges to distrust (run once to calibrate how much to lean on ctx for this repo)
 - add `--format json` to any of the above for machine-readable output
 
-Protocol: before modifying or analyzing code, run `ctx map --view skeleton` to load the
-topology. When you're about to work on a specific symbol, run `ctx context <name>` — it bundles
-the definition, signature types, callees, and callers in one call, so you rarely need to open the
-file until you're editing its body. For broader orientation use `ctx subtree <module>`; before
-changing a signature run `ctx callers <name>` to see the blast radius. Line anchors (`[L42]`)
-give exact positions for surgical reads.
+Protocol: to orient, run `ctx core` (cheap at any repo size) — or
+`ctx map --view skeleton --max-tokens 10000` for a topology guaranteed to fit 10k tokens. Never
+load an unbudgeted map just to orient; on a large repo that is 100k+ tokens. When you're about to
+work on a specific symbol, run `ctx context <name>` — it bundles the definition, signature types,
+callees, and callers in one call, so you rarely need to open the file until you're editing its
+body. For broader orientation use `ctx subtree <module>`; before changing a signature run
+`ctx callers <name>` to see the blast radius. Line anchors (`[L42]`) give exact positions for
+surgical reads.
 "#;
 
 fn main() -> Result<()> {
@@ -240,16 +248,38 @@ fn main() -> Result<()> {
         } => {
             let mut g = extract::build_graph(&path)?;
             let module_count = g.modules.len();
+            // What actually landed in the output: pruning can drop modules, and
+            // the "wrote" line must report emitted modules, not parsed ones.
+            let mut emitted_count = module_count;
             let rendered = match max_tokens {
                 Some(budget) => {
-                    let (used, text, fit) = render_budgeted(&g, view, format, budget);
+                    let b = render_budgeted(&g, view, format, budget);
+                    emitted_count = module_count - b.omitted;
+                    // Match on `fit` first: an over-budget render that pruned
+                    // nothing still has to say so.
+                    let detail = match (b.fit, b.omitted) {
+                        (true, 0) => String::new(),
+                        (true, n) => format!(
+                            " — pruned {n} of {module_count} least-central modules to fit"
+                        ),
+                        (false, n) => {
+                            // The map's header and footer are a fixed floor that
+                            // no amount of pruning removes, so at very small
+                            // budgets they, not the modules, are what overflows.
+                            let floor = b.text.len() / 4;
+                            format!(
+                                " — BUDGET NOT MET: emitted ~{floor} tok with {emitted_count} of \
+                                 {module_count} module(s) ({n} omitted); the map header and \
+                                 footer alone exceed {budget} tok"
+                            )
+                        }
+                    };
                     eprintln!(
-                        "budget {budget} tok → {} view (~{} tok){}",
-                        used.name(),
-                        text.len() / 4,
-                        if fit { "" } else { " — still over; coarsest view emitted" }
+                        "budget {budget} tok → {} view (~{} tok){detail}",
+                        b.view.name(),
+                        b.text.len() / 4,
                     );
-                    text
+                    b.text
                 }
                 None => {
                     view::apply(&mut g, view);
@@ -263,9 +293,14 @@ fn main() -> Result<()> {
                 Some(file) => {
                     fs::write(&file, &rendered)?;
                     eprintln!(
-                        "wrote {} ({} modules, {} bytes)",
+                        "wrote {} ({} modules{}, {} bytes)",
                         file.display(),
-                        module_count,
+                        emitted_count,
+                        if emitted_count == module_count {
+                            String::new()
+                        } else {
+                            format!(" of {module_count}")
+                        },
                         rendered.len()
                     );
                 }
@@ -659,10 +694,34 @@ fn cleanup(repo: &std::path::Path, wt: Option<PathBuf>) {
     }
 }
 
+/// Most a budget-pruned map will spend on prose (Markdown) modules, as a share
+/// of its rendered size. Docs link to each other and earn genuine centrality, so
+/// without a ceiling they can take a third of a small orientation budget in a
+/// codebase map. Applies only when pruning is required — an unbudgeted map, and
+/// a budget met by detail reduction alone, are never rebalanced.
+const PROSE_BUDGET_SHARE: f64 = 0.10;
+
+/// The outcome of fitting a render to a token budget.
+struct Budgeted {
+    view: View,
+    text: String,
+    /// Whether the budget was actually met.
+    fit: bool,
+    /// Modules dropped to make it fit (0 when detail reduction sufficed).
+    omitted: usize,
+}
+
 /// Render `g` at the richest view at or below `start` whose output fits
-/// `max_tokens` (~len/4). Never truncates; if even skeleton is over budget it
-/// returns skeleton with `fit = false`. Returns (view_used, text, fit).
-fn render_budgeted(g: &Graph, start: View, format: Format, max_tokens: usize) -> (View, String, bool) {
+/// `max_tokens` (~len/4).
+///
+/// Detail is reduced first (full → interface → skeleton). If even skeleton is
+/// over budget, detail is exhausted and the only remaining lever is dropping
+/// modules, so the least-central ones are pruned until the map fits — the
+/// budget is a real cap, not a suggestion. Items within a kept module are never
+/// truncated: you get fewer modules, each still whole.
+///
+/// `fit = false` only when a single module already exceeds the budget.
+fn render_budgeted(g: &Graph, start: View, format: Format, max_tokens: usize) -> Budgeted {
     let ladder = [View::Full, View::Interface, View::Skeleton];
     let start_idx = ladder.iter().position(|&v| v == start).unwrap_or(0);
     let render = |v: View| -> String {
@@ -673,20 +732,221 @@ fn render_budgeted(g: &Graph, start: View, format: Format, max_tokens: usize) ->
             Format::Json => serde_json::to_string_pretty(&gg).unwrap_or_default(),
         }
     };
-    let mut coarsest = (View::Skeleton, String::new());
     for &v in &ladder[start_idx..] {
         let text = render(v);
         if text.len() / 4 <= max_tokens {
-            return (v, text, true);
+            return Budgeted { view: v, text, fit: true, omitted: 0 };
         }
-        coarsest = (v, text);
     }
-    (coarsest.0, coarsest.1, false)
+
+    // Detail exhausted: prune modules. Skeleton is applied once up front so the
+    // search clones a much smaller graph on each probe.
+    let mut skel = g.clone();
+    view::apply(&mut skel, View::Skeleton);
+    let total = skel.modules.len();
+
+    // Largest `keep` that fits. Output grows monotonically with `keep`, so
+    // binary search costs ~log2(total) renders instead of a linear scan.
+    let (mut lo, mut hi) = (1usize, total);
+    let mut best: Option<(usize, String, usize)> = None;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let (text, omitted) = render_pruned(&skel, format, max_tokens, mid, total);
+        if text.len() / 4 <= max_tokens {
+            best = Some((mid, text, omitted));
+            lo = mid + 1;
+        } else {
+            if mid == 1 {
+                // Even one module is over budget — emit it and say so.
+                return Budgeted { view: View::Skeleton, text, fit: false, omitted };
+            }
+            hi = mid - 1;
+        }
+    }
+
+    match best {
+        Some((_, text, omitted)) => Budgeted { view: View::Skeleton, text, fit: true, omitted },
+        // Unreachable in practice: mid == 1 returns above.
+        None => {
+            let (text, omitted) = render_pruned(&skel, format, max_tokens, 1, total);
+            Budgeted { view: View::Skeleton, text, fit: false, omitted }
+        }
+    }
+}
+
+/// Render a skeleton graph pruned to its `keep` most central modules, annotated
+/// with what was dropped so the omission is visible in the output itself.
+/// `skel` must already have the skeleton view applied.
+fn render_pruned(
+    skel: &Graph,
+    format: Format,
+    budget: usize,
+    keep: usize,
+    total: usize,
+) -> (String, usize) {
+    let mut gg = skel.clone();
+    // Scarce budget goes to code first: prose keeps its rank but not its space.
+    let stats = view::prune_to_central(&mut gg, keep, PROSE_BUDGET_SHARE);
+    let shown = gg.modules.len();
+    let omitted = stats.omitted;
+    let text = match format {
+        Format::Md => {
+            let mut s = render::markdown(&gg);
+            if omitted > 0 {
+                let prose_note = if stats.prose_capped > 0 {
+                    format!(
+                        "{} of the omitted modules are docs that were central enough to keep \
+                         but would have pushed prose past {}% of the map.\n",
+                        stats.prose_capped,
+                        (PROSE_BUDGET_SHARE * 100.0).round() as u32
+                    )
+                } else {
+                    String::new()
+                };
+                s.push_str(&format!(
+                    "\n---\n\
+                     {omitted} of {total} modules omitted: kept the {shown} most central \
+                     to fit the {budget}-token budget.\n\
+                     {prose_note}\
+                     Dependency edges above may name an omitted module — that name is still \
+                     what to ask for.\n\
+                     Use `ctx subtree <module>` or `ctx context <symbol>` for anything not \
+                     listed; `ctx core` ranks the full set.\n"
+                ));
+            }
+            s
+        }
+        Format::Json => {
+            let mut v = serde_json::to_value(&gg).unwrap_or_default();
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("modules_shown".into(), serde_json::json!(shown));
+                obj.insert("modules_total".into(), serde_json::json!(total));
+                obj.insert("modules_omitted".into(), serde_json::json!(omitted));
+                obj.insert("pruned_to_budget".into(), serde_json::json!(budget));
+            }
+            serde_json::to_string_pretty(&v).unwrap_or_default()
+        }
+    };
+    (text, omitted)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_range;
+    use super::{parse_range, render_budgeted, Format, View};
+    use crate::extract::build_graph;
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// A repo with enough modules that a small budget cannot be met by detail
+    /// reduction alone, forcing the pruning rung.
+    ///
+    /// Classes, not functions: skeleton view drops bare `def`s, so a repo of
+    /// plain functions collapses to almost nothing and never needs pruning.
+    fn wide_repo() -> std::path::PathBuf {
+        // Unique per call: these tests run in parallel and each removes its dir,
+        // so a shared path would have them deleting each other's fixture.
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ctx_budget_{}_{}", std::process::id(), id));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..40 {
+            let body: String = (0..20)
+                .map(|j| {
+                    format!("class ClassWithADeliberatelyLongName_{i}_{j}:\n    pass\n\n")
+                })
+                .collect();
+            fs::write(dir.join(format!("mod_{i}.py")), body).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn budget_is_a_hard_cap_once_detail_is_exhausted() {
+        let dir = wide_repo();
+        let g = build_graph(&dir).unwrap();
+        let total = g.modules.len();
+        let budget = 2_000;
+        let b = render_budgeted(&g, View::Full, Format::Md, budget);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(b.fit, "a 2000-token budget should be satisfiable by pruning");
+        assert!(
+            b.text.len() / 4 <= budget,
+            "emitted ~{} tok exceeds the {budget} tok budget",
+            b.text.len() / 4
+        );
+        assert!(b.omitted > 0, "pruning should have dropped modules");
+        assert!(b.omitted < total, "pruning should not drop everything");
+        assert!(
+            b.text.contains("modules omitted"),
+            "a pruned map must disclose the omission in its output"
+        );
+    }
+
+    /// The prose cap must never touch an unbudgeted map — that path is what
+    /// writes a committed CODEBASE_MAP.md, which has to stay complete.
+    #[test]
+    fn unbudgeted_map_keeps_every_doc() {
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ctx_docs_{}_{}", std::process::id(), id));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("code.py"), "class Solo:\n    pass\n").unwrap();
+        for i in 0..6 {
+            let body: String = (0..30)
+                .map(|j| format!("## Section {i}_{j} with a reasonably long heading\n\n"))
+                .collect();
+            fs::write(dir.join(format!("doc_{i}.md")), format!("# D{i}\n\n{body}")).unwrap();
+        }
+        let mut g = build_graph(&dir).unwrap();
+        let total = g.modules.len();
+        // The no-budget path: apply the view and render, no pruning of any kind.
+        crate::view::apply(&mut g, View::Full);
+        let text = crate::render::markdown(&g);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(g.modules.len(), total, "no module may be dropped");
+        for i in 0..6 {
+            assert!(
+                text.contains(&format!("doc_{i}")),
+                "doc_{i} must survive an unbudgeted render"
+            );
+        }
+    }
+
+    #[test]
+    fn generous_budget_prunes_nothing() {
+        let dir = wide_repo();
+        let g = build_graph(&dir).unwrap();
+        let b = render_budgeted(&g, View::Full, Format::Md, 10_000_000);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(b.fit);
+        assert_eq!(b.omitted, 0, "nothing should be dropped when everything fits");
+        assert!(!b.text.contains("modules omitted"));
+    }
+
+    #[test]
+    fn unmeetable_budget_reports_no_fit_without_hanging() {
+        let dir = wide_repo();
+        let g = build_graph(&dir).unwrap();
+        // Not satisfiable: a single module already exceeds one token.
+        let b = render_budgeted(&g, View::Full, Format::Md, 1);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(!b.fit, "an unmeetable budget must report fit = false");
+        assert!(!b.text.is_empty(), "something usable should still be emitted");
+    }
+
+    #[test]
+    fn budget_render_is_deterministic() {
+        let dir = wide_repo();
+        let g = build_graph(&dir).unwrap();
+        let a = render_budgeted(&g, View::Full, Format::Md, 2_000);
+        let b = render_budgeted(&g, View::Full, Format::Md, 2_000);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(a.text, b.text, "same graph and budget must render identically");
+        assert_eq!(a.omitted, b.omitted);
+    }
 
     #[test]
     fn parse_range_forms() {

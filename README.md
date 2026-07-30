@@ -57,7 +57,8 @@ ctx changed ~/projects/myrepo --since main # vs a ref/branch
 ctx diff main..feature ~/projects/myrepo        # changed modules + who they break
 ctx diff main..feature ~/projects/myrepo --api  # breaking API changes across the range
 
-# Fit a map to a token budget (richest view that fits; never truncates)
+# Fit a map to a token budget (hard cap: reduces detail, then prunes
+# least-central modules; never truncates within a kept module)
 ctx map ~/projects/myrepo --max-tokens 8000
 
 # Cross-language parity: is the Rust port faithful to the Python source?
@@ -111,11 +112,19 @@ throwaway worktree when B is a ref; the working tree when B is omitted, as in
 breaking-change surface diff across the same range. `A...B` is accepted and
 treated like `A..B`.
 
-`map --max-tokens <N>` fits the output to a budget: it emits the richest view
-at or below `--view` whose (~`len/4`) token count fits, and reports the view
-it chose on stderr. It **never truncates** — if even `skeleton` is over
-budget it emits the whole skeleton and says so — so the map an agent receives
-is always structurally complete.
+`map --max-tokens <N>` fits the output to a budget and is a **hard cap**. It
+first reduces detail, emitting the richest view at or below `--view` whose
+(~`len/4`) token count fits, and reports the view it chose on stderr. When even
+`skeleton` is over budget, detail is exhausted and the only remaining lever is
+dropping modules, so the least-central ones are pruned (PageRank, the same
+ranking `core` uses) until the map fits. The output states what was omitted, and
+dependency edges still name pruned modules — that name is what to feed
+`subtree`/`context` next.
+
+Items inside a kept module are never truncated: you get fewer modules, each
+still whole. Only when a single module alone exceeds the budget does `ctx` emit
+an over-budget map, and it says so on stderr. Without `--max-tokens`, nothing is
+ever pruned.
 
 `parity <source> <port>...` answers "is this port a faithful structural copy?"
 across languages. Because the `Item` model is language-neutral, a source
@@ -200,14 +209,24 @@ one at negligible token cost:
 
 `ctx snippet` prints a ready-made "Codebase Discovery Tools" block — append it
 to the target repo's `CLAUDE.md` (`ctx snippet >> CLAUDE.md`). It teaches the
-agent a lookup protocol: boot with `ctx map --view skeleton`, pull
-`ctx subtree <module>` before touching a module, follow call edges instead of
-grepping, and only read raw source for implementation bodies.
+agent a lookup protocol: orient with `ctx core` or a budgeted
+`ctx map --max-tokens`, pull `ctx subtree <module>` before touching a module,
+follow call edges instead of grepping, and only read raw source for
+implementation bodies.
 
-To keep a committed `CODEBASE_MAP.md` fresh, regenerate it from a git
-pre-commit hook or a Claude Code hook (`ctx map . -o CODEBASE_MAP.md`) — or
-skip the file entirely and have sessions run `ctx map` at boot; generation is
-~100 ms, so freshness is free.
+**Don't commit the map.** A `CODEBASE_MAP.md` is a derived artifact — a pure
+function of the source tree, generated in well under a second — so it belongs in
+`.gitignore`, and sessions should regenerate it on demand
+(`ctx map . -o CODEBASE_MAP.md`). Committing it buys nothing, costs a ~1 MB diff
+whenever sources move, and leaves a stale copy lying around that reads as
+authoritative.
+
+Gitignoring it is also load-bearing for correctness: ctx honors `.gitignore`, so
+an ignored map is excluded from its own parse. A *tracked* map is Markdown in the
+tree, so ctx reads it back as a module of its own headings — each run then
+describes the previous run's output and generation never reaches a fixed point.
+If you must keep one tracked, list it in a `.ignore` file (honored by
+ripgrep-family tools, invisible to git) to restore idempotency.
 
 ### Markdown as a graph
 
