@@ -342,12 +342,26 @@ fn snippet_for(g: &Graph) -> String {
          resolve internally.\n\n"
     ));
 
-    out.push_str("Start here:\n\n");
-    out.push_str("- `ctx core` — the modules that matter most. Cheap at any size; first call.\n");
+    // Targeted lookups lead. An orientation-first protocol reads well and does not
+    // survive contact with an agent that has a concrete task: measured over one
+    // long working session, the "start with `ctx core`" step was never taken once,
+    // while the value that did land came from jumping straight to a symbol.
+    out.push_str("Reach for these first — they answer a question you actually have:\n\n");
     out.push_str(
-        "- `ctx context <symbol>` / `ctx def` / `ctx callers` — targeted lookups, cheap. Most \
-         work needs only these.\n",
+        "- `ctx def <name>` — where a symbol is defined, across languages, without guessing \
+         the file.\n",
     );
+    out.push_str(
+        "- `ctx callers <name>` — who calls it, before you change a signature. Also answers \
+         `<Type>`: what references a type, which is the most common breaking change.\n",
+    );
+    out.push_str(
+        "- `ctx context <symbol>` — definition + signature types + callees + callers in one \
+         call. Usually enough to edit without opening the file.\n",
+    );
+    out.push_str("- `ctx changed --api` before pushing — public items removed or changed, and who breaks.\n\n");
+    out.push_str("When you genuinely do not know where you are:\n\n");
+    out.push_str("- `ctx core` — the modules that matter most, by dependency centrality.\n");
     // Gate on the cost of what an agent would actually run — the default map —
     // not on the cheapest view. Calling an 18k-token map "affordable" because its
     // skeleton fits is the same category of wrong advice this block replaced.
@@ -363,7 +377,7 @@ fn snippet_for(g: &Graph) -> String {
              directly. Pass `--max-tokens` if it grows.\n"
         ));
     }
-    out.push_str("- `ctx changed --api` before pushing — public items removed or changed, and who breaks.\n\n");
+    out.push('\n');
 
     out.push_str(
         "**Trust:** `ctx callers` is a floor, never a complete answer. It prints `INCOMPLETE` \
