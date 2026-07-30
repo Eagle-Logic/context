@@ -315,7 +315,7 @@ fn main() -> Result<()> {
                             // The map's header and footer are a fixed floor that
                             // no amount of pruning removes, so at very small
                             // budgets they, not the modules, are what overflows.
-                            let floor = b.text.len() / 4;
+                            let floor = est_tokens(&b.text);
                             format!(
                                 " — BUDGET NOT MET: emitted ~{floor} tok with {emitted_count} of \
                                  {module_count} module(s) ({n} omitted); the map header and \
@@ -326,7 +326,7 @@ fn main() -> Result<()> {
                     eprintln!(
                         "budget {budget} tok → {} view (~{} tok){detail}",
                         b.view.name(),
-                        b.text.len() / 4,
+                        est_tokens(&b.text),
                     );
                     b.text
                 }
@@ -366,7 +366,7 @@ fn main() -> Result<()> {
             let g = extract::build_graph(&path)?;
             let text = subtree_text(&g, &module, view, format, max_tokens)?;
             if let Some(budget) = max_tokens {
-                eprintln!("budget {budget} tok → subtree (~{} tok)", text.len() / 4);
+                eprintln!("budget {budget} tok → subtree (~{} tok)", est_tokens(&text));
             }
             print!("{text}");
         }
@@ -800,7 +800,7 @@ fn subtree_text(
     let start = ladder.iter().position(|&v| v == view).unwrap_or(0);
     for &v in &ladder[start..] {
         let text = render_at(v, None);
-        if text.len() / 4 <= budget {
+        if est_tokens(&text) <= budget {
             return Ok(text);
         }
     }
@@ -820,7 +820,7 @@ fn subtree_text(
     while lo <= hi {
         let mid = lo + (hi - lo) / 2;
         let text = render_at(View::Skeleton, Some(mid));
-        if text.len() / 4 <= budget {
+        if est_tokens(&text) <= budget {
             best = text;
             lo = mid + 1;
         } else if mid == 0 {
@@ -883,6 +883,19 @@ fn not_found_message(g: &Graph, query: &str) -> String {
     )
 }
 
+/// Bytes per token for budget arithmetic.
+///
+/// `len/4` is the familiar rule of thumb, but measured against a real tokenizer
+/// on this tool's own output it under-counts by 5-23% — code and Markdown are
+/// denser than prose English. A cap that overshoots is not a cap, so budgets use
+/// a conservative divisor: better to under-fill than to blow the window.
+const BYTES_PER_TOKEN: usize = 3;
+
+/// Estimated tokens for rendered output.
+fn est_tokens(text: &str) -> usize {
+    text.len() / BYTES_PER_TOKEN
+}
+
 /// Most a budget-pruned map will spend on prose (Markdown) modules, as a share
 /// of its rendered size. Docs link to each other and earn genuine centrality, so
 /// without a ceiling they can take a third of a small orientation budget in a
@@ -923,7 +936,7 @@ fn render_budgeted(g: &Graph, start: View, format: Format, max_tokens: usize) ->
     };
     for &v in &ladder[start_idx..] {
         let text = render(v);
-        if text.len() / 4 <= max_tokens {
+        if est_tokens(&text) <= max_tokens {
             return Budgeted { view: v, text, fit: true, omitted: 0 };
         }
     }
@@ -941,7 +954,7 @@ fn render_budgeted(g: &Graph, start: View, format: Format, max_tokens: usize) ->
     while lo <= hi {
         let mid = lo + (hi - lo) / 2;
         let (text, omitted) = render_pruned(&skel, format, max_tokens, mid, total);
-        if text.len() / 4 <= max_tokens {
+        if est_tokens(&text) <= max_tokens {
             best = Some((mid, text, omitted));
             lo = mid + 1;
         } else {

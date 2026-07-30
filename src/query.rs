@@ -229,6 +229,55 @@ fn definition_count(g: &Graph, q: &[&str]) -> usize {
     hits.len()
 }
 
+
+/// Kinds of every definition of this name (type-like or not).
+fn definition_kinds(g: &Graph, q: &[&str]) -> Vec<String> {
+    let Some(&last) = q.last() else { return Vec::new() };
+    let mut hits = Vec::new();
+    for m in &g.modules {
+        collect_defs(&m.items, m, None, last, None, &mut hits);
+    }
+    hits.into_iter().map(|h| h.kind).collect()
+}
+
+fn is_type_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "struct" | "enum" | "trait" | "interface" | "type" | "class"
+    )
+}
+
+/// Every item whose SIGNATURE mentions `type_name` — the reverse of the forward
+/// index `context` already builds.
+///
+/// A type has no call edges, so `callers SteerConfig` used to answer "no callers
+/// found" for a struct referenced by a dozen files. That reads as "safe to
+/// change" for the single most common breaking change there is: altering a type.
+/// Signatures are where a type change actually breaks callers — fields,
+/// parameters, return types — so scanning them is both cheap and the right scope.
+fn type_references<'a>(g: &'a Graph, type_name: &str) -> Vec<(&'a Module, &'a Item)> {
+    fn walk<'a>(
+        items: &'a [Item],
+        m: &'a Module,
+        type_name: &str,
+        out: &mut Vec<(&'a Module, &'a Item)>,
+    ) {
+        for it in items {
+            // Skip the definition itself.
+            let is_self = it.name.as_deref() == Some(type_name) && is_type_kind(&it.kind);
+            if !is_self && identifiers(&it.signature).iter().any(|n| n == type_name) {
+                out.push((m, it));
+            }
+            walk(&it.children, m, type_name, out);
+        }
+    }
+    let mut out = Vec::new();
+    for m in &g.modules {
+        walk(&m.items, m, type_name, &mut out);
+    }
+    out
+}
+
 pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
     let q = segments(query);
     if q.is_empty() {
@@ -252,6 +301,14 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
     // merely shares the name. An empty result there is silence, not absence.
     let suppressed = crate::extract::is_suppressed_method_name(bare_name);
     let lower_bound = ambiguous || suppressed;
+    // A type is never "called", so call edges alone answer the wrong question.
+    let kinds = definition_kinds(g, &q);
+    let is_type = !kinds.is_empty() && kinds.iter().all(|k| is_type_kind(k));
+    let refs = if is_type {
+        type_references(g, bare_name)
+    } else {
+        Vec::new()
+    };
 
     if json_out {
         let arr: Vec<_> = found
@@ -276,6 +333,16 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
             "lower_bound": lower_bound,
             "ambiguous_name": ambiguous,
             "suppressed_common_name": suppressed,
+            "references": refs
+                .iter()
+                .map(|(m, it)| json!({
+                    "module": m.name,
+                    "file": m.file,
+                    "line": it.line,
+                    "kind": it.kind,
+                    "signature": it.signature,
+                }))
+                .collect::<Vec<_>>(),
         }))
         .unwrap_or_default()
             + "\n";
@@ -301,11 +368,38 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
         String::new()
     };
 
+    if !refs.is_empty() {
+        let mut out = format!(
+            "'{query}' is a type, so it has no call edges. {} item(s) reference it \
+             in a signature — these are what a change to it can break:\n\n",
+            refs.len()
+        );
+        for (m, it) in &refs {
+            out.push_str(&format!(
+                "{}  ({}:{})\n    {}\n",
+                m.name, m.file, it.line, it.signature
+            ));
+        }
+        if !found.is_empty() {
+            out.push_str(&format!("\nplus {} resolved call edge(s).\n", found.len()));
+        }
+        out.push_str(
+            "\nSignature references only: uses inside function BODIES are not indexed.\n",
+        );
+        return out + &recall_note;
+    }
+
     if found.is_empty() {
+        let type_note = if is_type {
+            "\n(this name is a type: types have no call edges, and nothing references it \
+             in a signature)\n"
+        } else {
+            ""
+        };
         return format!(
             "no callers found for '{query}'\n\
              (only resolved call edges are indexed; ambiguous calls and \
-             ubiquitous std-named methods are intentionally dropped)\n{recall_note}"
+             ubiquitous std-named methods are intentionally dropped)\n{type_note}{recall_note}"
         );
     }
     let mut out = format!("{} caller(s) of '{}':\n\n", found.len(), query);
@@ -1337,6 +1431,38 @@ mod tests {
             !text.contains("user.go"),
             "the Python call must not be reported as a caller of the Rust method: {text}"
         );
+    }
+
+    #[test]
+    fn module_level_calls_are_attributed_to_the_module() {
+        // Top-level code is invisible if only function bodies are scanned, which
+        // silently loses callers in scripts, tests and __init__ wiring.
+        let (g, dir) = graph(&[
+            ("lib.py", "def frequencies(x):\n    return x\n"),
+            ("top.py", "from lib import frequencies\n\nFR = frequencies(3)\n"),
+        ]);
+        let text = callers(&g, "frequencies", false);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            text.contains("top"),
+            "a module-level call must be reported: {text}"
+        );
+    }
+
+    #[test]
+    fn type_queries_report_signature_references() {
+        // A type has no call edges; "no callers found" reads as "safe to change"
+        // for the most common breaking change there is.
+        let (g, dir) = graph(&[
+            ("a.py", "class Config:\n    pass\n"),
+            ("b.py", "from a import Config\n\ndef build(c: Config) -> Config:\n    return c\n"),
+        ]);
+        let text = callers(&g, "Config", false);
+        let json = callers(&g, "Config", true);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(text.contains("is a type"), "type queries need the type path: {text}");
+        assert!(text.contains("build"), "the referencing signature must be listed");
+        assert!(json.contains("\"references\""));
     }
 
     #[test]

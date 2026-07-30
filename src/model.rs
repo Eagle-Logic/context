@@ -23,6 +23,11 @@ pub struct Module {
     pub deps: Vec<String>,
     /// External crates / packages referenced (top-level names, deduped).
     pub extern_deps: Vec<String>,
+    /// Subset of `deps` that exists ONLY because of receiver-inferred (`~`)
+    /// call edges. Rendered with a `~` so the "a `~`-free edge is reliable" rule
+    /// holds at module level too, not just per call site.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub heuristic_deps: Vec<String>,
     /// Symbols this module re-exports (Rust `pub use`, Python `__init__`
     /// imports), resolved to their source path where possible.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -193,14 +198,6 @@ impl Module {
             Lang::Python | Lang::TypeScript | Lang::Markdown => ".",
         };
         base.split(sep).map(|s| s.to_string()).collect()
-    }
-
-    pub fn name_segs(&self) -> Vec<String> {
-        let sep = match self.lang {
-            Lang::Rust => "::",
-            Lang::Python | Lang::TypeScript | Lang::Markdown => ".",
-        };
-        self.name.split(sep).map(|s| s.to_string()).collect()
     }
 
     pub fn item_count(&self) -> usize {

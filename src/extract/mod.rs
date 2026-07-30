@@ -170,6 +170,7 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
         modules.push(Module {
             name,
             resolve_name: String::new(),
+            heuristic_deps: Vec::new(),
             file: rel.display().to_string(),
             lang,
             deps: Vec::new(),
@@ -410,6 +411,7 @@ fn resolve_deps(modules: &mut [Module], root: &Path) {
         BTreeSet<String>,
         Vec<String>,
         Vec<Vec<Call>>,
+        Vec<String>,
         Diagnostics,
     );
     let results: Vec<ModuleResult> = {
@@ -442,17 +444,25 @@ fn resolve_deps(modules: &mut [Module], root: &Path) {
                     .filter(|b| b.public)
                     .map(|b| display_reexport(b, m, &ctx))
                     .collect();
-                let (calls_per_item, call_deps, diag) = compute_calls(m, &ctx, &method_index);
+                let (calls_per_item, call_deps, soft_deps, diag) =
+                    compute_calls(m, &ctx, &method_index);
+                // An import-derived dep is hard evidence; only a dep that exists
+                // SOLELY via receiver inference stays marked soft.
+                let soft: Vec<String> = soft_deps
+                    .into_iter()
+                    .filter(|d| d != &m.name && !deps.contains(d))
+                    .collect();
                 deps.extend(call_deps.into_iter().filter(|d| d != &m.name));
-                (deps, ext, reex, calls_per_item, diag)
+                (deps, ext, reex, calls_per_item, soft, diag)
             })
             .collect()
     };
 
-    for (m, (deps, ext, reex, calls, diag)) in modules.iter_mut().zip(results) {
+    for (m, (deps, ext, reex, calls, soft, diag)) in modules.iter_mut().zip(results) {
         m.deps = deps.into_iter().collect();
         m.extern_deps = ext.into_iter().collect();
         m.reexports = reex;
+        m.heuristic_deps = soft;
         m.diag = diag;
         let mut it = calls.into_iter();
         apply_calls(&mut m.items, &mut it);
@@ -863,7 +873,14 @@ fn resolve_call(
                 return Resolution::Edge {
                     display: segs.join(s),
                     dep: None,
-                    heuristic: false,
+                    // In Rust `Engine::new()` really is type-qualified. In
+                    // Python/TS the same shape is `receiver.method()`, and
+                    // `defined_names` holds functions and imports too — so a
+                    // local variable that happens to share a module-level name
+                    // (a pytest fixture called `router`) produced a confident,
+                    // `~`-free edge naming nothing in the graph. Keep the signal,
+                    // but stop asserting it.
+                    heuristic: m.lang != Lang::Rust,
                 };
             }
             // First segment bound by use/import: helpers::go(), np-style aliases.
@@ -1124,7 +1141,7 @@ fn compute_calls(
     m: &Module,
     ctx: &Ctx,
     method_index: &MethodIndex,
-) -> (Vec<Vec<Call>>, BTreeSet<String>, Diagnostics) {
+) -> (Vec<Vec<Call>>, BTreeSet<String>, BTreeSet<String>, Diagnostics) {
     #[allow(clippy::too_many_arguments)]
     fn rec(
         items: &[Item],
@@ -1134,6 +1151,7 @@ fn compute_calls(
         method_index: &MethodIndex,
         per_item: &mut Vec<Vec<Call>>,
         deps: &mut BTreeSet<String>,
+        soft_deps: &mut BTreeSet<String>,
         diag: &mut Diagnostics,
     ) {
         for it in items {
@@ -1157,6 +1175,9 @@ fn compute_calls(
                             .and_modify(|h| *h = *h && heuristic)
                             .or_insert(heuristic);
                         if let Some(d) = dep {
+                            if heuristic {
+                                soft_deps.insert(d.clone());
+                            }
                             deps.insert(d);
                         }
                     }
@@ -1180,14 +1201,15 @@ fn compute_calls(
             } else {
                 container
             };
-            rec(&it.children, next, m, ctx, method_index, per_item, deps, diag);
+            rec(&it.children, next, m, ctx, method_index, per_item, deps, soft_deps, diag);
         }
     }
     let mut per_item = Vec::new();
     let mut deps = BTreeSet::new();
+    let mut soft_deps = BTreeSet::new();
     let mut diag = Diagnostics::default();
-    rec(&m.items, None, m, ctx, method_index, &mut per_item, &mut deps, &mut diag);
-    (per_item, deps, diag)
+    rec(&m.items, None, m, ctx, method_index, &mut per_item, &mut deps, &mut soft_deps, &mut diag);
+    (per_item, deps, soft_deps, diag)
 }
 
 fn apply_calls(items: &mut [Item], resolved: &mut std::vec::IntoIter<Vec<Call>>) {
