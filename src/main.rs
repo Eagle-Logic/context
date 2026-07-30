@@ -220,6 +220,10 @@ enum Cmd {
         /// Exit non-zero if any source member is missing from the port
         #[arg(long)]
         strict: bool,
+        /// Map a renamed container/type explicitly, e.g.
+        /// --alias TriStateRouter=IntentGate (repeatable). Overrides inference.
+        #[arg(long, value_parser = parse_alias)]
+        alias: Vec<(String, String)>,
         /// Apply a systematic cross-language rename table (e.g. py-rust maps
         /// `__init__` → `new`). Alias matches are reported, never silent.
         #[arg(long, value_enum)]
@@ -554,6 +558,7 @@ fn main() -> Result<()> {
             source,
             target,
             strict,
+            alias,
             aliases,
             format,
         } => {
@@ -566,7 +571,15 @@ fn main() -> Result<()> {
                 Some(AliasSet::PyRust) => parity::py_rust_aliases(),
                 None => parity::AliasMap::new(),
             };
-            let (out, missing) = parity::report(&src, &tgt, &amap, matches!(format, Format::Json));
+            let containers: std::collections::BTreeMap<String, String> =
+                alias.into_iter().collect();
+            let (out, missing) = parity::report(
+                &src,
+                &tgt,
+                &amap,
+                &containers,
+                matches!(format, Format::Json),
+            );
             print!("{out}");
             if strict && missing > 0 {
                 std::process::exit(1);
@@ -1037,6 +1050,16 @@ fn subtree_text(
     Ok(text)
 }
 
+
+/// Parse `--alias Old=New` into a container rename pair.
+fn parse_alias(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((a, b)) if !a.trim().is_empty() && !b.trim().is_empty() => {
+            Ok((a.trim().to_string(), b.trim().to_string()))
+        }
+        _ => Err(format!("expected Old=New, got '{s}'")),
+    }
+}
 
 /// A module-not-found error with near misses instead of the whole index.
 ///

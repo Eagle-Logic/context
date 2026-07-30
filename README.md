@@ -208,9 +208,19 @@ renames for free (it strips the underscores, so `__len__`↔`len`, `__eq__`↔`e
 `__hash__`↔`hash`, `__next__`↔`next` already align). For the renames it can't —
 chiefly `__init__`→`new`, plus `__str__`→`fmt`/`to_string`, `__getitem__`→
 `index`, `__iter__`→`into_iter` — pass `--aliases py-rust`. Every alias-based
-match is reported in its own **Aligned via alias** section (`__init__ → new
-(via init → new)`), never silently folded — so the fuzz you opted into is
-always visible.
+match is reported in its own **Aligned via alias** section, never silently folded
+— so the fuzz you opted into is always visible.
+
+**Renamed containers are inferred.** Container is part of every member key, so
+renaming a type invalidates all of its members at once — and renaming the main
+type is the normal case in a port, not an edge case. `parity` pairs containers by
+shared member sets (requiring at least two shared members and a majority of the
+smaller container, so unrelated types are never paired), and container and member
+renames compose: `TriStateRouter.__init__` → `IntentGate.new` needs both, and
+neither alias alone finds it. Every inferred pairing is listed under **Inferred
+container renames** — a wrong pairing must never masquerade as a clean parity
+result — and `--alias Old=New` overrides inference when the port shares too few
+names to infer from.
 
 `def` and `callers` accept a bare name (`to_config`) or a qualified name
 (`SteerOverride::to_config`, `pkg.mod.fn`); a bare name lists every match so
