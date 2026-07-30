@@ -218,11 +218,44 @@ fn frontmatter_lines(src: &str) -> usize {
     if lines.next().map(str::trim) != Some("---") {
         return 0;
     }
+    // The block must LOOK like YAML, or a document opening with a thematic
+    // break gets everything up to the next `---` deleted — including real
+    // headings, whose slugs then go unregistered and turn working links into
+    // reported-broken ones. That is worse than the phantom heading this guards
+    // against, so be strict: every line up to the delimiter must be a `key:`
+    // entry, a list item, an indented continuation, a comment, or blank — and
+    // the block may not be empty.
+    let mut body = 0usize;
     for (i, l) in lines.enumerate() {
         let t = l.trim();
         if t == "---" || t == "..." {
-            return i + 2; // opening line + this closing line
+            return if body > 0 { i + 2 } else { 0 };
         }
+        if t.is_empty() {
+            // A blank line immediately after `---` means a thematic break, not
+            // frontmatter; later blanks inside a real block are tolerated.
+            if body == 0 {
+                return 0;
+            }
+            continue;
+        }
+        if t.starts_with('#') {
+            // A comment is fine; an ATX heading is not YAML.
+            if t.starts_with("# ") || t.starts_with("## ") {
+                return 0;
+            }
+            continue;
+        }
+        let yamlish = t.starts_with('-')
+            || l.starts_with(' ')
+            || l.starts_with('\t')
+            || t.split_once(':').is_some_and(|(k, _)| {
+                !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || "_-.\"'".contains(c))
+            });
+        if !yamlish {
+            return 0;
+        }
+        body += 1;
     }
     0
 }

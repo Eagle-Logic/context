@@ -243,10 +243,11 @@ implementation bodies.
 - `ctx def <name>` — where a symbol is defined: module, kind, line, and signature (jump-to-def
   without knowing the module; accepts bare `Foo` or qualified `Type::method`)
 - `ctx callers <name>` — every function that calls the given function/method (resolved reverse
-  call edges — the blast radius before changing a signature). Reads a name with more than one
-  definition as ambiguous and says so: it prints `INCOMPLETE`, the definition count, and the
-  `rg` command to confirm with. Treat an unflagged result as complete and a flagged one as a
-  lower bound
+  call edges — the blast radius before changing a signature). It never claims completeness:
+  the result is a floor. It prints `INCOMPLETE` when the name has several definitions, and
+  `NOT INDEXED` when the name is a suppressed ubiquitous one (`get`/`open`/`push`/...), where
+  an empty result means nothing at all. An unflagged result means no KNOWN reason to distrust
+  it, not a guarantee — run the `rg` command it prints before changing a signature
 - `ctx context <name>` — everything needed to edit a symbol in one shot: its definition, the
   types in its signature, what it calls, and what calls it (token-budgeted via `--max-tokens`)
 - `ctx changed [--since <ref>]` — impact map of your diff: the changed modules plus their

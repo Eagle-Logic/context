@@ -217,10 +217,14 @@ fn collect_callers(
 /// graph knows the name three times over.
 fn definition_count(g: &Graph, q: &[&str]) -> usize {
     let Some(&last) = q.last() else { return 0 };
-    let parent = if q.len() >= 2 { Some(q[q.len() - 2]) } else { None };
+    // Deliberately ignores any qualifier. Ambiguity is a property of the NAME as
+    // written at the call site: `x.run()` cannot be pinned to `A::run` or
+    // `B::run` no matter how the query is spelled, so counting only `A::run`
+    // would silence the warning exactly when a user follows the documented
+    // advice to qualify.
     let mut hits = Vec::new();
     for m in &g.modules {
-        collect_defs(&m.items, m, None, last, parent, &mut hits);
+        collect_defs(&m.items, m, None, last, None, &mut hits);
     }
     hits.len()
 }
@@ -237,11 +241,17 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
     }
     found.sort_by(|a, b| (&a.qualname, a.line).cmp(&(&b.qualname, b.line)));
 
-    // Ambiguity is the dominant source of missing reverse edges, and it is
-    // knowable from the same graph, so never let the count stand alone.
+    // Reverse edges exist only for calls that resolved, so `callers` must never
+    // present its count as an answer without the known loss channels alongside
+    // it. Two are knowable from here.
     let defs = definition_count(g, &q);
-    let ambiguous = defs > 1;
     let bare_name = q.last().copied().unwrap_or(query);
+    let ambiguous = defs > 1;
+    // A suppressed ubiquitous name (`get`, `open`, `push`, ...) has NO reverse
+    // edges at all, by design — including for a project-defined method that
+    // merely shares the name. An empty result there is silence, not absence.
+    let suppressed = crate::extract::is_suppressed_method_name(bare_name);
+    let lower_bound = ambiguous || suppressed;
 
     if json_out {
         let arr: Vec<_> = found
@@ -259,9 +269,13 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
             "query": query,
             "callers": arr,
             "definitions": defs,
-            // With several definitions the reverse edges are a lower bound, not
-            // an answer. Machine consumers need this as a field, not prose.
-            "complete": !ambiguous,
+            // Never claim completeness: resolution can drop a call site for
+            // reasons not visible from here (module-level calls, function-local
+            // imports). These flag the two knowable causes; absent flags mean
+            // "no known reason to distrust this", not "guaranteed complete".
+            "lower_bound": lower_bound,
+            "ambiguous_name": ambiguous,
+            "suppressed_common_name": suppressed,
         }))
         .unwrap_or_default()
             + "\n";
@@ -269,7 +283,14 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
 
     // Spelled out the same way whether or not anything was found: the risk of
     // acting on an incomplete blast radius does not depend on the count.
-    let recall_note = if ambiguous {
+    let recall_note = if suppressed {
+        format!(
+            "\nNOT INDEXED: '{bare_name}' is on the suppressed list of ubiquitous method names, \
+             so ctx indexes NO reverse edges for it — including for a project-defined method of \
+             that name. The result above carries no information about whether callers exist.\n\
+             Use grep for this one:  rg -n '\\b{bare_name}\\s*\\('\n"
+        )
+    } else if ambiguous {
         format!(
             "\nINCOMPLETE: '{bare_name}' has {defs} definitions in this graph. Calls through a \
              receiver that cannot be pinned to one of them are dropped, never guessed, so the \
@@ -1263,7 +1284,59 @@ mod tests {
             !unique.contains("INCOMPLETE"),
             "a uniquely-named symbol must not raise a false alarm"
         );
-        assert!(json.contains("\"complete\": false"), "machine callers need the flag");
+        // Qualifying the query must not silence the warning: ambiguity is a
+        // property of the name at the call site, not of how it was spelled.
+        let qualified = callers(&g, "A::run", false);
+        assert!(
+            qualified.contains("INCOMPLETE"),
+            "qualifying must not hide the ambiguity"
+        );
+        assert!(json.contains("\"lower_bound\": true"), "machine callers need the flag");
+    }
+
+    #[test]
+    fn suppressed_common_names_say_they_are_not_indexed() {
+        // `open` is on the suppressed ubiquitous-method list, so NO reverse edges
+        // exist for it — an empty result must not read as "no callers".
+        let (g, dir) = graph(&[(
+            "m.py",
+            "class Clock:\n    def open(self):\n        pass\n\n\ndef driver(c):\n    c.open()\n",
+        )]);
+        let text = callers(&g, "open", false);
+        let json = callers(&g, "open", true);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(text.contains("NOT INDEXED"), "suppression must be disclosed: {text}");
+        assert!(json.contains("\"suppressed_common_name\": true"));
+        assert!(json.contains("\"lower_bound\": true"));
+        assert!(!json.contains("\"complete\": true"), "must never claim completeness");
+    }
+
+    #[test]
+    fn cross_language_method_names_do_not_create_edges() {
+        // A Python call to `apply_template` must not be attributed to a Rust
+        // method of the same name — that invents a Python -> Rust dependency.
+            let (g, dir) = graph(&[
+            (
+                "user.py",
+                "import os\n\ndef go(tok):\n    tok.apply_template('x')\n",
+            ),
+            (
+                "src/engine.rs",
+                "pub struct Engine;\nimpl Engine {\n    pub fn apply_template(&self, s: &str) {}\n}\n",
+            ),
+        ]);
+        let text = callers(&g, "apply_template", false);
+        let py = g.modules.iter().find(|m| m.name == "user").unwrap();
+        let deps = py.deps.clone();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            deps.is_empty(),
+            "a Python module must not gain a Rust dep from a shared method name: {deps:?}"
+        );
+        assert!(
+            !text.contains("user.go"),
+            "the Python call must not be reported as a caller of the Rust method: {text}"
+        );
     }
 
     #[test]

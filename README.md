@@ -126,14 +126,31 @@ still whole. Only when a single module alone exceeds the budget does `ctx` emit
 an over-budget map, and it says so on stderr. Without `--max-tokens`, nothing is
 ever pruned.
 
-`callers` reports its own recall. Reverse edges are only emitted for calls that
-resolve, and a method name with several definitions cannot be attributed from an
-opaque receiver — those sites are dropped rather than guessed. So when the queried
-name has more than one definition, `callers` prints `INCOMPLETE`, the definition
-count, and the `rg` command to confirm with (`complete: false` in JSON). An
-unflagged result is complete; a flagged one is a lower bound. This matters because
-`callers` is the pre-signature-change safety check, and "no callers" reads as
-"safe to change".
+`callers` reports its own recall, and **never claims completeness**. Reverse edges
+exist only for calls that resolved, and resolution drops rather than guesses, so
+the result is a floor. Two loss channels are knowable and are reported in band:
+
+- **Ambiguous name** — more than one definition, so a call through an opaque
+  receiver cannot be pinned to one of them. Prints `INCOMPLETE` with the
+  definition count (`ambiguous_name` in JSON). Computed from the bare name, so
+  qualifying the query cannot silence it.
+- **Suppressed ubiquitous name** — `get`, `open`, `push`, `len` and friends are
+  never indexed, including a project-defined method that merely shares the name.
+  Prints `NOT INDEXED`, because an empty result there carries no information at
+  all (`suppressed_common_name` in JSON).
+
+Both set `lower_bound: true`. The absence of a flag means "no *known* reason to
+distrust this" — not a guarantee: a call made at module level, or through a
+function-local import, can still be missed. Before changing a signature, run the
+`rg` command ctx prints. This matters because `callers` is the
+pre-signature-change safety check, and "no callers" reads as "safe to change".
+
+Heuristic method attribution is **language-scoped**. A unique method name is
+evidence only within one language; across languages it is coincidence, so
+`tok.apply_chat_template(...)` in Python is no longer attributed to a Rust method
+of the same name. Before this guard, 45 of 50 reported callers of that name were
+artifacts, ~18% of module dep edges were impossible Python->Rust edges, and those
+edges distorted `core`'s ranking.
 
 `--exclude '<glob>'` and `--lang` are global, repeatable flags for scoping the
 scan. Vendored trees, archived docs and dead code are usually tracked, so
@@ -188,14 +205,17 @@ or any trailing suffix (`inference`).
 `map` and `subtree` take `--view` to scale detail to informational need —
 each level adds a whole category, so token spend buys precision, not noise:
 
-| view | contents | eagle-logits-native (419 modules) |
-|---|---|---|
-| `skeleton` | modules, deps, re-exports, type names | 79 KB (~19k tok) |
-| `interface` | + public signatures, struct fields, enum variants | 301 KB (~75k tok) |
-| `full` (default) | + private items and call edges | 451 KB (~112k tok) |
+| view | contents | 720-module polyglot repo | same, `--lang code` |
+|---|---|---|---|
+| `skeleton` | modules, deps, re-exports, type names | 504 KB (~126k tok) | 105 KB (~26k tok) |
+| `interface` | + public signatures, struct fields, enum variants | 827 KB (~207k tok) | — |
+| `full` (default) | + private items and call edges | 1.03 MB (~258k tok) | — |
 
-On a mid-size repo (70 files) skeleton is ~3k tokens — cheap enough for the
-first turn of every session. Rust visibility is `pub`-based; Python uses the
+Those are the *unbudgeted* sizes, and at that scale none of them belong in a
+context window: pass `--max-tokens` (a hard cap) or `--lang code` (77% of that
+repo's map is Markdown). On a small repo (16 modules) `full` is ~10k tokens, cheap
+enough for the first turn of a session. Sizes scale with the repo, not with the
+view alone — measure before reading. Rust visibility is `pub`-based; Python uses the
 underscore convention (dunders like `__init__` count as public); TypeScript
 uses the `export` keyword (public class methods are interface, `private`/`#`
 members are dropped). Trait methods and trait impls are always interface.

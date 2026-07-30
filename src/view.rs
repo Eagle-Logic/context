@@ -221,8 +221,12 @@ pub fn is_public(it: &Item, lang: Lang) -> bool {
                     "function ",
                     // `async function foo()` is a top-level declaration too, and
                     // without it here a non-exported async function reads as API.
+                    // Only the `function` form: a bare `async ` prefix also
+                    // matches CLASS METHODS, and extraction already dropped the
+                    // private ones, so every method reaching here is public —
+                    // suppressing them would hide real API from `--view
+                    // interface` and from `changed --api`'s breaking-change check.
                     "async function ",
-                    "async ",
                     "const ",
                     "class ",
                     "abstract ",

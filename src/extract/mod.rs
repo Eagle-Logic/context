@@ -169,6 +169,7 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
         let (name, crate_prefix) = module_name(rel, lang);
         modules.push(Module {
             name,
+            resolve_name: String::new(),
             file: rel.display().to_string(),
             lang,
             deps: Vec::new(),
@@ -238,7 +239,9 @@ fn disambiguate_module_names(modules: &mut [Module]) {
             n += 1;
         }
         seen.insert(candidate.clone(), 1);
-        renames.push((name, candidate.clone(), modules[i].file.clone()));
+        renames.push((name.clone(), candidate.clone(), modules[i].file.clone()));
+        // Display name changes; resolution identity must not.
+        modules[i].resolve_name = name;
         modules[i].name = candidate;
     }
     for (from, to, file) in &renames {
@@ -393,7 +396,7 @@ enum Resolved {
 fn resolve_deps(modules: &mut [Module], root: &Path) {
     let mut index: Vec<(Vec<String>, String)> = modules
         .iter()
-        .map(|m| (m.name_segs(), m.name.clone()))
+        .map(|m| (m.resolve_segs(), m.name.clone()))
         .collect();
     index.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.1.cmp(&b.1)));
     let by_name: HashMap<String, usize> = modules
@@ -470,7 +473,7 @@ fn candidates(imp: &str, m: &Module) -> (Vec<Vec<String>>, bool) {
             if raw.is_empty() {
                 return (Vec::new(), true);
             }
-            let cur = m.name_segs();
+            let cur = m.resolve_segs();
             match raw[0].as_str() {
                 "crate" => (
                     vec![[m.crate_prefix.clone(), raw[1..].to_vec()].concat()],
@@ -504,7 +507,7 @@ fn candidates(imp: &str, m: &Module) -> (Vec<Vec<String>>, bool) {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
-                let cur = m.name_segs();
+                let cur = m.resolve_segs();
                 let dir_len = if m.is_package {
                     cur.len()
                 } else {
@@ -540,7 +543,7 @@ fn candidates(imp: &str, m: &Module) -> (Vec<Vec<String>>, bool) {
                 // One dot means the enclosing package: the module itself for
                 // an __init__.py, its parent otherwise. Each extra dot climbs
                 // one more level.
-                let cur = m.name_segs();
+                let cur = m.resolve_segs();
                 let pkg_len = if m.is_package {
                     cur.len()
                 } else {
@@ -707,6 +710,14 @@ fn provides(mi: usize, sym: &str, ctx: &Ctx, depth: usize) -> bool {
 /// Receiver-based method calls are resolved via a global method index only
 /// when the name is unique codebase-wide AND not a ubiquitous std method —
 /// otherwise a single local `fn push` would swallow every `vec.push()`.
+/// Is this a method name whose reverse edges are deliberately not indexed?
+///
+/// `callers` needs this to answer honestly: a suppressed name has NO reverse
+/// edges by design, so an empty result says nothing about whether callers exist.
+pub fn is_suppressed_method_name(name: &str) -> bool {
+    STD_METHODS.contains(&name)
+}
+
 const STD_METHODS: &[&str] = &[
     "new", "default", "clone", "into", "from", "as_ref", "as_mut", "as_str", "to_string",
     "to_owned", "to_vec", "into_iter", "iter", "iter_mut", "next", "collect", "map", "filter",
@@ -1057,6 +1068,17 @@ fn method_edge(
     let Some(&omi) = ctx.by_name.get(om) else {
         return Resolution::Drop;
     };
+    // A unique method name is evidence only WITHIN one language. Across
+    // languages it is coincidence: `tok.apply_chat_template(...)` in Python is
+    // the HuggingFace tokenizer, not the Rust `NativeEngine` method that happens
+    // to share the name — and attributing it invents a Python -> Rust dependency
+    // that cannot exist. Those fabricated edges then drive `deps:`, `subtree`
+    // upstream and `core`'s ranking, so this is not a cosmetic miss. Measured on
+    // a polyglot repo: 45 of 50 `apply_chat_template` "callers", and ~18% of all
+    // module dep edges, were cross-language artifacts.
+    if ctx.modules[omi].lang != m.lang {
+        return Resolution::Drop;
+    }
     let os = sep(ctx.modules[omi].lang);
     if om == &m.name {
         Resolution::Edge {
