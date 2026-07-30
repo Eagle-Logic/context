@@ -184,6 +184,10 @@ enum Cmd {
         /// Changed modules are always kept.
         #[arg(long)]
         max_tokens: Option<usize>,
+        /// With --api: exit non-zero if any public item was removed or had its
+        /// signature changed. Additions are not breaking. For CI gates.
+        #[arg(long)]
+        strict: bool,
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
         #[arg(long, value_enum, default_value_t = View::Full)]
@@ -203,6 +207,9 @@ enum Cmd {
         /// Changed modules are always kept.
         #[arg(long)]
         max_tokens: Option<usize>,
+        /// With --api: exit non-zero on a breaking change. For CI gates.
+        #[arg(long)]
+        strict: bool,
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
         #[arg(long, value_enum, default_value_t = View::Full)]
@@ -563,6 +570,7 @@ fn main() -> Result<()> {
             since,
             api,
             max_tokens: _,
+            strict,
             format,
             view: _,
         } if api => {
@@ -581,16 +589,22 @@ fn main() -> Result<()> {
             let base = extract::build_graph(&wt.join(&rel));
             git::remove_worktree(&repo, &wt);
             let base = base?;
-            print!(
-                "{}",
-                query::api_report(&base, &current, label, matches!(format, Format::Json))
-            );
+            let (report, breaking) =
+                query::api_report(&base, &current, label, matches!(format, Format::Json));
+            print!("{report}");
+            if strict && breaking > 0 {
+                eprintln!(
+                    "ctx: {breaking} breaking public-API change(s) vs {label} — failing (--strict)"
+                );
+                std::process::exit(1);
+            }
         }
         Cmd::Changed {
             path,
             since,
             api: _,
             max_tokens,
+            strict: _,
             format,
             view,
         } => {
@@ -635,9 +649,10 @@ fn main() -> Result<()> {
             path,
             api,
             max_tokens,
+            strict,
             format,
             view,
-        } => run_diff(&range, &path, api, format, view, max_tokens)?,
+        } => run_diff(&range, &path, api, format, view, max_tokens, strict)?,
         Cmd::Parity {
             source,
             target,
@@ -741,6 +756,7 @@ fn run_diff(
     format: Format,
     view: View,
     max_tokens: Option<usize>,
+    strict: bool,
 ) -> Result<()> {
     let (a, b) = parse_range(range);
     let repo = git::repo_root(path)?;
@@ -768,7 +784,12 @@ fn run_diff(
         let out = query::api_report(&base, &head, &a, json);
         cleanup(&repo, wt_a);
         cleanup(&repo, wt_b);
-        print!("{out}");
+        let (report, breaking) = out;
+        print!("{report}");
+        if strict && breaking > 0 {
+            eprintln!("ctx: {breaking} breaking public-API change(s) in {a} — failing (--strict)");
+            std::process::exit(1);
+        }
         return Ok(());
     }
 

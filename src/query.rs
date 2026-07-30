@@ -1124,7 +1124,17 @@ fn fmt_callers(names: &[String]) -> String {
 /// signature-changed public items are (potentially) breaking; each is listed
 /// with the callers it affects (removed → who used it in `base`; changed →
 /// who uses it in `current`).
-pub fn api_report(base: &Graph, current: &Graph, label: &str, json_out: bool) -> String {
+/// Public-API diff. Returns the rendered report and the number of **breaking**
+/// changes (removed plus signature-changed items); additions are not breaking.
+///
+/// The count is returned rather than inferred from the text so a CI gate can fail
+/// on it without parsing prose.
+pub fn api_report(
+    base: &Graph,
+    current: &Graph,
+    label: &str,
+    json_out: bool,
+) -> (String, usize) {
     let bs = public_surface(base);
     let cs = public_surface(current);
 
@@ -1140,18 +1150,19 @@ pub fn api_report(base: &Graph, current: &Graph, label: &str, json_out: bool) ->
     let added: Vec<(&String, &Surface)> = cs.iter().filter(|(q, _)| !bs.contains_key(*q)).collect();
 
     if json_out {
-        return serde_json::to_string_pretty(&json!({
+        let breaking = removed.len() + changed.len();
+        return (serde_json::to_string_pretty(&json!({
             "since": label,
             "removed": removed.iter().map(|(q, b)| json!({"name": q, "kind": b.kind, "signature": b.signature, "callers": caller_names(base, &b.match_q)})).collect::<Vec<_>>(),
             "changed": changed.iter().map(|(q, b, c)| json!({"name": q, "kind": c.kind, "was": b.signature, "now": c.signature, "callers": caller_names(current, &c.match_q)})).collect::<Vec<_>>(),
             "added": added.iter().map(|(q, c)| json!({"name": q, "kind": c.kind, "signature": c.signature})).collect::<Vec<_>>(),
         }))
         .unwrap_or_default()
-            + "\n";
+            + "\n", breaking);
     }
 
     if removed.is_empty() && changed.is_empty() && added.is_empty() {
-        return format!("no public API changes vs {label}\n");
+        return (format!("no public API changes vs {label}\n"), 0);
     }
 
     let mut out = format!("# API changes vs {label}\n");
@@ -1185,7 +1196,7 @@ pub fn api_report(base: &Graph, current: &Graph, label: &str, json_out: bool) ->
             out.push_str(&format!("- {q}  [{}]  {}\n", c.kind, c.signature));
         }
     }
-    out
+    (out, removed.len() + changed.len())
 }
 
 #[cfg(test)]
@@ -1665,11 +1676,14 @@ mod tests {
             "src/api.rs",
             "pub fn stable() {}\npub fn morph(a: i32, b: i32) {}\npub fn fresh() {}\n",
         )]);
-        let out = api_report(&base.0, &cur.0, "HEAD", false);
+        let (out, breaking) = api_report(&base.0, &cur.0, "HEAD", false);
         assert!(out.contains("## Removed") && out.contains("api::gone"), "{out}");
         assert!(out.contains("## Changed") && out.contains("api::morph"), "{out}");
         assert!(out.contains("## Added") && out.contains("api::fresh"), "{out}");
         assert!(!out.contains("stable"), "unchanged item must not appear:\n{out}");
+        // One removal + one signature change; the addition is NOT breaking, and a
+        // CI gate keys on this number rather than parsing the prose above.
+        assert_eq!(breaking, 2, "breaking count drives --strict");
         let _ = fs::remove_dir_all(base.1);
         let _ = fs::remove_dir_all(cur.1);
     }
