@@ -202,7 +202,10 @@ fn transform_item(mut it: Item, view: View, lang: Lang) -> Option<Item> {
 
 pub fn is_public(it: &Item, lang: Lang) -> bool {
     match lang {
-        Lang::Rust => it.signature.starts_with("pub"),
+        // `pub(crate)` / `pub(super)` / `pub(in path)` are restricted, not public:
+        // treating them as API surface both pads `--view interface` and makes
+        // `changed --api` cry breaking-change over crate-internal edits.
+        Lang::Rust => it.signature.starts_with("pub") && !it.signature.starts_with("pub("),
         Lang::Python => match &it.name {
             // Dunders (__init__, __call__) are interface despite the underscore.
             Some(n) => !n.starts_with('_') || (n.starts_with("__") && n.ends_with("__")),
@@ -216,6 +219,10 @@ pub fn is_public(it: &Item, lang: Lang) -> bool {
             s.starts_with("export")
                 || ![
                     "function ",
+                    // `async function foo()` is a top-level declaration too, and
+                    // without it here a non-exported async function reads as API.
+                    "async function ",
+                    "async ",
                     "const ",
                     "class ",
                     "abstract ",

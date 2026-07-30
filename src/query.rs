@@ -208,6 +208,23 @@ fn collect_callers(
     }
 }
 
+/// How many definitions the graph holds for this query.
+///
+/// This is the number that decides whether reverse-edge resolution could have
+/// been ambiguous: a method name with several definitions cannot be attributed
+/// from an opaque receiver, so those call sites are dropped rather than guessed.
+/// `callers` reports it, because "1 caller" is a very different claim when the
+/// graph knows the name three times over.
+fn definition_count(g: &Graph, q: &[&str]) -> usize {
+    let Some(&last) = q.last() else { return 0 };
+    let parent = if q.len() >= 2 { Some(q[q.len() - 2]) } else { None };
+    let mut hits = Vec::new();
+    for m in &g.modules {
+        collect_defs(&m.items, m, None, last, parent, &mut hits);
+    }
+    hits.len()
+}
+
 pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
     let q = segments(query);
     if q.is_empty() {
@@ -219,6 +236,12 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
         collect_callers(&m.items, m, &mut path, &q, &mut found);
     }
     found.sort_by(|a, b| (&a.qualname, a.line).cmp(&(&b.qualname, b.line)));
+
+    // Ambiguity is the dominant source of missing reverse edges, and it is
+    // knowable from the same graph, so never let the count stand alone.
+    let defs = definition_count(g, &q);
+    let ambiguous = defs > 1;
+    let bare_name = q.last().copied().unwrap_or(query);
 
     if json_out {
         let arr: Vec<_> = found
@@ -232,16 +255,36 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
                 })
             })
             .collect();
-        return serde_json::to_string_pretty(&json!({ "query": query, "callers": arr }))
-            .unwrap_or_default()
+        return serde_json::to_string_pretty(&json!({
+            "query": query,
+            "callers": arr,
+            "definitions": defs,
+            // With several definitions the reverse edges are a lower bound, not
+            // an answer. Machine consumers need this as a field, not prose.
+            "complete": !ambiguous,
+        }))
+        .unwrap_or_default()
             + "\n";
     }
+
+    // Spelled out the same way whether or not anything was found: the risk of
+    // acting on an incomplete blast radius does not depend on the count.
+    let recall_note = if ambiguous {
+        format!(
+            "\nINCOMPLETE: '{bare_name}' has {defs} definitions in this graph. Calls through a \
+             receiver that cannot be pinned to one of them are dropped, never guessed, so the \
+             list above is a LOWER BOUND.\n\
+             Before changing this signature, confirm with:  rg -n '\\b{bare_name}\\s*\\('\n"
+        )
+    } else {
+        String::new()
+    };
 
     if found.is_empty() {
         return format!(
             "no callers found for '{query}'\n\
              (only resolved call edges are indexed; ambiguous calls and \
-             ubiquitous std-named methods are intentionally dropped)\n"
+             ubiquitous std-named methods are intentionally dropped)\n{recall_note}"
         );
     }
     let mut out = format!("{} caller(s) of '{}':\n\n", found.len(), query);
@@ -268,6 +311,7 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
     if found.iter().any(|c| c.edges.iter().any(|e| e.heuristic)) {
         out.push_str("\n(~ = heuristic edge: attributed by receiver inference, not import/path)\n");
     }
+    out.push_str(&recall_note);
     out
 }
 
@@ -542,37 +586,6 @@ fn append_capped(out: &mut String, lines: impl Iterator<Item = String>, cap: usi
     }
     if shown < total {
         out.push_str(&format!("- … (+{} more)\n", total - shown));
-    }
-}
-
-/// A module plus its immediate upstream/downstream neighbors, rendered.
-/// Shared by the CLI `subtree` command and the MCP server.
-pub fn subtree(g: &Graph, module: &str, json_out: bool) -> String {
-    let targets: Vec<&Module> = g
-        .modules
-        .iter()
-        .filter(|m| {
-            m.name == module
-                || m.name.ends_with(&format!("::{module}"))
-                || m.name.ends_with(&format!(".{module}"))
-        })
-        .collect();
-    if targets.is_empty() {
-        return format!("no module matching '{module}'\n");
-    }
-    let target_names: BTreeSet<&str> = targets.iter().map(|m| m.name.as_str()).collect();
-    let (upstream, downstream) = neighbors(g, &target_names);
-    if json_out {
-        serde_json::to_string_pretty(&json!({
-            "query": module,
-            "target": targets,
-            "upstream": upstream,
-            "downstream": downstream,
-        }))
-        .unwrap_or_default()
-            + "\n"
-    } else {
-        crate::render::subtree_md(module, &targets, &upstream, &downstream)
     }
 }
 
@@ -1228,6 +1241,43 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(stats.omitted, 0);
         assert_eq!(g.modules.len(), before);
+    }
+
+    #[test]
+    fn callers_discloses_ambiguity_and_stays_quiet_otherwise() {
+        // Two `run` methods: an opaque receiver cannot be pinned to either, so
+        // edges are dropped and the count is a lower bound the caller must know
+        // about. `solo` has one definition, so no warning belongs on it.
+        let (g, dir) = graph(&[(
+            "a.py",
+            "class A:\n    def run(self):\n        pass\n\n\nclass B:\n    def run(self):\n        pass\n\n\ndef solo():\n    pass\n",
+        )]);
+        let ambiguous = callers(&g, "run", false);
+        let unique = callers(&g, "solo", false);
+        let json = callers(&g, "run", true);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(ambiguous.contains("INCOMPLETE"), "ambiguity must be disclosed");
+        assert!(ambiguous.contains("2 definitions"));
+        assert!(ambiguous.contains("rg -n"), "must offer the confirming command");
+        assert!(
+            !unique.contains("INCOMPLETE"),
+            "a uniquely-named symbol must not raise a false alarm"
+        );
+        assert!(json.contains("\"complete\": false"), "machine callers need the flag");
+    }
+
+    #[test]
+    fn colliding_module_names_are_made_unique() {
+        // `foo.py` and `foo.ts` both want to be module `foo`; indexing by name
+        // used to make one unreachable, silently dropping its reverse edges.
+        let (g, dir) = graph(&[
+            ("foo.py", "def build_model():\n    pass\n"),
+            ("foo.ts", "export function buildModel() {}\n"),
+        ]);
+        let names: Vec<&str> = g.modules.iter().map(|m| m.name.as_str()).collect();
+        let unique: BTreeSet<&&str> = names.iter().collect();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(names.len(), unique.len(), "module names must be unique: {names:?}");
     }
 
     #[test]

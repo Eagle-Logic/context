@@ -26,6 +26,38 @@ use view::View;
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+    /// Skip paths matching a gitignore-style glob (repeatable), e.g.
+    /// --exclude 'docs/archive/**' --exclude 'vendor/**'
+    #[arg(long, global = true)]
+    exclude: Vec<String>,
+    /// Restrict the scan to these languages (repeatable). `code` means every
+    /// supported language except Markdown — useful when prose dominates a map.
+    #[arg(long, value_enum, global = true)]
+    lang: Vec<LangArg>,
+}
+
+/// Language selector for `--lang`.
+#[derive(Clone, Copy, ValueEnum)]
+enum LangArg {
+    Rust,
+    Python,
+    Ts,
+    Md,
+    /// Every supported language except Markdown.
+    Code,
+}
+
+impl LangArg {
+    fn expand(self) -> Vec<model::Lang> {
+        use model::Lang;
+        match self {
+            LangArg::Rust => vec![Lang::Rust],
+            LangArg::Python => vec![Lang::Python],
+            LangArg::Ts => vec![Lang::TypeScript],
+            LangArg::Md => vec![Lang::Markdown],
+            LangArg::Code => vec![Lang::Rust, Lang::Python, Lang::TypeScript],
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -75,6 +107,10 @@ enum Cmd {
         /// Detail level: skeleton, interface, or full
         #[arg(long, value_enum, default_value_t = View::Full)]
         view: View,
+        /// Fit the output to a token budget: reduces detail, then drops the
+        /// least-central neighbors. The target module is always kept.
+        #[arg(long)]
+        max_tokens: Option<usize>,
     },
     /// Top-level module list with dependency edges (the global high-level map)
     Modules {
@@ -207,7 +243,10 @@ implementation bodies.
 - `ctx def <name>` — where a symbol is defined: module, kind, line, and signature (jump-to-def
   without knowing the module; accepts bare `Foo` or qualified `Type::method`)
 - `ctx callers <name>` — every function that calls the given function/method (resolved reverse
-  call edges — the blast radius before you change a signature; more precise than grep)
+  call edges — the blast radius before changing a signature). Reads a name with more than one
+  definition as ambiguous and says so: it prints `INCOMPLETE`, the definition count, and the
+  `rg` command to confirm with. Treat an unflagged result as complete and a flagged one as a
+  lower bound
 - `ctx context <name>` — everything needed to edit a symbol in one shot: its definition, the
   types in its signature, what it calls, and what calls it (token-budgeted via `--max-tokens`)
 - `ctx changed [--since <ref>]` — impact map of your diff: the changed modules plus their
@@ -224,7 +263,11 @@ implementation bodies.
   first in an unfamiliar codebase; add `--churn` to weight by how often they change)
 - `ctx doctor` — coverage report: what fraction of the call graph resolved and which modules/
   edges to distrust (run once to calibrate how much to lean on ctx for this repo)
-- add `--format json` to any of the above for machine-readable output
+- `--exclude '<glob>'` / `--lang code` (global, repeatable) — skip vendored or archived trees, or
+  drop prose from a code map. On a large repo `--lang code` cut the skeleton view from ~126k to
+  ~27k tokens
+- add `--format json` to `map`, `subtree`, `def`, `callers`, `context`, `core` and `doctor` for
+  machine-readable output (`modules` is text-only)
 
 Protocol: to orient, run `ctx core` (cheap at any repo size) — or
 `ctx map --view skeleton --max-tokens 10000` for a topology guaranteed to fit 10k tokens. Never
@@ -238,6 +281,11 @@ surgical reads.
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Scan scope is fixed by argv, so install it before any graph is built.
+    extract::set_filter(extract::Filter {
+        exclude: cli.exclude.clone(),
+        langs: cli.lang.iter().flat_map(|l| l.expand()).collect(),
+    });
     match cli.cmd {
         Cmd::Map {
             path,
@@ -312,46 +360,14 @@ fn main() -> Result<()> {
             path,
             format,
             view,
+            max_tokens,
         } => {
-            let mut g = extract::build_graph(&path)?;
-            view::apply(&mut g, view);
-            let targets: Vec<&Module> = g
-                .modules
-                .iter()
-                .filter(|m| {
-                    m.name == module
-                        || m.name.ends_with(&format!("::{module}"))
-                        || m.name.ends_with(&format!(".{module}"))
-                })
-                .collect();
-            if targets.is_empty() {
-                let names: Vec<&str> = g.modules.iter().map(|m| m.name.as_str()).collect();
-                bail!(
-                    "no module matching '{}'. Available modules:\n  {}",
-                    module,
-                    names.join("\n  ")
-                );
+            let g = extract::build_graph(&path)?;
+            let text = subtree_text(&g, &module, view, format, max_tokens)?;
+            if let Some(budget) = max_tokens {
+                eprintln!("budget {budget} tok → subtree (~{} tok)", text.len() / 4);
             }
-
-            let target_names: BTreeSet<&str> =
-                targets.iter().map(|m| m.name.as_str()).collect();
-            let (upstream, downstream) = query::neighbors(&g, &target_names);
-
-            match format {
-                Format::Md => print!(
-                    "{}",
-                    render::subtree_md(&module, &targets, &upstream, &downstream)
-                ),
-                Format::Json => {
-                    let json = serde_json::json!({
-                        "query": module,
-                        "target": targets,
-                        "upstream": upstream,
-                        "downstream": downstream,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&json)?);
-                }
-            }
+            print!("{text}");
         }
         Cmd::Modules { path } => {
             let g = extract::build_graph(&path)?;
@@ -692,6 +708,178 @@ fn cleanup(repo: &std::path::Path, wt: Option<PathBuf>) {
     if let Some(wt) = wt {
         git::remove_worktree(repo, &wt);
     }
+}
+
+/// Render a subtree, optionally fitted to a token budget.
+///
+/// Shared by the CLI and the MCP server so both honor the same budget. Fitting
+/// reduces detail first (full → interface → skeleton); if that is not enough it
+/// drops the least-central *neighbors*, never the target — the target is the
+/// thing you asked about, so it is the one module that must survive.
+fn subtree_text(
+    g: &Graph,
+    module: &str,
+    view: View,
+    format: Format,
+    budget: Option<usize>,
+) -> Result<String> {
+    let matches_query = |name: &str| {
+        name == module
+            || name.ends_with(&format!("::{module}"))
+            || name.ends_with(&format!(".{module}"))
+    };
+    if !g.modules.iter().any(|m| matches_query(&m.name)) {
+        bail!("{}", not_found_message(g, module));
+    }
+    // Centrality of the whole graph, so neighbor ranking does not shift with the
+    // view or the cap.
+    let rank_of: std::collections::HashMap<&str, usize> = query::centrality_order(g)
+        .into_iter()
+        .enumerate()
+        .map(|(pos, i)| (g.modules[i].name.as_str(), pos))
+        .collect();
+
+    let render_at = |v: View, neighbor_cap: Option<usize>| -> String {
+        let mut gg = g.clone();
+        view::apply(&mut gg, v);
+        let targets: Vec<&Module> = gg.modules.iter().filter(|m| matches_query(&m.name)).collect();
+        let target_names: BTreeSet<&str> = targets.iter().map(|m| m.name.as_str()).collect();
+        let (mut upstream, mut downstream) = query::neighbors(&gg, &target_names);
+        let mut dropped = 0usize;
+        if let Some(cap) = neighbor_cap {
+            let by_rank = |set: &mut Vec<&Module>| {
+                set.sort_by_key(|m| rank_of.get(m.name.as_str()).copied().unwrap_or(usize::MAX));
+            };
+            by_rank(&mut upstream);
+            by_rank(&mut downstream);
+            // Split the cap between the two sides so neither starves the other.
+            let half = cap.div_ceil(2);
+            let up_keep = half.min(upstream.len());
+            let down_keep = (cap - up_keep).min(downstream.len());
+            dropped = (upstream.len() - up_keep) + (downstream.len() - down_keep);
+            upstream.truncate(up_keep);
+            downstream.truncate(down_keep);
+            // Restore name order for a stable, readable rendering.
+            upstream.sort_by(|a, b| a.name.cmp(&b.name));
+            downstream.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        match format {
+            Format::Md => {
+                let mut s = render::subtree_md(module, &targets, &upstream, &downstream);
+                if dropped > 0 {
+                    s.push_str(&format!(
+                        "\n---\n{dropped} less-central neighbor(s) omitted to fit the token \
+                         budget. Ask for one by name with `ctx subtree <module>`.\n"
+                    ));
+                }
+                s
+            }
+            Format::Json => {
+                let mut v = serde_json::json!({
+                    "query": module,
+                    "target": targets,
+                    "upstream": upstream,
+                    "downstream": downstream,
+                });
+                if dropped > 0 {
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("neighbors_omitted".into(), serde_json::json!(dropped));
+                    }
+                }
+                serde_json::to_string_pretty(&v).unwrap_or_default() + "\n"
+            }
+        }
+    };
+
+    let Some(budget) = budget else {
+        return Ok(render_at(view, None));
+    };
+
+    let ladder = [View::Full, View::Interface, View::Skeleton];
+    let start = ladder.iter().position(|&v| v == view).unwrap_or(0);
+    for &v in &ladder[start..] {
+        let text = render_at(v, None);
+        if text.len() / 4 <= budget {
+            return Ok(text);
+        }
+    }
+    // Detail exhausted: shed neighbors, largest fitting set wins.
+    let max_neighbors = {
+        let names: BTreeSet<&str> = g
+            .modules
+            .iter()
+            .filter(|m| matches_query(&m.name))
+            .map(|m| m.name.as_str())
+            .collect();
+        let (u, d) = query::neighbors(g, &names);
+        u.len() + d.len()
+    };
+    let (mut lo, mut hi) = (0usize, max_neighbors);
+    let mut best = render_at(View::Skeleton, Some(0));
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let text = render_at(View::Skeleton, Some(mid));
+        if text.len() / 4 <= budget {
+            best = text;
+            lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok(best)
+}
+
+/// A module-not-found error with near misses instead of the whole index.
+///
+/// Dumping every module name cost 24 KB on a 720-module repo — a typo should not
+/// spend thousands of tokens of an agent's context. Candidates are ranked by
+/// substring containment, then by shared prefix length with the query.
+fn not_found_message(g: &Graph, query: &str) -> String {
+    const MAX_SUGGESTIONS: usize = 12;
+    let q = query.to_lowercase();
+    let shared_prefix = |name: &str| -> usize {
+        name.to_lowercase()
+            .chars()
+            .zip(q.chars())
+            .take_while(|(a, b)| a == b)
+            .count()
+    };
+    let mut ranked: Vec<(&str, bool, usize)> = g
+        .modules
+        .iter()
+        .map(|m| {
+            let lower = m.name.to_lowercase();
+            let last = lower.rsplit(['.', ':']).next().unwrap_or(&lower).to_string();
+            (
+                m.name.as_str(),
+                lower.contains(&q) || last.contains(&q),
+                shared_prefix(&m.name),
+            )
+        })
+        .collect();
+    // Contains-match first, then longest shared prefix, then name for stability.
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(b.0)));
+    let suggestions: Vec<&str> = ranked
+        .iter()
+        .filter(|(_, contains, prefix)| *contains || *prefix > 0)
+        .take(MAX_SUGGESTIONS)
+        .map(|(n, _, _)| *n)
+        .collect();
+
+    let total = g.modules.len();
+    if suggestions.is_empty() {
+        return format!(
+            "no module matching '{query}' among {total} modules.\n\
+             Run `ctx modules` for the full list, or `ctx core` for the ones that matter most."
+        );
+    }
+    format!(
+        "no module matching '{query}' among {total} modules. Closest:\n  {}\n\
+         Run `ctx modules` for the full list, or `ctx core` for the ones that matter most.",
+        suggestions.join("\n  ")
+    )
 }
 
 /// Most a budget-pruned map will spend on prose (Markdown) modules, as a share

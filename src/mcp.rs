@@ -31,9 +31,19 @@ pub fn run() -> Result<()> {
         let id = req.get("id").cloned();
         let method = req.get("method").and_then(Value::as_str).unwrap_or("");
         let response = handle_method(method, &req);
-        // Requests carry an id and get a reply; notifications get nothing.
-        if let (Some(id), Some(result)) = (id, response) {
-            let msg = json!({"jsonrpc": "2.0", "id": id, "result": result});
+        // A request carries an id and MUST get a reply; a notification gets
+        // nothing. An unhandled method still needs an error object — staying
+        // silent leaves clients that probe `resources/list` or `prompts/list`
+        // blocking on an id that never arrives.
+        if let Some(id) = id {
+            let msg = match response {
+                Some(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                None => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32601, "message": format!("Method not found: {method}")},
+                }),
+            };
             writeln!(out, "{}", serde_json::to_string(&msg)?)?;
             out.flush()?;
         }
@@ -67,21 +77,36 @@ fn path_prop() -> Value {
     json!({ "type": "string", "description": "Path to the repo (default \".\")" })
 }
 
+fn budget_prop(desc: &str) -> Value {
+    json!({ "type": "integer", "description": desc })
+}
+
 fn tools() -> Vec<Value> {
     let name_prop =
         json!({ "type": "string", "description": "Symbol name, bare or qualified (Type::method)" });
     vec![
         tool(
             "map",
-            "Deterministic topology map of the codebase (modules, deps, signatures, call edges).",
-            json!({ "path": path_prop(), "view": {"type": "string", "enum": ["skeleton", "interface", "full"], "description": "Detail level (default skeleton)"} }),
+            "Deterministic topology map of the codebase (modules, deps, signatures, call edges). \
+             Output scales with repo size and can exceed 100k tokens unbudgeted — pass max_tokens \
+             to get a guaranteed-size map (it reduces detail, then keeps the most central modules).",
+            json!({
+                "path": path_prop(),
+                "view": {"type": "string", "enum": ["skeleton", "interface", "full"], "description": "Detail level (default skeleton)"},
+                "max_tokens": budget_prop("Hard cap on output size. Strongly recommended: without it a large repo returns a very large map."),
+            }),
             &[],
         ),
         tool("modules", "One line per module with dependency edges.", json!({ "path": path_prop() }), &[]),
         tool(
             "subtree",
             "A module plus its immediate upstream dependencies and downstream dependents.",
-            json!({ "path": path_prop(), "module": {"type": "string", "description": "Module name or suffix"} }),
+            json!({
+                "path": path_prop(),
+                "module": {"type": "string", "description": "Module name or suffix"},
+                "view": {"type": "string", "enum": ["skeleton", "interface", "full"], "description": "Detail level (default full)"},
+                "max_tokens": budget_prop("Hard cap on output size. Reduces detail, then drops the least-central neighbors; the target module is always kept."),
+            }),
             &["module"],
         ),
         tool(
@@ -140,20 +165,37 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
     let sarg = |k: &str| args.get(k).and_then(Value::as_str);
     let uarg = |k: &str, d: u64| args.get(k).and_then(Value::as_u64).unwrap_or(d) as usize;
 
+    let view_arg = |d: View| match sarg("view") {
+        Some("skeleton") => View::Skeleton,
+        Some("interface") => View::Interface,
+        Some("full") => View::Full,
+        _ => d,
+    };
+    // Only honor a budget the caller actually set — absent means "exact view".
+    let budget = args.get("max_tokens").and_then(Value::as_u64).map(|v| v as usize);
+
     match name {
         "map" => {
-            let mut g = g;
-            let v = match sarg("view") {
-                Some("interface") => View::Interface,
-                Some("full") => View::Full,
-                _ => View::Skeleton,
-            };
-            view::apply(&mut g, v);
-            (render::markdown(&g), false)
+            // Defaults to skeleton, not the CLI's `full`: an unbudgeted full map
+            // is ~258k tokens on a large repo, and an MCP result lands straight
+            // in the caller's context with no chance to pipe it anywhere.
+            let v = view_arg(View::Skeleton);
+            match budget {
+                Some(b) => (crate::render_budgeted(&g, v, crate::Format::Md, b).text, false),
+                None => {
+                    let mut g = g;
+                    view::apply(&mut g, v);
+                    (render::markdown(&g), false)
+                }
+            }
         }
         "modules" => (render::module_list(&g), false),
         "subtree" => match sarg("module") {
-            Some(m) => (query::subtree(&g, m, false), false),
+            // Same code path as the CLI, so the two cannot drift again.
+            Some(m) => match crate::subtree_text(&g, m, view_arg(View::Full), crate::Format::Md, budget) {
+                Ok(t) => (t, false),
+                Err(e) => (format!("{e}"), true),
+            },
             None => ("missing required argument 'module'".into(), true),
         },
         "def" => match sarg("name") {

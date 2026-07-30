@@ -25,13 +25,70 @@ const SKIP_DIRS: &[&str] = &[
 
 const CHASE_DEPTH: usize = 8;
 
+/// What to scan. Empty means "everything ctx supports".
+///
+/// Vendored trees, archived docs and dead code are the bulk of a large repo's
+/// map, and `.gitignore` will not exclude them because they are legitimately
+/// tracked. Without a lever the only options were "whole repo" or nothing.
+#[derive(Default, Clone)]
+pub struct Filter {
+    /// Gitignore-style globs to skip (e.g. `docs/archive/**`).
+    pub exclude: Vec<String>,
+    /// Languages to include; empty means all supported.
+    pub langs: Vec<Lang>,
+}
+
+/// Set once from the CLI before any graph is built, then read-only.
+///
+/// A process-wide filter rather than a parameter on 17 call sites: `ctx` is a
+/// one-shot CLI where the scan scope is fixed by argv at startup, so threading it
+/// through every command (and the MCP dispatcher, and parity) would be churn with
+/// no added expressiveness.
+static FILTER: std::sync::OnceLock<Filter> = std::sync::OnceLock::new();
+
+pub fn set_filter(f: Filter) {
+    let _ = FILTER.set(f);
+}
+
+fn filter() -> &'static Filter {
+    FILTER.get_or_init(Filter::default)
+}
+
+/// Build the walker for `root`, applying any `--exclude` globs.
+fn walker(root: &Path) -> WalkBuilder {
+    let mut wb = WalkBuilder::new(root);
+    let excludes = &filter().exclude;
+    if !excludes.is_empty() {
+        let mut ob = ignore::overrides::OverrideBuilder::new(root);
+        for pat in excludes {
+            // Only negations, so everything not matched still passes through.
+            if let Err(e) = ob.add(&format!("!{pat}")) {
+                eprintln!("ctx: ignoring bad --exclude glob '{pat}': {e}");
+            }
+        }
+        match ob.build() {
+            Ok(ov) => {
+                wb.overrides(ov);
+            }
+            Err(e) => eprintln!("ctx: --exclude globs unusable, scanning everything: {e}"),
+        }
+    }
+    wb
+}
+
+/// Whether this language is in scope for the current filter.
+fn lang_selected(lang: Lang) -> bool {
+    let langs = &filter().langs;
+    langs.is_empty() || langs.contains(&lang)
+}
+
 pub fn build_graph(root: &Path) -> Result<Graph> {
     let root = root
         .canonicalize()
         .with_context(|| format!("cannot resolve path {}", root.display()))?;
 
     let mut files: Vec<PathBuf> = Vec::new();
-    for entry in WalkBuilder::new(&root).build() {
+    for entry in walker(&root).build() {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
@@ -47,9 +104,14 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
             continue;
         }
         let take = match path.extension().and_then(|e| e.to_str()) {
-            Some("rs") | Some("py") | Some("tsx") | Some("md") | Some("markdown") => true,
+            Some("rs") => lang_selected(Lang::Rust),
+            Some("py") => lang_selected(Lang::Python),
+            Some("tsx") => lang_selected(Lang::TypeScript),
+            Some("md") | Some("markdown") => lang_selected(Lang::Markdown),
             // Skip `.d.ts` — ambient type declarations carry no topology.
-            Some("ts") => !path.to_str().is_some_and(|s| s.ends_with(".d.ts")),
+            Some("ts") => {
+                lang_selected(Lang::TypeScript) && !path.to_str().is_some_and(|s| s.ends_with(".d.ts"))
+            }
             _ => false,
         };
         if take {
@@ -122,6 +184,7 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
         });
     }
 
+    disambiguate_module_names(&mut modules);
     resolve_deps(&mut modules, &root);
     modules.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -132,18 +195,83 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
     })
 }
 
-/// Source-language extensions `ctx` does not (yet) model — used by the
-/// coverage report to name its blind spots honestly.
-const UNSUPPORTED_SOURCE_EXTS: &[&str] = &[
-    "js", "jsx", "mjs", "cjs", "go", "java", "kt", "kts", "rb", "c", "cc", "cpp", "cxx", "h",
-    "hpp", "cs", "swift", "php", "scala", "clj", "ex", "exs", "lua", "vue", "svelte", "sql",
+/// Give every module a unique name, renaming the losers of a collision.
+///
+/// Module names come from paths, so distinct files can land on the same name:
+/// `src/lib.rs` and `src/main.rs` are both `crate`; `native/README.md` and
+/// `src/native/mod.rs` are both `native`. Resolution indexes modules by name, so
+/// a duplicate used to make one of them unreachable — its reverse call edges
+/// silently vanished, which is the worst failure this tool has, because
+/// `ctx callers` returning nothing reads as "safe to change".
+///
+/// Code keeps the bare name and prose is the one renamed — otherwise a
+/// `native/README.md` can take the name of the `src/native/mod.rs` it documents,
+/// which both misreports the top of `ctx core` and breaks `use crate::native::…`
+/// resolution. Within a tie, the first file in sorted order wins, so the result
+/// is deterministic. Losers get `name@stem`, falling back to `name@stem@N` if
+/// stems collide too. Renames are reported on stderr — a visibly renamed module
+/// is far better than a silently ambiguous graph.
+fn disambiguate_module_names(modules: &mut [Module]) {
+    // Visit code before prose so code claims the bare name; `modules` is already
+    // in sorted-file order, which breaks ties.
+    let mut order: Vec<usize> = (0..modules.len()).collect();
+    order.sort_by_key(|&i| (modules[i].lang == Lang::Markdown, i));
+
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut renames: Vec<(String, String, String)> = Vec::new();
+    for i in order {
+        let name = modules[i].name.clone();
+        let count = seen.entry(name.clone()).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            continue;
+        }
+        let stem = std::path::Path::new(&modules[i].file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("dup")
+            .to_string();
+        let mut candidate = format!("{name}@{stem}");
+        let mut n = 2;
+        while seen.contains_key(&candidate) {
+            candidate = format!("{name}@{stem}@{n}");
+            n += 1;
+        }
+        seen.insert(candidate.clone(), 1);
+        renames.push((name, candidate.clone(), modules[i].file.clone()));
+        modules[i].name = candidate;
+    }
+    for (from, to, file) in &renames {
+        eprintln!("ctx: module name collision — {file} renamed '{from}' -> '{to}'");
+    }
+}
+
+/// Assets, data and lockfiles: absent from a code topology by design, so they
+/// are not blind spots and must not pad the coverage report. Everything NOT
+/// listed here that ctx cannot parse IS reported, so a new language shows up
+/// as a blind spot automatically instead of waiting to be allowlisted.
+const NON_SOURCE_EXTS: &[&str] = &[
+    // images / fonts / media
+    "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "bmp", "pdf", "mp4", "mp3", "wav", "ttf",
+    "otf", "woff", "woff2",
+    // archives / binaries / model weights
+    "zip", "gz", "tgz", "bz2", "xz", "zst", "tar", "bin", "so", "dylib", "dll", "exe", "a", "o",
+    "pyc", "pyd", "whl", "onnx", "pt", "pth", "safetensors", "gguf", "ggml", "npy", "npz", "pkl",
+    // data / config / text
+    "json", "jsonl", "csv", "tsv", "parquet", "db", "sqlite", "lock", "log", "txt", "toml", "yaml",
+    "yml", "ini", "cfg", "env", "gbnf", "gitignore", "gitattributes",
 ];
 
 /// Count unmodeled source files by extension under `root`, honoring the same
 /// directory-skip rules as the graph walk. Returns (ext, count), descending.
 pub fn unsupported_census(root: &Path) -> Vec<(String, usize)> {
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for entry in WalkBuilder::new(root).build().flatten() {
+    // Count hidden-but-supported files too: the walker skips dotted paths by
+    // default, so `.hooks/deploy.py` is real source that silently never enters
+    // the graph. For a report whose entire job is honest disclosure, an
+    // undisclosed omission is the one unacceptable answer.
+    let mut hidden_supported = 0usize;
+    for entry in walker(root).hidden(false).build().flatten() {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
@@ -154,14 +282,43 @@ pub fn unsupported_census(root: &Path) -> Vec<(String, usize)> {
         {
             continue;
         }
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if UNSUPPORTED_SOURCE_EXTS.contains(&ext) {
-                *counts.entry(ext.to_string()).or_default() += 1;
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        let is_hidden = rel
+            .components()
+            .any(|c| c.as_os_str().to_str().is_some_and(|s| s.starts_with('.')));
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        let supported = matches!(ext, "rs" | "py" | "ts" | "tsx" | "md" | "markdown");
+        if supported {
+            if is_hidden {
+                hidden_supported += 1;
             }
+            continue;
         }
+        if is_hidden {
+            // Hidden non-source (lockfiles, CI config) is not a blind spot.
+            continue;
+        }
+        // Report every unparsed extension EXCEPT known non-source, rather than
+        // an allowlist of known source: the old allowlist had no `.ipynb`,
+        // `.sh`, `.pyi`, `.proto` or `.tf`, so a repo full of notebooks
+        // reported "none". Inverting it keeps new languages honest by default;
+        // the denylist only suppresses assets, data and lockfiles, which are
+        // not blind spots in a code topology.
+        if NON_SOURCE_EXTS.contains(&ext) {
+            continue;
+        }
+        *counts.entry(ext.to_string()).or_default() += 1;
     }
     let mut v: Vec<(String, usize)> = counts.into_iter().collect();
     v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    if hidden_supported > 0 {
+        v.push((
+            format!("(hidden paths, {hidden_supported} supported file(s) not scanned)"),
+            hidden_supported,
+        ));
+    }
     v
 }
 

@@ -126,6 +126,29 @@ still whole. Only when a single module alone exceeds the budget does `ctx` emit
 an over-budget map, and it says so on stderr. Without `--max-tokens`, nothing is
 ever pruned.
 
+`callers` reports its own recall. Reverse edges are only emitted for calls that
+resolve, and a method name with several definitions cannot be attributed from an
+opaque receiver — those sites are dropped rather than guessed. So when the queried
+name has more than one definition, `callers` prints `INCOMPLETE`, the definition
+count, and the `rg` command to confirm with (`complete: false` in JSON). An
+unflagged result is complete; a flagged one is a lower bound. This matters because
+`callers` is the pre-signature-change safety check, and "no callers" reads as
+"safe to change".
+
+`--exclude '<glob>'` and `--lang` are global, repeatable flags for scoping the
+scan. Vendored trees, archived docs and dead code are usually tracked, so
+`.gitignore` will not exclude them: `--exclude 'docs/archive/**'`. And because a
+docs tree can dominate a *code* map — 78% of one 720-module repo's skeleton view —
+`--lang code` restricts the scan to Rust/Python/TypeScript, cutting that map from
+~126k to ~27k tokens.
+
+Module names are unique. They derive from paths, so `src/lib.rs` and `src/main.rs`
+both want to be `crate`, and a `native/README.md` collides with the
+`src/native/mod.rs` it documents. Because resolution indexes by name, a collision
+used to make one module unreachable and silently drop its reverse edges. Code now
+keeps the bare name, prose is renamed to `name@stem`, and every rename is reported
+on stderr.
+
 `parity <source> <port>...` answers "is this port a faithful structural copy?"
 across languages. Because the `Item` model is language-neutral, a source
 module and its port are two renderings of one skeleton; parity flattens each
