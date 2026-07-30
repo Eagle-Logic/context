@@ -12,6 +12,10 @@ pub struct Graph {
 #[derive(Serialize, Clone)]
 pub struct Module {
     pub name: String,
+    /// Original path-derived name, kept when `name` is renamed to break a
+    /// collision. Empty means `name` was never renamed.
+    #[serde(skip)]
+    pub resolve_name: String,
     pub file: String,
     pub lang: Lang,
     /// Internal modules this module imports from, with re-export facades
@@ -19,6 +23,16 @@ pub struct Module {
     pub deps: Vec<String>,
     /// External crates / packages referenced (top-level names, deduped).
     pub extern_deps: Vec<String>,
+    /// Subset of `deps` that exists ONLY because of receiver-inferred (`~`)
+    /// call edges. Rendered with a `~` so the "a `~`-free edge is reliable" rule
+    /// holds at module level too, not just per call site.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub heuristic_deps: Vec<String>,
+    /// (import text as written, module it resolved to) for every internal
+    /// import. Resolution discards this mapping, but it is exactly what a
+    /// rename/move plan needs: the literal string to rewrite, per site.
+    #[serde(skip)]
+    pub import_sites: Vec<(String, String)>,
     /// Symbols this module re-exports (Rust `pub use`, Python `__init__`
     /// imports), resolved to their source path where possible.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -170,12 +184,25 @@ pub struct RawCall {
 }
 
 impl Module {
-    pub fn name_segs(&self) -> Vec<String> {
+    /// Path-derived segments used for RESOLUTION, which must survive
+    /// collision renaming.
+    ///
+    /// `name` can be rewritten to keep display names unique (`native` ->
+    /// `native@README`), but import and link resolution does path arithmetic
+    /// against a module's own location — for an index-like module the name *is*
+    /// its directory — so resolving against a renamed name silently loses every
+    /// edge. Lookups therefore key on this, while edges and labels use `name`.
+    pub fn resolve_segs(&self) -> Vec<String> {
+        let base = if self.resolve_name.is_empty() {
+            &self.name
+        } else {
+            &self.resolve_name
+        };
         let sep = match self.lang {
             Lang::Rust => "::",
             Lang::Python | Lang::TypeScript | Lang::Markdown => ".",
         };
-        self.name.split(sep).map(|s| s.to_string()).collect()
+        base.split(sep).map(|s| s.to_string()).collect()
     }
 
     pub fn item_count(&self) -> usize {

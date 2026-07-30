@@ -10,11 +10,16 @@ pub fn markdown(g: &Graph) -> String {
         "Call edges: `→ name` resolved via import/path; `name~` inferred by receiver heuristic.\n",
     );
     out.push_str(&format!(
-        "root: {} | files: {} | modules: {}\n\n",
+        "root: {} | files: {} | modules: {}\n",
         g.root,
         g.file_count,
         g.modules.len()
     ));
+    // A filtered map is a partial map; saying so costs one line.
+    if let Some(f) = crate::extract::filter_note() {
+        out.push_str(&format!("scope: FILTERED ({f}) — modules outside it are absent\n"));
+    }
+    out.push('\n');
     for m in &g.modules {
         module_md(m, &mut out);
     }
@@ -24,7 +29,20 @@ pub fn markdown(g: &Graph) -> String {
 pub fn module_md(m: &Module, out: &mut String) {
     out.push_str(&format!("## {}  ({})\n", m.name, m.file));
     if !m.deps.is_empty() {
-        out.push_str(&format!("deps: {}\n", m.deps.join(", ")));
+        // A dep that exists only via receiver inference is marked, so the
+        // "`~`-free means resolved by import/path" rule holds at module level.
+        let deps: Vec<String> = m
+            .deps
+            .iter()
+            .map(|d| {
+                if m.heuristic_deps.contains(d) {
+                    format!("{d}~")
+                } else {
+                    d.clone()
+                }
+            })
+            .collect();
+        out.push_str(&format!("deps: {}\n", deps.join(", ")));
     }
     if !m.extern_deps.is_empty() {
         out.push_str(&format!("extern: {}\n", m.extern_deps.join(", ")));
@@ -135,7 +153,18 @@ pub fn module_list(g: &Graph) -> String {
         let deps = if m.deps.is_empty() {
             String::new()
         } else {
-            format!("  -> {}", m.deps.join(", "))
+            let ds: Vec<String> = m
+                .deps
+                .iter()
+                .map(|d| {
+                    if m.heuristic_deps.contains(d) {
+                        format!("{d}~")
+                    } else {
+                        d.clone()
+                    }
+                })
+                .collect();
+            format!("  -> {}", ds.join(", "))
         };
         out.push_str(&format!(
             "{}  ({})  [{} items]{}\n",

@@ -53,7 +53,19 @@ pub fn extract(src: &str) -> Result<FileFacts> {
     // the file, so gather them all up front before harvesting link uses.
     let defs = collect_link_defs(src);
 
-    for raw in src.lines() {
+    // YAML frontmatter is metadata, not content. Its closing `---` sits directly
+    // under a non-blank line, which is exactly the shape of a setext H2
+    // underline, so leaving it in fabricates a heading out of the last metadata
+    // key — and that phantom's slug becomes a link-resolution target, which can
+    // mask a genuinely broken link. Frontmatter is near-universal (Docusaurus,
+    // Jekyll, Obsidian, mdBook), so this is the common case.
+    let skip_lines = frontmatter_lines(src);
+
+    for (i, raw) in src.lines().enumerate() {
+        if i < skip_lines {
+            prev_line = None;
+            continue;
+        }
         let line = raw.trim_end();
         let trimmed = line.trim_start();
 
@@ -124,9 +136,15 @@ fn assign_lines(src: &str, flat: &mut [Heading]) {
     let mut in_fence = false;
     let mut fence_marker = "";
     let mut prev: Option<&str> = None;
+    // Must skip exactly what `extract` skipped, or every line number shifts.
+    let skip_lines = frontmatter_lines(src);
     for (n, raw) in src.lines().enumerate() {
         if idx >= flat.len() {
             break;
+        }
+        if n < skip_lines {
+            prev = None;
+            continue;
         }
         let trimmed = raw.trim_start().trim_end();
         if let Some(marker) = fence_open(trimmed) {
@@ -189,6 +207,57 @@ fn atx_heading(line: &str) -> Option<(usize, String)> {
         return None;
     }
     Some((hashes, text.to_string()))
+}
+
+/// Lines occupied by a leading YAML frontmatter block, or 0 if there is none.
+///
+/// Only a `---` on the very first line opens frontmatter. If no closing delimiter
+/// is found the block is treated as absent rather than swallowing the document.
+fn frontmatter_lines(src: &str) -> usize {
+    let mut lines = src.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return 0;
+    }
+    // The block must LOOK like YAML, or a document opening with a thematic
+    // break gets everything up to the next `---` deleted — including real
+    // headings, whose slugs then go unregistered and turn working links into
+    // reported-broken ones. That is worse than the phantom heading this guards
+    // against, so be strict: every line up to the delimiter must be a `key:`
+    // entry, a list item, an indented continuation, a comment, or blank — and
+    // the block may not be empty.
+    let mut body = 0usize;
+    for (i, l) in lines.enumerate() {
+        let t = l.trim();
+        if t == "---" || t == "..." {
+            return if body > 0 { i + 2 } else { 0 };
+        }
+        if t.is_empty() {
+            // A blank line immediately after `---` means a thematic break, not
+            // frontmatter; later blanks inside a real block are tolerated.
+            if body == 0 {
+                return 0;
+            }
+            continue;
+        }
+        if t.starts_with('#') {
+            // A comment is fine; an ATX heading is not YAML.
+            if t.starts_with("# ") || t.starts_with("## ") {
+                return 0;
+            }
+            continue;
+        }
+        let yamlish = t.starts_with('-')
+            || l.starts_with(' ')
+            || l.starts_with('\t')
+            || t.split_once(':').is_some_and(|(k, _)| {
+                !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || "_-.\"'".contains(c))
+            });
+        if !yamlish {
+            return 0;
+        }
+        body += 1;
+    }
+    0
 }
 
 fn setext_heading(line: &str, prev: Option<&str>) -> Option<(usize, String)> {
@@ -437,6 +506,28 @@ See the [design doc][design] and the [guide][] and a [shortcut].
         assert_eq!(
             extract(src).unwrap().items[0].doc.as_deref(),
             Some("Real summary here.")
+        );
+    }
+
+    #[test]
+    fn yaml_frontmatter_does_not_fabricate_a_heading() {
+        let src = "---\ntitle: My Page\ntags: [a, b]\n---\n\n# Real Heading\n\n## Sub\n";
+        let items = extract(src).unwrap().items;
+        let sigs: Vec<&str> = items.iter().map(|i| i.signature.as_str()).collect();
+        assert_eq!(sigs, ["Real Heading"], "frontmatter must not become a heading");
+        assert_eq!(items[0].signature, "Real Heading");
+        // Line numbers must still refer to the original file, not a stripped copy.
+        assert_eq!(items[0].line, 6);
+        assert_eq!(items[0].children[0].line, 8);
+    }
+
+    #[test]
+    fn unterminated_frontmatter_does_not_swallow_the_document() {
+        let src = "---\ntitle: no closing delimiter\n\n# Still A Heading\n";
+        let items = extract(src).unwrap().items;
+        assert!(
+            items.iter().any(|i| i.signature == "Still A Heading"),
+            "an unclosed block must be treated as absent"
         );
     }
 

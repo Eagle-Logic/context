@@ -57,7 +57,8 @@ ctx changed ~/projects/myrepo --since main # vs a ref/branch
 ctx diff main..feature ~/projects/myrepo        # changed modules + who they break
 ctx diff main..feature ~/projects/myrepo --api  # breaking API changes across the range
 
-# Fit a map to a token budget (richest view that fits; never truncates)
+# Fit a map to a token budget (hard cap: reduces detail, then prunes
+# least-central modules; never truncates within a kept module)
 ctx map ~/projects/myrepo --max-tokens 8000
 
 # Cross-language parity: is the Rust port faithful to the Python source?
@@ -111,11 +112,82 @@ throwaway worktree when B is a ref; the working tree when B is omitted, as in
 breaking-change surface diff across the same range. `A...B` is accepted and
 treated like `A..B`.
 
-`map --max-tokens <N>` fits the output to a budget: it emits the richest view
-at or below `--view` whose (~`len/4`) token count fits, and reports the view
-it chose on stderr. It **never truncates** — if even `skeleton` is over
-budget it emits the whole skeleton and says so — so the map an agent receives
-is always structurally complete.
+`map --max-tokens <N>` fits the output to a budget and is a **hard cap**. It
+first reduces detail, emitting the richest view at or below `--view` whose
+(~`len/4`) token count fits, and reports the view it chose on stderr. When even
+`skeleton` is over budget, detail is exhausted and the only remaining lever is
+dropping modules, so the least-central ones are pruned (PageRank, the same
+ranking `core` uses) until the map fits. The output states what was omitted, and
+dependency edges still name pruned modules — that name is what to feed
+`subtree`/`context` next.
+
+Items inside a kept module are never truncated: you get fewer modules, each
+still whole. Only when a single module alone exceeds the budget does `ctx` emit
+an over-budget map, and it says so on stderr. Without `--max-tokens`, nothing is
+ever pruned.
+
+`callers` reports its own recall, and **never claims completeness**. Reverse edges
+exist only for calls that resolved, and resolution drops rather than guesses, so
+the result is a floor. Two loss channels are knowable and are reported in band:
+
+- **Ambiguous name** — more than one definition, so a call through an opaque
+  receiver cannot be pinned to one of them. Prints `INCOMPLETE` with the
+  definition count (`ambiguous_name` in JSON). Computed from the bare name, so
+  qualifying the query cannot silence it.
+- **Suppressed ubiquitous name** — `get`, `open`, `push`, `len` and friends are
+  never indexed, including a project-defined method that merely shares the name.
+  Prints `NOT INDEXED`, because an empty result there carries no information at
+  all (`suppressed_common_name` in JSON).
+
+Both set `lower_bound: true`. The absence of a flag means "no *known* reason to
+distrust this" — not a guarantee: a call made at module level, or through a
+function-local import, can still be missed. Before changing a signature, run the
+`rg` command ctx prints. This matters because `callers` is the
+pre-signature-change safety check, and "no callers" reads as "safe to change".
+
+Heuristic method attribution is **language-scoped**. A unique method name is
+evidence only within one language; across languages it is coincidence, so
+`tok.apply_chat_template(...)` in Python is no longer attributed to a Rust method
+of the same name. Before this guard, 45 of 50 reported callers of that name were
+artifacts, ~18% of module dep edges were impossible Python->Rust edges, and those
+edges distorted `core`'s ranking.
+
+`--exclude '<glob>'` and `--lang` are global, repeatable flags for scoping the
+scan. Vendored trees, archived docs and dead code are usually tracked, so
+`.gitignore` will not exclude them: `--exclude 'docs/archive/**'`. And because a
+docs tree can dominate a *code* map — 78% of one 720-module repo's skeleton view —
+`--lang code` restricts the scan to Rust/Python/TypeScript, cutting that map from
+~126k to ~27k tokens.
+
+Module names are unique. They derive from paths, so `src/lib.rs` and `src/main.rs`
+both want to be `crate`, and a `native/README.md` collides with the
+`src/native/mod.rs` it documents. Because resolution indexes by name, a collision
+used to make one module unreachable and silently drop its reverse edges. Code now
+keeps the bare name, prose is renamed to `name@stem`, and every rename is reported
+on stderr.
+
+`move-plan <from> <to>` is an **oracle, not an actuator**: it emits every site a
+module relocation must touch, and `move-verify` checks the result. ctx never
+writes source files. An agent can already make edits cheaply and precisely; what
+it cannot do is know it found every site or prove nothing was orphaned — so the
+scarce thing is ground truth, not typing, and staying read-only keeps ctx free of
+partial application and undo semantics.
+
+```sh
+ctx move-plan native::gate native::routing::gate   # file move + every import rewrite
+# ... agent applies the edits ...
+ctx move-verify native::gate native::routing::gate # exits non-zero if anything is orphaned
+```
+
+Scope is bounded by what ctx can prove. Moves ride on import and link resolution
+— path arithmetic, deterministic, non-heuristic — which is ctx's strongest signal,
+so the site list is exact for the languages it parses. Dependents reached only by
+receiver inference have no literal string to rewrite and are listed separately as
+*unverified*, never mixed in with real sites. Rust `mod` declarations are not
+imports, so the plan names them as a required manual step rather than omitting
+them silently. Renaming a *method* is deliberately not offered: it would ride on
+receiver inference, which resolves a minority of call sites, and a plan built on
+that would silently miss some.
 
 `parity <source> <port>...` answers "is this port a faithful structural copy?"
 across languages. Because the `Item` model is language-neutral, a source
@@ -136,9 +208,19 @@ renames for free (it strips the underscores, so `__len__`↔`len`, `__eq__`↔`e
 `__hash__`↔`hash`, `__next__`↔`next` already align). For the renames it can't —
 chiefly `__init__`→`new`, plus `__str__`→`fmt`/`to_string`, `__getitem__`→
 `index`, `__iter__`→`into_iter` — pass `--aliases py-rust`. Every alias-based
-match is reported in its own **Aligned via alias** section (`__init__ → new
-(via init → new)`), never silently folded — so the fuzz you opted into is
-always visible.
+match is reported in its own **Aligned via alias** section, never silently folded
+— so the fuzz you opted into is always visible.
+
+**Renamed containers are inferred.** Container is part of every member key, so
+renaming a type invalidates all of its members at once — and renaming the main
+type is the normal case in a port, not an edge case. `parity` pairs containers by
+shared member sets (requiring at least two shared members and a majority of the
+smaller container, so unrelated types are never paired), and container and member
+renames compose: `TriStateRouter.__init__` → `IntentGate.new` needs both, and
+neither alias alone finds it. Every inferred pairing is listed under **Inferred
+container renames** — a wrong pairing must never masquerade as a clean parity
+result — and `--alias Old=New` overrides inference when the port shares too few
+names to infer from.
 
 `def` and `callers` accept a bare name (`to_config`) or a qualified name
 (`SteerOverride::to_config`, `pkg.mod.fn`); a bare name lists every match so
@@ -156,14 +238,17 @@ or any trailing suffix (`inference`).
 `map` and `subtree` take `--view` to scale detail to informational need —
 each level adds a whole category, so token spend buys precision, not noise:
 
-| view | contents | eagle-logits-native (419 modules) |
-|---|---|---|
-| `skeleton` | modules, deps, re-exports, type names | 79 KB (~19k tok) |
-| `interface` | + public signatures, struct fields, enum variants | 301 KB (~75k tok) |
-| `full` (default) | + private items and call edges | 451 KB (~112k tok) |
+| view | contents | 720-module polyglot repo | same, `--lang code` |
+|---|---|---|---|
+| `skeleton` | modules, deps, re-exports, type names | 504 KB (~126k tok) | 105 KB (~26k tok) |
+| `interface` | + public signatures, struct fields, enum variants | 827 KB (~207k tok) | — |
+| `full` (default) | + private items and call edges | 1.03 MB (~258k tok) | — |
 
-On a mid-size repo (70 files) skeleton is ~3k tokens — cheap enough for the
-first turn of every session. Rust visibility is `pub`-based; Python uses the
+Those are the *unbudgeted* sizes, and at that scale none of them belong in a
+context window: pass `--max-tokens` (a hard cap) or `--lang code` (77% of that
+repo's map is Markdown). On a small repo (16 modules) `full` is ~10k tokens, cheap
+enough for the first turn of a session. Sizes scale with the repo, not with the
+view alone — measure before reading. Rust visibility is `pub`-based; Python uses the
 underscore convention (dunders like `__init__` count as public); TypeScript
 uses the `export` keyword (public class methods are interface, `private`/`#`
 members are dropped). Trait methods and trait impls are always interface.
@@ -198,16 +283,38 @@ one at negligible token cost:
 
 ## Claude Code integration
 
-`ctx snippet` prints a ready-made "Codebase Discovery Tools" block — append it
-to the target repo's `CLAUDE.md` (`ctx snippet >> CLAUDE.md`). It teaches the
-agent a lookup protocol: boot with `ctx map --view skeleton`, pull
-`ctx subtree <module>` before touching a module, follow call edges instead of
-grepping, and only read raw source for implementation bodies.
+`ctx snippet` prints the discovery block to paste into a repo's `CLAUDE.md`
+(`ctx snippet >> CLAUDE.md`). It is the one artifact ctx emits that gets *copied*
+somewhere else, so it is the one that can go stale — a generic block telling every
+agent to "load the topology" is fine at 20 modules and catastrophic at 720, and it
+sits wrong in a repo long after the tool has learned better.
 
-To keep a committed `CODEBASE_MAP.md` fresh, regenerate it from a git
-pre-commit hook or a Claude Code hook (`ctx map . -o CODEBASE_MAP.md`) — or
-skip the file entirely and have sessions run `ctx map` at boot; generation is
-~100 ms, so freshness is free.
+So the block **measures the repo it is generated for**: module count, real map
+cost, prose share, and the internal call-resolution rate, with the advice derived
+from those numbers rather than asserted. A repo whose map costs 348k tokens is
+told never to run one unbudgeted and handed the `--lang code` flag; a repo whose
+map is 258 tokens is told to just read it. It is also **delimited** by
+`<!-- ctx:begin -->` / `<!-- ctx:end -->`, so regenerating replaces it in place
+instead of appending a second, contradictory copy.
+
+It stays short — a CLAUDE.md block is resident in every session forever, so
+anything reachable from `ctx <cmd> --help` on demand is left out. What remains is
+what an agent cannot derive: this repo's scale, and where ctx's own output is not
+trustworthy (1.5 KB, down from 4.3 KB).
+
+**Don't commit the map.** A `CODEBASE_MAP.md` is a derived artifact — a pure
+function of the source tree, generated in well under a second — so it belongs in
+`.gitignore`, and sessions should regenerate it on demand
+(`ctx map . -o CODEBASE_MAP.md`). Committing it buys nothing, costs a ~1 MB diff
+whenever sources move, and leaves a stale copy lying around that reads as
+authoritative.
+
+Gitignoring it is also load-bearing for correctness: ctx honors `.gitignore`, so
+an ignored map is excluded from its own parse. A *tracked* map is Markdown in the
+tree, so ctx reads it back as a module of its own headings — each run then
+describes the previous run's output and generation never reaches a fixed point.
+If you must keep one tracked, list it in a `.ignore` file (honored by
+ripgrep-family tools, invisible to git) to restore idempotency.
 
 ### Markdown as a graph
 

@@ -128,7 +128,7 @@ fn structure(node: Node, src: &str) -> Item {
             if fields.is_empty() {
                 head
             } else {
-                clip(&format!("{} {{ {} }}", head, fields.join(", ")))
+                clip_structure(&head, &fields)
             }
         }
         // Tuple structs / unit structs: the whole declaration is the signature.
@@ -150,7 +150,7 @@ fn enumeration(node: Node, src: &str) -> Item {
             if variants.is_empty() {
                 head
             } else {
-                clip(&format!("{} {{ {} }}", head, variants.join(" | ")))
+                clip_structure_sep(&head, &variants, " | ")
             }
         }
         None => collapse(text(node, src)),
@@ -281,6 +281,96 @@ fn def_name(node: Node, src: &str) -> Option<String> {
         .map(|n| text(n, src).to_string())
 }
 
+/// Split on commas that sit outside any brace group.
+fn split_top_level(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut depth = 0usize;
+    let mut cur = String::new();
+    for ch in s.chars() {
+        match ch {
+            '{' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                cur.push(ch);
+            }
+            ',' if depth == 0 => {
+                out.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    out.push(cur.trim().to_string());
+    out.retain(|p| !p.is_empty());
+    out
+}
+
+/// Contents of the brace group `s` opens with, ignoring anything past its match.
+fn brace_inner(s: &str) -> &str {
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '{' => {
+                depth += 1;
+                if depth == 1 {
+                    start = i + 1;
+                }
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &s[start..i];
+                }
+            }
+            _ => {}
+        }
+    }
+    // Unbalanced (truncated source): take whatever is there.
+    &s[start.min(s.len())..]
+}
+
+/// Expand a use tree into full paths, honoring nested brace groups.
+///
+/// Nesting must be handled recursively. Splitting only the first group on commas
+/// turns `use crate::{a::{alpha, gamma}, b::beta}` into `crate::gamma` — both a
+/// lost edge to `a::gamma` and a fabricated one to `crate::gamma`. If a sibling
+/// module happens to be named `gamma`, that invented dependency *resolves*, and
+/// then feeds PageRank, `core`, `subtree`, and pruning order.
+fn expand_use_tree(t: &str) -> Vec<String> {
+    let t = t.trim();
+    let Some(i) = t.find('{') else {
+        return if t.is_empty() {
+            Vec::new()
+        } else {
+            vec![t.to_string()]
+        };
+    };
+    let base = t[..i].trim().trim_end_matches(':').trim().to_string();
+    let inner = brace_inner(&t[i..]).to_string();
+    let mut out = Vec::new();
+    for part in split_top_level(&inner) {
+        // `use a::{self, b}` imports `a` itself.
+        if part == "self" {
+            if !base.is_empty() {
+                out.push(base.clone());
+            }
+            continue;
+        }
+        for p in expand_use_tree(&part) {
+            if base.is_empty() {
+                out.push(p);
+            } else {
+                out.push(format!("{base}::{p}"));
+            }
+        }
+    }
+    out
+}
+
 /// Expand a `use` declaration into (path, bound name) per imported name.
 fn parse_use(t: &str) -> Vec<(String, String)> {
     let t = match t.find("use ") {
@@ -288,27 +378,7 @@ fn parse_use(t: &str) -> Vec<(String, String)> {
         None => t,
     };
     let t = t.trim().trim_end_matches(';').trim();
-
-    let full_paths: Vec<String> = if let Some(brace) = t.find('{') {
-        let base = t[..brace].trim_end_matches(':').trim().to_string();
-        t[brace + 1..]
-            .trim_end_matches('}')
-            .split(',')
-            .map(|p| p.replace(['{', '}'], "").trim().to_string())
-            .filter(|p| !p.is_empty())
-            .map(|p| {
-                if base.is_empty() {
-                    p
-                } else {
-                    format!("{base}::{p}")
-                }
-            })
-            .collect()
-    } else {
-        vec![t.to_string()]
-    };
-
-    full_paths.iter().filter_map(|s| entry(s)).collect()
+    expand_use_tree(t).iter().filter_map(|s| entry(s)).collect()
 }
 
 fn entry(s: &str) -> Option<(String, String)> {
@@ -344,13 +414,55 @@ fn collapse(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Field and variant lists ARE the architectural signal, so they get a much
+/// larger allowance than a plain signature — and when a clip does happen it says
+/// how many members were dropped, rather than a bare `…` that reads as "that's
+/// the whole type".
+const SIG_CLIP: usize = 200;
+const STRUCTURE_CLIP: usize = 600;
+
 fn clip(s: &str) -> String {
-    if s.chars().count() > 200 {
-        let mut out: String = s.chars().take(197).collect();
+    clip_to(s, SIG_CLIP)
+}
+
+fn clip_to(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let mut out: String = s.chars().take(max.saturating_sub(3)).collect();
         out.push('…');
         out
     } else {
         s.to_string()
+    }
+}
+
+/// Clip a `head { a, b, c }` structure, disclosing how many members were cut.
+fn clip_structure(head: &str, members: &[String]) -> String {
+    clip_structure_sep(head, members, ", ")
+}
+
+fn clip_structure_sep<S: AsRef<str>>(head: &str, members: &[S], sep: &str) -> String {
+    let all: Vec<&str> = members.iter().map(|m| m.as_ref()).collect();
+    let full = format!("{} {{ {} }}", head, all.join(sep));
+    if full.chars().count() <= STRUCTURE_CLIP {
+        return full;
+    }
+    // Keep whole members, then say how many are missing.
+    let mut kept: Vec<&str> = Vec::new();
+    let mut len = head.chars().count() + 4;
+    for m in &all {
+        let cost = m.chars().count() + sep.len();
+        if len + cost > STRUCTURE_CLIP && !kept.is_empty() {
+            break;
+        }
+        len += cost;
+        kept.push(m);
+    }
+    let dropped = all.len() - kept.len();
+    let body = kept.join(sep);
+    if dropped == 0 {
+        clip_to(&format!("{head} {{ {body} }}"), STRUCTURE_CLIP)
+    } else {
+        format!("{head} {{ {body}{sep}… +{dropped} more }}")
     }
 }
 
@@ -447,6 +559,34 @@ fn clip_doc(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_brace_use_expands_without_inventing_paths() {
+        let paths: Vec<String> = expand_use_tree("crate::{a::{alpha, gamma}, b::beta}");
+        assert_eq!(paths, ["crate::a::alpha", "crate::a::gamma", "crate::b::beta"]);
+    }
+
+    #[test]
+    fn use_self_in_group_imports_the_module_itself() {
+        let paths: Vec<String> = expand_use_tree("crate::a::{self, alpha}");
+        assert_eq!(paths, ["crate::a", "crate::a::alpha"]);
+    }
+
+    #[test]
+    fn deeply_nested_use_groups_expand() {
+        let paths: Vec<String> = expand_use_tree("x::{y::{z::{deep, deeper}}, flat}");
+        assert_eq!(paths, ["x::y::z::deep", "x::y::z::deeper", "x::flat"]);
+    }
+
+    #[test]
+    fn clipped_structures_disclose_how_many_members_were_dropped() {
+        let members: Vec<String> = (0..80)
+            .map(|i| format!("pub field_with_a_long_name_{i}: SomeLongTypeName<Inner>"))
+            .collect();
+        let s = clip_structure("pub struct Big", &members);
+        assert!(s.contains("more }"), "a clipped member list must say what is missing: {s}");
+        assert!(!s.ends_with('…'), "a bare ellipsis reads as a complete list");
+    }
 
     fn items(src: &str) -> Vec<Item> {
         extract(src).unwrap().items

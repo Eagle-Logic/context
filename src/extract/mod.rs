@@ -25,13 +25,100 @@ const SKIP_DIRS: &[&str] = &[
 
 const CHASE_DEPTH: usize = 8;
 
+/// What to scan. Empty means "everything ctx supports".
+///
+/// Vendored trees, archived docs and dead code are the bulk of a large repo's
+/// map, and `.gitignore` will not exclude them because they are legitimately
+/// tracked. Without a lever the only options were "whole repo" or nothing.
+#[derive(Default, Clone)]
+pub struct Filter {
+    /// Gitignore-style globs to skip (e.g. `docs/archive/**`).
+    pub exclude: Vec<String>,
+    /// Languages to include; empty means all supported.
+    pub langs: Vec<Lang>,
+}
+
+/// Set once from the CLI before any graph is built, then read-only.
+///
+/// A process-wide filter rather than a parameter on 17 call sites: `ctx` is a
+/// one-shot CLI where the scan scope is fixed by argv at startup, so threading it
+/// through every command (and the MCP dispatcher, and parity) would be churn with
+/// no added expressiveness.
+static FILTER: std::sync::OnceLock<Filter> = std::sync::OnceLock::new();
+
+pub fn set_filter(f: Filter) {
+    let _ = FILTER.set(f);
+}
+
+fn filter() -> &'static Filter {
+    FILTER.get_or_init(Filter::default)
+}
+
+/// One-line description of the active scan filter, or None when unfiltered.
+///
+/// A filtered graph is a different graph: deps vanish, modules disappear, and
+/// `doctor` would otherwise report a clean bill of health for a tree it never
+/// looked at. Reports that claim coverage must disclose their scope.
+pub fn filter_note() -> Option<String> {
+    let f = filter();
+    if f.exclude.is_empty() && f.langs.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !f.langs.is_empty() {
+        let names: Vec<&str> = f
+            .langs
+            .iter()
+            .map(|l| match l {
+                Lang::Rust => "rust",
+                Lang::Python => "python",
+                Lang::TypeScript => "ts",
+                Lang::Markdown => "md",
+            })
+            .collect();
+        parts.push(format!("--lang {}", names.join(",")));
+    }
+    for e in &f.exclude {
+        parts.push(format!("--exclude '{e}'"));
+    }
+    Some(parts.join(" "))
+}
+
+/// Build the walker for `root`, applying any `--exclude` globs.
+fn walker(root: &Path) -> WalkBuilder {
+    let mut wb = WalkBuilder::new(root);
+    let excludes = &filter().exclude;
+    if !excludes.is_empty() {
+        let mut ob = ignore::overrides::OverrideBuilder::new(root);
+        for pat in excludes {
+            // Only negations, so everything not matched still passes through.
+            if let Err(e) = ob.add(&format!("!{pat}")) {
+                eprintln!("ctx: ignoring bad --exclude glob '{pat}': {e}");
+            }
+        }
+        match ob.build() {
+            Ok(ov) => {
+                wb.overrides(ov);
+            }
+            Err(e) => eprintln!("ctx: --exclude globs unusable, scanning everything: {e}"),
+        }
+    }
+    wb
+}
+
+/// Whether this language is in scope for the current filter.
+fn lang_selected(lang: Lang) -> bool {
+    let langs = &filter().langs;
+    langs.is_empty() || langs.contains(&lang)
+}
+
 pub fn build_graph(root: &Path) -> Result<Graph> {
     let root = root
         .canonicalize()
         .with_context(|| format!("cannot resolve path {}", root.display()))?;
 
     let mut files: Vec<PathBuf> = Vec::new();
-    for entry in WalkBuilder::new(&root).build() {
+    for entry in walker(&root).build() {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
@@ -47,9 +134,14 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
             continue;
         }
         let take = match path.extension().and_then(|e| e.to_str()) {
-            Some("rs") | Some("py") | Some("tsx") | Some("md") | Some("markdown") => true,
+            Some("rs") => lang_selected(Lang::Rust),
+            Some("py") => lang_selected(Lang::Python),
+            Some("tsx") => lang_selected(Lang::TypeScript),
+            Some("md") | Some("markdown") => lang_selected(Lang::Markdown),
             // Skip `.d.ts` — ambient type declarations carry no topology.
-            Some("ts") => !path.to_str().is_some_and(|s| s.ends_with(".d.ts")),
+            Some("ts") => {
+                lang_selected(Lang::TypeScript) && !path.to_str().is_some_and(|s| s.ends_with(".d.ts"))
+            }
             _ => false,
         };
         if take {
@@ -107,6 +199,9 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
         let (name, crate_prefix) = module_name(rel, lang);
         modules.push(Module {
             name,
+            resolve_name: String::new(),
+            heuristic_deps: Vec::new(),
+            import_sites: Vec::new(),
             file: rel.display().to_string(),
             lang,
             deps: Vec::new(),
@@ -122,6 +217,7 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
         });
     }
 
+    disambiguate_module_names(&mut modules);
     resolve_deps(&mut modules, &root);
     modules.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -132,18 +228,88 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
     })
 }
 
-/// Source-language extensions `ctx` does not (yet) model — used by the
-/// coverage report to name its blind spots honestly.
-const UNSUPPORTED_SOURCE_EXTS: &[&str] = &[
-    "js", "jsx", "mjs", "cjs", "go", "java", "kt", "kts", "rb", "c", "cc", "cpp", "cxx", "h",
-    "hpp", "cs", "swift", "php", "scala", "clj", "ex", "exs", "lua", "vue", "svelte", "sql",
+/// Give every module a unique name, renaming the losers of a collision.
+///
+/// Module names come from paths, so distinct files can land on the same name:
+/// `src/lib.rs` and `src/main.rs` are both `crate`; `native/README.md` and
+/// `src/native/mod.rs` are both `native`. Resolution indexes modules by name, so
+/// a duplicate used to make one of them unreachable — its reverse call edges
+/// silently vanished, which is the worst failure this tool has, because
+/// `ctx callers` returning nothing reads as "safe to change".
+///
+/// Code keeps the bare name and prose is the one renamed — otherwise a
+/// `native/README.md` can take the name of the `src/native/mod.rs` it documents,
+/// which both misreports the top of `ctx core` and breaks `use crate::native::…`
+/// resolution. Within a tie, the first file in sorted order wins, so the result
+/// is deterministic. Losers get `name@stem`, falling back to `name@stem@N` if
+/// stems collide too. Renames are reported on stderr — a visibly renamed module
+/// is far better than a silently ambiguous graph.
+fn disambiguate_module_names(modules: &mut [Module]) {
+    // Visit code before prose so code claims the bare name; `modules` is already
+    // in sorted-file order, which breaks ties.
+    let mut order: Vec<usize> = (0..modules.len()).collect();
+    order.sort_by_key(|&i| (modules[i].lang == Lang::Markdown, i));
+
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut renames: Vec<(String, String, String)> = Vec::new();
+    for i in order {
+        let name = modules[i].name.clone();
+        let count = seen.entry(name.clone()).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            continue;
+        }
+        let stem = std::path::Path::new(&modules[i].file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("dup")
+            .to_string();
+        let mut candidate = format!("{name}@{stem}");
+        let mut n = 2;
+        while seen.contains_key(&candidate) {
+            candidate = format!("{name}@{stem}@{n}");
+            n += 1;
+        }
+        seen.insert(candidate.clone(), 1);
+        renames.push((name.clone(), candidate.clone(), modules[i].file.clone()));
+        // Display name changes; resolution identity must not.
+        modules[i].resolve_name = name;
+        modules[i].name = candidate;
+    }
+    for (from, to, file) in &renames {
+        eprintln!("ctx: module name collision — {file} renamed '{from}' -> '{to}'");
+    }
+}
+
+/// Assets, data and lockfiles: absent from a code topology by design, so they
+/// are not blind spots and must not pad the coverage report. Everything NOT
+/// listed here that ctx cannot parse IS reported, so a new language shows up
+/// as a blind spot automatically instead of waiting to be allowlisted.
+const NON_SOURCE_EXTS: &[&str] = &[
+    // images / fonts / media
+    "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "bmp", "pdf", "mp4", "mp3", "wav", "ttf",
+    "otf", "woff", "woff2",
+    // archives / binaries / model weights
+    "zip", "gz", "tgz", "bz2", "xz", "zst", "tar", "bin", "so", "dylib", "dll", "exe", "a", "o",
+    "pyc", "pyd", "whl", "onnx", "pt", "pth", "safetensors", "gguf", "ggml", "npy", "npz", "pkl",
+    // data / config / text
+    "json", "jsonl", "csv", "tsv", "parquet", "db", "sqlite", "lock", "log", "txt", "toml", "yaml",
+    "yml", "ini", "cfg", "env", "gbnf", "gitignore", "gitattributes",
+    // backups / artifacts / keys: present in a tree, but not language blind spots
+    "bak", "backup", "archive", "orig", "rej", "tmp", "swp", "pub", "pem", "key",
+    "pin", "patch", "manifest", "tpl", "lockb",
 ];
 
 /// Count unmodeled source files by extension under `root`, honoring the same
 /// directory-skip rules as the graph walk. Returns (ext, count), descending.
 pub fn unsupported_census(root: &Path) -> Vec<(String, usize)> {
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for entry in WalkBuilder::new(root).build().flatten() {
+    // Count hidden-but-supported files too: the walker skips dotted paths by
+    // default, so `.hooks/deploy.py` is real source that silently never enters
+    // the graph. For a report whose entire job is honest disclosure, an
+    // undisclosed omission is the one unacceptable answer.
+    let mut hidden_supported = 0usize;
+    for entry in walker(root).hidden(false).build().flatten() {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
@@ -154,14 +320,43 @@ pub fn unsupported_census(root: &Path) -> Vec<(String, usize)> {
         {
             continue;
         }
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if UNSUPPORTED_SOURCE_EXTS.contains(&ext) {
-                *counts.entry(ext.to_string()).or_default() += 1;
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        let is_hidden = rel
+            .components()
+            .any(|c| c.as_os_str().to_str().is_some_and(|s| s.starts_with('.')));
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        let supported = matches!(ext, "rs" | "py" | "ts" | "tsx" | "md" | "markdown");
+        if supported {
+            if is_hidden {
+                hidden_supported += 1;
             }
+            continue;
         }
+        if is_hidden {
+            // Hidden non-source (lockfiles, CI config) is not a blind spot.
+            continue;
+        }
+        // Report every unparsed extension EXCEPT known non-source, rather than
+        // an allowlist of known source: the old allowlist had no `.ipynb`,
+        // `.sh`, `.pyi`, `.proto` or `.tf`, so a repo full of notebooks
+        // reported "none". Inverting it keeps new languages honest by default;
+        // the denylist only suppresses assets, data and lockfiles, which are
+        // not blind spots in a code topology.
+        if NON_SOURCE_EXTS.contains(&ext) {
+            continue;
+        }
+        *counts.entry(ext.to_string()).or_default() += 1;
     }
     let mut v: Vec<(String, usize)> = counts.into_iter().collect();
     v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    if hidden_supported > 0 {
+        v.push((
+            format!("(hidden paths, {hidden_supported} supported file(s) not scanned)"),
+            hidden_supported,
+        ));
+    }
     v
 }
 
@@ -236,7 +431,7 @@ enum Resolved {
 fn resolve_deps(modules: &mut [Module], root: &Path) {
     let mut index: Vec<(Vec<String>, String)> = modules
         .iter()
-        .map(|m| (m.name_segs(), m.name.clone()))
+        .map(|m| (m.resolve_segs(), m.name.clone()))
         .collect();
     index.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.1.cmp(&b.1)));
     let by_name: HashMap<String, usize> = modules
@@ -250,6 +445,8 @@ fn resolve_deps(modules: &mut [Module], root: &Path) {
         BTreeSet<String>,
         Vec<String>,
         Vec<Vec<Call>>,
+        Vec<String>,
+        Vec<(String, String)>,
         Diagnostics,
     );
     let results: Vec<ModuleResult> = {
@@ -265,9 +462,11 @@ fn resolve_deps(modules: &mut [Module], root: &Path) {
             .map(|m| {
                 let mut deps = BTreeSet::new();
                 let mut ext = BTreeSet::new();
+                let mut sites: Vec<(String, String)> = Vec::new();
                 for imp in &m.raw_imports {
                     match resolve_from(imp, m, &ctx) {
                         Resolved::Internal(n) if n != m.name => {
+                            sites.push((imp.clone(), n.clone()));
                             deps.insert(n);
                         }
                         Resolved::External(n) => {
@@ -282,17 +481,26 @@ fn resolve_deps(modules: &mut [Module], root: &Path) {
                     .filter(|b| b.public)
                     .map(|b| display_reexport(b, m, &ctx))
                     .collect();
-                let (calls_per_item, call_deps, diag) = compute_calls(m, &ctx, &method_index);
+                let (calls_per_item, call_deps, soft_deps, diag) =
+                    compute_calls(m, &ctx, &method_index);
+                // An import-derived dep is hard evidence; only a dep that exists
+                // SOLELY via receiver inference stays marked soft.
+                let soft: Vec<String> = soft_deps
+                    .into_iter()
+                    .filter(|d| d != &m.name && !deps.contains(d))
+                    .collect();
                 deps.extend(call_deps.into_iter().filter(|d| d != &m.name));
-                (deps, ext, reex, calls_per_item, diag)
+                (deps, ext, reex, calls_per_item, soft, sites, diag)
             })
             .collect()
     };
 
-    for (m, (deps, ext, reex, calls, diag)) in modules.iter_mut().zip(results) {
+    for (m, (deps, ext, reex, calls, soft, sites, diag)) in modules.iter_mut().zip(results) {
         m.deps = deps.into_iter().collect();
         m.extern_deps = ext.into_iter().collect();
         m.reexports = reex;
+        m.heuristic_deps = soft;
+        m.import_sites = sites;
         m.diag = diag;
         let mut it = calls.into_iter();
         apply_calls(&mut m.items, &mut it);
@@ -313,7 +521,7 @@ fn candidates(imp: &str, m: &Module) -> (Vec<Vec<String>>, bool) {
             if raw.is_empty() {
                 return (Vec::new(), true);
             }
-            let cur = m.name_segs();
+            let cur = m.resolve_segs();
             match raw[0].as_str() {
                 "crate" => (
                     vec![[m.crate_prefix.clone(), raw[1..].to_vec()].concat()],
@@ -347,7 +555,7 @@ fn candidates(imp: &str, m: &Module) -> (Vec<Vec<String>>, bool) {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
-                let cur = m.name_segs();
+                let cur = m.resolve_segs();
                 let dir_len = if m.is_package {
                     cur.len()
                 } else {
@@ -383,7 +591,7 @@ fn candidates(imp: &str, m: &Module) -> (Vec<Vec<String>>, bool) {
                 // One dot means the enclosing package: the module itself for
                 // an __init__.py, its parent otherwise. Each extra dot climbs
                 // one more level.
-                let cur = m.name_segs();
+                let cur = m.resolve_segs();
                 let pkg_len = if m.is_package {
                     cur.len()
                 } else {
@@ -550,6 +758,14 @@ fn provides(mi: usize, sym: &str, ctx: &Ctx, depth: usize) -> bool {
 /// Receiver-based method calls are resolved via a global method index only
 /// when the name is unique codebase-wide AND not a ubiquitous std method —
 /// otherwise a single local `fn push` would swallow every `vec.push()`.
+/// Is this a method name whose reverse edges are deliberately not indexed?
+///
+/// `callers` needs this to answer honestly: a suppressed name has NO reverse
+/// edges by design, so an empty result says nothing about whether callers exist.
+pub fn is_suppressed_method_name(name: &str) -> bool {
+    STD_METHODS.contains(&name)
+}
+
 const STD_METHODS: &[&str] = &[
     "new", "default", "clone", "into", "from", "as_ref", "as_mut", "as_str", "to_string",
     "to_owned", "to_vec", "into_iter", "iter", "iter_mut", "next", "collect", "map", "filter",
@@ -695,7 +911,14 @@ fn resolve_call(
                 return Resolution::Edge {
                     display: segs.join(s),
                     dep: None,
-                    heuristic: false,
+                    // In Rust `Engine::new()` really is type-qualified. In
+                    // Python/TS the same shape is `receiver.method()`, and
+                    // `defined_names` holds functions and imports too — so a
+                    // local variable that happens to share a module-level name
+                    // (a pytest fixture called `router`) produced a confident,
+                    // `~`-free edge naming nothing in the graph. Keep the signal,
+                    // but stop asserting it.
+                    heuristic: m.lang != Lang::Rust,
                 };
             }
             // First segment bound by use/import: helpers::go(), np-style aliases.
@@ -900,6 +1123,17 @@ fn method_edge(
     let Some(&omi) = ctx.by_name.get(om) else {
         return Resolution::Drop;
     };
+    // A unique method name is evidence only WITHIN one language. Across
+    // languages it is coincidence: `tok.apply_chat_template(...)` in Python is
+    // the HuggingFace tokenizer, not the Rust `NativeEngine` method that happens
+    // to share the name — and attributing it invents a Python -> Rust dependency
+    // that cannot exist. Those fabricated edges then drive `deps:`, `subtree`
+    // upstream and `core`'s ranking, so this is not a cosmetic miss. Measured on
+    // a polyglot repo: 45 of 50 `apply_chat_template` "callers", and ~18% of all
+    // module dep edges, were cross-language artifacts.
+    if ctx.modules[omi].lang != m.lang {
+        return Resolution::Drop;
+    }
     let os = sep(ctx.modules[omi].lang);
     if om == &m.name {
         Resolution::Edge {
@@ -945,7 +1179,7 @@ fn compute_calls(
     m: &Module,
     ctx: &Ctx,
     method_index: &MethodIndex,
-) -> (Vec<Vec<Call>>, BTreeSet<String>, Diagnostics) {
+) -> (Vec<Vec<Call>>, BTreeSet<String>, BTreeSet<String>, Diagnostics) {
     #[allow(clippy::too_many_arguments)]
     fn rec(
         items: &[Item],
@@ -955,6 +1189,7 @@ fn compute_calls(
         method_index: &MethodIndex,
         per_item: &mut Vec<Vec<Call>>,
         deps: &mut BTreeSet<String>,
+        soft_deps: &mut BTreeSet<String>,
         diag: &mut Diagnostics,
     ) {
         for it in items {
@@ -978,6 +1213,9 @@ fn compute_calls(
                             .and_modify(|h| *h = *h && heuristic)
                             .or_insert(heuristic);
                         if let Some(d) = dep {
+                            if heuristic {
+                                soft_deps.insert(d.clone());
+                            }
                             deps.insert(d);
                         }
                     }
@@ -1001,14 +1239,15 @@ fn compute_calls(
             } else {
                 container
             };
-            rec(&it.children, next, m, ctx, method_index, per_item, deps, diag);
+            rec(&it.children, next, m, ctx, method_index, per_item, deps, soft_deps, diag);
         }
     }
     let mut per_item = Vec::new();
     let mut deps = BTreeSet::new();
+    let mut soft_deps = BTreeSet::new();
     let mut diag = Diagnostics::default();
-    rec(&m.items, None, m, ctx, method_index, &mut per_item, &mut deps, &mut diag);
-    (per_item, deps, diag)
+    rec(&m.items, None, m, ctx, method_index, &mut per_item, &mut deps, &mut soft_deps, &mut diag);
+    (per_item, deps, soft_deps, diag)
 }
 
 fn apply_calls(items: &mut [Item], resolved: &mut std::vec::IntoIter<Vec<Call>>) {

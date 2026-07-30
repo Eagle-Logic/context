@@ -4,6 +4,7 @@ mod mcp;
 mod model;
 mod parity;
 mod query;
+mod refactor;
 mod render;
 mod view;
 
@@ -26,6 +27,38 @@ use view::View;
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+    /// Skip paths matching a gitignore-style glob (repeatable), e.g.
+    /// --exclude 'docs/archive/**' --exclude 'vendor/**'
+    #[arg(long, global = true)]
+    exclude: Vec<String>,
+    /// Restrict the scan to these languages (repeatable). `code` means every
+    /// supported language except Markdown — useful when prose dominates a map.
+    #[arg(long, value_enum, global = true)]
+    lang: Vec<LangArg>,
+}
+
+/// Language selector for `--lang`.
+#[derive(Clone, Copy, ValueEnum)]
+enum LangArg {
+    Rust,
+    Python,
+    Ts,
+    Md,
+    /// Every supported language except Markdown.
+    Code,
+}
+
+impl LangArg {
+    fn expand(self) -> Vec<model::Lang> {
+        use model::Lang;
+        match self {
+            LangArg::Rust => vec![Lang::Rust],
+            LangArg::Python => vec![Lang::Python],
+            LangArg::Ts => vec![Lang::TypeScript],
+            LangArg::Md => vec![Lang::Markdown],
+            LangArg::Code => vec![Lang::Rust, Lang::Python, Lang::TypeScript],
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -50,12 +83,16 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
         /// Detail level: skeleton (architecture only), interface (public API),
-        /// full (private items + call edges)
-        #[arg(long, value_enum, default_value_t = View::Full)]
+        /// full (private items + call edges). Defaults to skeleton: an
+        /// unbudgeted `full` map is ~258k tokens on a large repo, and the
+        /// expensive view should be asked for, not stumbled into.
+        #[arg(long, value_enum, default_value_t = View::Skeleton)]
         view: View,
         /// Fit the output to a token budget: emit the richest view at or below
-        /// `--view` whose ~token count fits, reporting the choice on stderr.
-        /// Never truncates. Omit for the exact `--view`.
+        /// `--view` whose ~token count fits, reporting the choice on stderr. If
+        /// even `skeleton` is over budget, the least-central modules are pruned
+        /// until it fits, so the budget is a hard cap. Items inside a kept
+        /// module are never truncated. Omit for the exact `--view`.
         #[arg(long)]
         max_tokens: Option<usize>,
         /// Write to a file instead of stdout (e.g. CODEBASE_MAP.md)
@@ -73,6 +110,10 @@ enum Cmd {
         /// Detail level: skeleton, interface, or full
         #[arg(long, value_enum, default_value_t = View::Full)]
         view: View,
+        /// Fit the output to a token budget: reduces detail, then drops the
+        /// least-central neighbors. The target module is always kept.
+        #[arg(long)]
+        max_tokens: Option<usize>,
     },
     /// Top-level module list with dependency edges (the global high-level map)
     Modules {
@@ -139,6 +180,15 @@ enum Cmd {
         /// Report public-API changes (removed/changed signatures + who breaks)
         #[arg(long)]
         api: bool,
+        /// Fit the output to a token budget: sheds least-central neighbors.
+        /// Changed modules are always kept.
+        #[arg(long)]
+        max_tokens: Option<usize>,
+        /// With --api: exit non-zero if a public item was REMOVED. Signature
+        /// changes are reported but do not fail, since ctx cannot tell an added
+        /// optional parameter from an incompatible one. For CI gates.
+        #[arg(long)]
+        strict: bool,
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
         #[arg(long, value_enum, default_value_t = View::Full)]
@@ -154,6 +204,13 @@ enum Cmd {
         /// Report public-API changes between the refs (removed/changed + who breaks)
         #[arg(long)]
         api: bool,
+        /// Fit the output to a token budget: sheds least-central neighbors.
+        /// Changed modules are always kept.
+        #[arg(long)]
+        max_tokens: Option<usize>,
+        /// With --api: exit non-zero on a breaking change. For CI gates.
+        #[arg(long)]
+        strict: bool,
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
         #[arg(long, value_enum, default_value_t = View::Full)]
@@ -171,6 +228,10 @@ enum Cmd {
         /// Exit non-zero if any source member is missing from the port
         #[arg(long)]
         strict: bool,
+        /// Map a renamed container/type explicitly, e.g.
+        /// --alias TriStateRouter=IntentGate (repeatable). Overrides inference.
+        #[arg(long, value_parser = parse_alias)]
+        alias: Vec<(String, String)>,
         /// Apply a systematic cross-language rename table (e.g. py-rust maps
         /// `__init__` → `new`). Alias matches are reported, never silent.
         #[arg(long, value_enum)]
@@ -178,58 +239,183 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
     },
+    /// Plan a module move: every import site that must be rewritten
+    MovePlan {
+        /// Module to move, e.g. "native::gate"
+        from: String,
+        /// Destination module path, e.g. "native::routing::gate"
+        to: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, value_enum, default_value_t = Format::Md)]
+        format: Format,
+    },
+    /// Check a completed move: module landed, old name gone, nothing orphaned
+    MoveVerify {
+        /// The module path that was moved away from
+        from: String,
+        /// The destination it should now live at
+        to: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, value_enum, default_value_t = Format::Md)]
+        format: Format,
+    },
     /// Run as an MCP server over stdio (exposes the read-only commands as tools)
     Mcp,
-    /// Print the recommended CLAUDE.md discovery-protocol block
-    Snippet,
+    /// Print the CLAUDE.md discovery block, measured for this repo
+    Snippet {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
 }
 
-const SNIPPET: &str = r#"## Codebase Discovery Tools
+/// Build the CLAUDE.md discovery block for a specific repo.
+///
+/// This is the one artifact ctx emits that gets *copied* somewhere else, so it is
+/// the one that can go stale. The previous block was generic prose telling every
+/// agent to "run `ctx map --view skeleton` to load the topology" — advice that is
+/// fine at 20 modules and catastrophic at 720, and which sat wrong in a repo's
+/// CLAUDE.md long after the tool had learned better.
+///
+/// Two changes make staleness self-correcting rather than inevitable:
+///
+/// 1. **It measures.** Module count, prose share, real map cost and the
+///    call-resolution rate are read off THIS repo, so the guidance is derived
+///    rather than asserted, and the numbers tell an agent what to trust.
+/// 2. **It is delimited.** The block is fenced by markers so regenerating
+///    replaces it in place instead of appending a second, contradictory copy.
+///
+/// It is also short. A CLAUDE.md block is resident in every session forever, so
+/// anything an agent can get from `--help` on demand does not belong here — only
+/// what it cannot derive: this repo's scale, and where ctx's output is not
+/// trustworthy.
+fn snippet_for(g: &Graph) -> String {
+    let modules = g.modules.len();
 
-`ctx` is a deterministic static-analysis CLI for this repo (Rust, Python, TypeScript, Markdown). Use it to
-orient yourself instead of grepping raw source; only read raw files when you need
-implementation bodies.
+    let render_at = |v: View| -> usize {
+        let mut gg = g.clone();
+        view::apply(&mut gg, v);
+        est_tokens(&render::markdown(&gg))
+    };
+    let skeleton_tok = render_at(View::Skeleton);
+    let full_tok = render_at(View::Full);
 
-- `ctx map --view skeleton` — bird's-eye architecture: modules, deps, type names (cheapest)
-- `ctx map --view interface` — + public signatures, struct fields, enum variants (API surface)
-- `ctx map` — + private items and per-function call edges (`→ callee`) for tracing execution
-  (a trailing `~` on an edge means it was inferred from an opaque receiver, not an import/path —
-  trust it less)
-- `ctx modules` — one line per module with dependency edges
-- `ctx subtree <module> [--view ...]` — one module plus its immediate upstream dependencies
-  and downstream dependents
-- `ctx def <name>` — where a symbol is defined: module, kind, line, and signature (jump-to-def
-  without knowing the module; accepts bare `Foo` or qualified `Type::method`)
-- `ctx callers <name>` — every function that calls the given function/method (resolved reverse
-  call edges — the blast radius before you change a signature; more precise than grep)
-- `ctx context <name>` — everything needed to edit a symbol in one shot: its definition, the
-  types in its signature, what it calls, and what calls it (token-budgeted via `--max-tokens`)
-- `ctx changed [--since <ref>]` — impact map of your diff: the changed modules plus their
-  dependencies and the callers they may break (defaults to the working tree vs HEAD)
-- `ctx changed --api [--since <ref>]` — public API changes in your diff: removed or
-  signature-changed public items and who breaks (a pre-merge breaking-change check)
-- `ctx diff <A>..<B>` — structural diff between two git refs (B defaults to the working
-  tree): changed modules + who they break; add `--api` for breaking changes across the range
-- `ctx parity <source> <port>...` — cross-language structural check: is a port a faithful
-  copy of its source? Flags members missing from the port, arity drift, and dropped internal
-  calls (deterministic, structure-only — e.g. a Python module vs its Rust port; add
-  `--aliases py-rust` to bridge systematic renames like `__init__` → `new`)
-- `ctx core` — the modules that matter most, ranked by dependency centrality (where to look
-  first in an unfamiliar codebase; add `--churn` to weight by how often they change)
-- `ctx doctor` — coverage report: what fraction of the call graph resolved and which modules/
-  edges to distrust (run once to calibrate how much to lean on ctx for this repo)
-- add `--format json` to any of the above for machine-readable output
+    // Measured on the SKELETON view, because that is the view the advice is
+    // about. At full view code carries bodies and call edges and dwarfs prose,
+    // which understates how much of an *orientation* map is documentation.
+    let mut skel = g.clone();
+    view::apply(&mut skel, View::Skeleton);
+    let prose_bytes: usize = skel
+        .modules
+        .iter()
+        .filter(|m| m.lang == model::Lang::Markdown)
+        .map(|m| {
+            let mut s = String::new();
+            render::module_md(m, &mut s);
+            s.len()
+        })
+        .sum();
+    let all_bytes: usize = skel
+        .modules
+        .iter()
+        .map(|m| {
+            let mut s = String::new();
+            render::module_md(m, &mut s);
+            s.len()
+        })
+        .sum();
+    let prose_pct = if all_bytes == 0 {
+        0
+    } else {
+        prose_bytes * 100 / all_bytes
+    };
 
-Protocol: before modifying or analyzing code, run `ctx map --view skeleton` to load the
-topology. When you're about to work on a specific symbol, run `ctx context <name>` — it bundles
-the definition, signature types, callees, and callers in one call, so you rarely need to open the
-file until you're editing its body. For broader orientation use `ctx subtree <module>`; before
-changing a signature run `ctx callers <name>` to see the blast radius. Line anchors (`[L42]`)
-give exact positions for surgical reads.
-"#;
+    let (sites, resolved): (usize, usize) = g
+        .modules
+        .iter()
+        .fold((0, 0), |(s, r), m| (s + m.diag.call_sites, r + m.diag.resolved));
+    let resolve_pct = if sites == 0 { 0 } else { resolved * 100 / sites };
+
+    let mut out = String::from("<!-- ctx:begin — regenerate with `ctx snippet` -->\n");
+    out.push_str("## Codebase Discovery\n\n");
+    out.push_str(
+        "`ctx` is a deterministic structural index (Rust/Python/TS/Markdown). Use it to locate \
+         and orient; read raw files for implementation bodies. `ctx <cmd> --help` for detail.\n\n",
+    );
+
+    out.push_str(&format!(
+        "**This repo:** {modules} modules · unbudgeted map ~{full_tok} tok (skeleton \
+         ~{skeleton_tok}) · {prose_pct}% of the map is prose · {resolve_pct}% of call sites \
+         resolve internally.\n\n"
+    ));
+
+    // Targeted lookups lead. An orientation-first protocol reads well and does not
+    // survive contact with an agent that has a concrete task: measured over one
+    // long working session, the "start with `ctx core`" step was never taken once,
+    // while the value that did land came from jumping straight to a symbol.
+    out.push_str("Reach for these first — they answer a question you actually have:\n\n");
+    out.push_str(
+        "- `ctx def <name>` — where a symbol is defined, across languages, without guessing \
+         the file.\n",
+    );
+    out.push_str(
+        "- `ctx callers <name>` — who calls it, before you change a signature. Also answers \
+         `<Type>`: what references a type, which is the most common breaking change.\n",
+    );
+    out.push_str(
+        "- `ctx context <symbol>` — definition + signature types + callees + callers in one \
+         call. Usually enough to edit without opening the file.\n",
+    );
+    out.push_str("- `ctx changed --api` before pushing — public items removed or changed, and who breaks.\n\n");
+    out.push_str("When you genuinely do not know where you are:\n\n");
+    out.push_str("- `ctx core` — the modules that matter most, by dependency centrality.\n");
+    // Gate on the cost of what an agent would actually run — the default map —
+    // not on the cheapest view. Calling an 18k-token map "affordable" because its
+    // skeleton fits is the same category of wrong advice this block replaced.
+    if full_tok > 15_000 {
+        out.push_str(&format!(
+            "- `ctx map --max-tokens 10000{}` — whole-topology view. **Never run an unbudgeted \
+             map here** (~{full_tok} tok); `--max-tokens` is a hard cap.\n",
+            if prose_pct >= 25 { " --lang code" } else { "" }
+        ));
+    } else {
+        out.push_str(&format!(
+            "- `ctx map` — the whole map is ~{full_tok} tok here, small enough to read \
+             directly. Pass `--max-tokens` if it grows.\n"
+        ));
+    }
+    out.push('\n');
+
+    out.push_str(
+        "**Trust:** `ctx callers` is a floor, never a complete answer. It prints `INCOMPLETE` \
+         when a name has several definitions and `NOT INDEXED` for suppressed common names \
+         (`get`, `open`, `push`, …) where it indexes nothing at all. No warning means no *known* \
+         reason to distrust it, not a guarantee — run the `rg` it prints before changing a \
+         signature. A trailing `~` on an edge means it was inferred from an opaque receiver.\n",
+    );
+    // Only warn when there is a real measurement to warn about: a repo with no
+    // call sites scores 0% and would otherwise be told its call graph is
+    // untrustworthy, which is noise, not calibration.
+    if sites >= 50 && resolve_pct < 30 {
+        out.push_str(&format!(
+            "Only {resolve_pct}% of call sites resolve internally here, so calibrate with \
+             `ctx doctor` before leaning on call edges.\n"
+        ));
+    }
+    out.push_str("\n`CODEBASE_MAP.md` is generated, not committed: gitignore it and rebuild on demand.\n");
+    out.push_str("<!-- ctx:end -->\n");
+    out
+}
+
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Scan scope is fixed by argv, so install it before any graph is built.
+    extract::set_filter(extract::Filter {
+        exclude: cli.exclude.clone(),
+        langs: cli.lang.iter().flat_map(|l| l.expand()).collect(),
+    });
     match cli.cmd {
         Cmd::Map {
             path,
@@ -240,16 +426,41 @@ fn main() -> Result<()> {
         } => {
             let mut g = extract::build_graph(&path)?;
             let module_count = g.modules.len();
+            // What actually landed in the output: pruning can drop modules, and
+            // the "wrote" line must report emitted modules, not parsed ones.
+            let mut emitted_count = module_count;
             let rendered = match max_tokens {
                 Some(budget) => {
-                    let (used, text, fit) = render_budgeted(&g, view, format, budget);
+                    let b = render_budgeted(&g, view, format, budget);
+                    emitted_count = module_count - b.omitted;
+                    // Match on `fit` first: an over-budget render that pruned
+                    // nothing still has to say so.
+                    let detail = match (b.fit, b.omitted) {
+                        (true, 0) => String::new(),
+                        (true, n) => format!(
+                            " — pruned {n} of {module_count} least-central modules to fit"
+                        ),
+                        (false, n) => {
+                            // The map's header and footer are a fixed floor that
+                            // no amount of pruning removes, so at very small
+                            // budgets they, not the modules, are what overflows.
+                            let floor = est_tokens(&b.text);
+                            format!(
+                                " — BUDGET NOT MET: emitted ~{floor} tok with {emitted_count} of \
+                                 {module_count} module(s) ({n} omitted); the map header and \
+                                 footer alone exceed {budget} tok"
+                            )
+                        }
+                    };
                     eprintln!(
-                        "budget {budget} tok → {} view (~{} tok){}",
-                        used.name(),
-                        text.len() / 4,
-                        if fit { "" } else { " — still over; coarsest view emitted" }
+                        "budget {budget} tok → {} view (~{} tok){detail}",
+                        b.view.name(),
+                        est_tokens(&b.text),
                     );
-                    text
+                    // stdout is what a pipe, an `-o` file and an MCP caller see;
+                    // a verdict that only reaches stderr is a verdict nobody
+                    // downstream can act on.
+                    annotate_budget(b.text, b.view, budget, b.fit, format)
                 }
                 None => {
                     view::apply(&mut g, view);
@@ -263,9 +474,14 @@ fn main() -> Result<()> {
                 Some(file) => {
                     fs::write(&file, &rendered)?;
                     eprintln!(
-                        "wrote {} ({} modules, {} bytes)",
+                        "wrote {} ({} modules{}, {} bytes)",
                         file.display(),
-                        module_count,
+                        emitted_count,
+                        if emitted_count == module_count {
+                            String::new()
+                        } else {
+                            format!(" of {module_count}")
+                        },
                         rendered.len()
                     );
                 }
@@ -277,46 +493,14 @@ fn main() -> Result<()> {
             path,
             format,
             view,
+            max_tokens,
         } => {
-            let mut g = extract::build_graph(&path)?;
-            view::apply(&mut g, view);
-            let targets: Vec<&Module> = g
-                .modules
-                .iter()
-                .filter(|m| {
-                    m.name == module
-                        || m.name.ends_with(&format!("::{module}"))
-                        || m.name.ends_with(&format!(".{module}"))
-                })
-                .collect();
-            if targets.is_empty() {
-                let names: Vec<&str> = g.modules.iter().map(|m| m.name.as_str()).collect();
-                bail!(
-                    "no module matching '{}'. Available modules:\n  {}",
-                    module,
-                    names.join("\n  ")
-                );
+            let g = extract::build_graph(&path)?;
+            let text = subtree_text(&g, &module, view, format, max_tokens)?;
+            if let Some(budget) = max_tokens {
+                eprintln!("budget {budget} tok → subtree (~{} tok)", est_tokens(&text));
             }
-
-            let target_names: BTreeSet<&str> =
-                targets.iter().map(|m| m.name.as_str()).collect();
-            let (upstream, downstream) = query::neighbors(&g, &target_names);
-
-            match format {
-                Format::Md => print!(
-                    "{}",
-                    render::subtree_md(&module, &targets, &upstream, &downstream)
-                ),
-                Format::Json => {
-                    let json = serde_json::json!({
-                        "query": module,
-                        "target": targets,
-                        "upstream": upstream,
-                        "downstream": downstream,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&json)?);
-                }
-            }
+            print!("{text}");
         }
         Cmd::Modules { path } => {
             let g = extract::build_graph(&path)?;
@@ -386,6 +570,8 @@ fn main() -> Result<()> {
             path,
             since,
             api,
+            max_tokens: _,
+            strict,
             format,
             view: _,
         } if api => {
@@ -404,15 +590,28 @@ fn main() -> Result<()> {
             let base = extract::build_graph(&wt.join(&rel));
             git::remove_worktree(&repo, &wt);
             let base = base?;
-            print!(
-                "{}",
-                query::api_report(&base, &current, label, matches!(format, Format::Json))
-            );
+            let (report, removed_n, changed_n) =
+                query::api_report(&base, &current, label, matches!(format, Format::Json));
+            print!("{report}");
+            if strict && removed_n > 0 {
+                eprintln!(
+                    "ctx: {removed_n} public item(s) REMOVED vs {label} — failing (--strict)"
+                );
+                std::process::exit(1);
+            }
+            if strict && changed_n > 0 {
+                eprintln!(
+                    "ctx: {changed_n} signature change(s) vs {label} — reported, not failing \
+                     (ctx cannot distinguish an added optional parameter from an incompatible one)"
+                );
+            }
         }
         Cmd::Changed {
             path,
             since,
             api: _,
+            max_tokens,
+            strict: _,
             format,
             view,
         } => {
@@ -445,33 +644,27 @@ fn main() -> Result<()> {
             }
             let target_names: BTreeSet<&str> = targets.iter().map(|m| m.name.as_str()).collect();
             let (upstream, downstream) = query::neighbors(&g, &target_names);
-            match format {
-                Format::Md => print!(
-                    "{}",
-                    render::changed_md(label, &targets, &upstream, &downstream)
-                ),
-                Format::Json => {
-                    let json = serde_json::json!({
-                        "since": label,
-                        "changed": targets,
-                        "upstream": upstream,
-                        "downstream": downstream,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&json)?);
-                }
-            }
+            print!(
+                "{}",
+                impact_text(
+                    &g, label, &targets, &upstream, &downstream, format, max_tokens
+                )
+            );
         }
         Cmd::Diff {
             range,
             path,
             api,
+            max_tokens,
+            strict,
             format,
             view,
-        } => run_diff(&range, &path, api, format, view)?,
+        } => run_diff(&range, &path, api, format, view, max_tokens, strict)?,
         Cmd::Parity {
             source,
             target,
             strict,
+            alias,
             aliases,
             format,
         } => {
@@ -484,14 +677,50 @@ fn main() -> Result<()> {
                 Some(AliasSet::PyRust) => parity::py_rust_aliases(),
                 None => parity::AliasMap::new(),
             };
-            let (out, missing) = parity::report(&src, &tgt, &amap, matches!(format, Format::Json));
+            let containers: std::collections::BTreeMap<String, String> =
+                alias.into_iter().collect();
+            let (out, missing) = parity::report(
+                &src,
+                &tgt,
+                &amap,
+                &containers,
+                matches!(format, Format::Json),
+            );
             print!("{out}");
             if strict && missing > 0 {
                 std::process::exit(1);
             }
         }
+        Cmd::MovePlan {
+            from,
+            to,
+            path,
+            format,
+        } => {
+            let g = extract::build_graph(&path)?;
+            print!(
+                "{}",
+                refactor::move_plan(&g, &from, &to, matches!(format, Format::Json))
+            );
+        }
+        Cmd::MoveVerify {
+            from,
+            to,
+            path,
+            format,
+        } => {
+            let g = extract::build_graph(&path)?;
+            let (out, ok) = refactor::move_verify(&g, &from, &to, matches!(format, Format::Json));
+            print!("{out}");
+            if !ok {
+                std::process::exit(1);
+            }
+        }
         Cmd::Mcp => mcp::run()?,
-        Cmd::Snippet => print!("{SNIPPET}"),
+        Cmd::Snippet { path } => {
+            let g = extract::build_graph(&path)?;
+            print!("{}", snippet_for(&g));
+        }
     }
     Ok(())
 }
@@ -527,7 +756,15 @@ fn members_for(path: &std::path::Path) -> Result<Vec<parity::MemberView>> {
 /// `ctx diff A..B` — map the file changes between two refs onto B's module
 /// graph (B defaults to the working tree). With `--api`, diff the public API
 /// surface between the two refs instead.
-fn run_diff(range: &str, path: &std::path::Path, api: bool, format: Format, view: View) -> Result<()> {
+fn run_diff(
+    range: &str,
+    path: &std::path::Path,
+    api: bool,
+    format: Format,
+    view: View,
+    max_tokens: Option<usize>,
+    strict: bool,
+) -> Result<()> {
     let (a, b) = parse_range(range);
     let repo = git::repo_root(path)?;
     let rel = path
@@ -554,7 +791,15 @@ fn run_diff(range: &str, path: &std::path::Path, api: bool, format: Format, view
         let out = query::api_report(&base, &head, &a, json);
         cleanup(&repo, wt_a);
         cleanup(&repo, wt_b);
-        print!("{out}");
+        let (report, removed_n, changed_n) = out;
+        print!("{report}");
+        if strict && removed_n > 0 {
+            eprintln!("ctx: {removed_n} public item(s) REMOVED in {a} — failing (--strict)");
+            std::process::exit(1);
+        }
+        if strict && changed_n > 0 {
+            eprintln!("ctx: {changed_n} signature change(s) in {a} — reported, not failing");
+        }
         return Ok(());
     }
 
@@ -595,21 +840,12 @@ fn run_diff(range: &str, path: &std::path::Path, api: bool, format: Format, view
     } else {
         let target_names: BTreeSet<&str> = targets.iter().map(|m| m.name.as_str()).collect();
         let (upstream, downstream) = query::neighbors(&head, &target_names);
-        match format {
-            Format::Md => print!(
-                "{}",
-                render::changed_md(&label, &targets, &upstream, &downstream)
-            ),
-            Format::Json => {
-                let json = serde_json::json!({
-                    "range": label,
-                    "changed": targets,
-                    "upstream": upstream,
-                    "downstream": downstream,
-                });
-                println!("{}", serde_json::to_string_pretty(&json)?);
-            }
-        }
+        print!(
+            "{}",
+            impact_text(
+                &head, &label, &targets, &upstream, &downstream, format, max_tokens
+            )
+        );
     }
     cleanup(&repo, wt_b);
     Ok(())
@@ -659,10 +895,382 @@ fn cleanup(repo: &std::path::Path, wt: Option<PathBuf>) {
     }
 }
 
+/// Render a change-impact report, optionally fitted to a token budget.
+///
+/// Shared by `changed` and `diff`. Changed modules are always kept — they are the
+/// subject of the report — so only neighbors are shed, least-central first. A
+/// single commit on a 14-module repo rendered ~10k tokens unbudgeted, which is
+/// the wrong shape for something meant to be read during review.
+fn impact_text(
+    g: &Graph,
+    label: &str,
+    targets: &[&Module],
+    upstream: &[&Module],
+    downstream: &[&Module],
+    format: Format,
+    budget: Option<usize>,
+) -> String {
+    let rank_of: std::collections::HashMap<&str, usize> = query::centrality_order(g)
+        .into_iter()
+        .enumerate()
+        .map(|(pos, i)| (g.modules[i].name.as_str(), pos))
+        .collect();
+
+    let render = |cap: Option<usize>| -> String {
+        let mut up: Vec<&Module> = upstream.to_vec();
+        let mut down: Vec<&Module> = downstream.to_vec();
+        let mut dropped = 0usize;
+        if let Some(cap) = cap {
+            let by_rank = |set: &mut Vec<&Module>| {
+                set.sort_by_key(|m| rank_of.get(m.name.as_str()).copied().unwrap_or(usize::MAX));
+            };
+            by_rank(&mut up);
+            by_rank(&mut down);
+            let half = cap.div_ceil(2);
+            let up_keep = half.min(up.len());
+            let down_keep = (cap - up_keep).min(down.len());
+            dropped = (up.len() - up_keep) + (down.len() - down_keep);
+            up.truncate(up_keep);
+            down.truncate(down_keep);
+            up.sort_by(|a, b| a.name.cmp(&b.name));
+            down.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        match format {
+            Format::Md => {
+                let mut s = render::changed_md(label, targets, &up, &down);
+                if dropped > 0 {
+                    s.push_str(&format!(
+                        "\n---\n{dropped} less-central neighbor(s) omitted to fit the token \
+                         budget. The changed modules themselves are always kept.\n"
+                    ));
+                }
+                s
+            }
+            Format::Json => {
+                let mut v = serde_json::json!({
+                    "since": label,
+                    "changed": targets,
+                    "upstream": up,
+                    "downstream": down,
+                });
+                if dropped > 0 {
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("neighbors_omitted".into(), serde_json::json!(dropped));
+                    }
+                }
+                serde_json::to_string_pretty(&v).unwrap_or_default() + "\n"
+            }
+        }
+    };
+
+    let Some(budget) = budget else {
+        return render(None);
+    };
+    let whole = render(None);
+    if est_tokens(&whole) <= budget {
+        return whole;
+    }
+    let max_neighbors = upstream.len() + downstream.len();
+    let bare = render(Some(0));
+    if est_tokens(&bare) > budget {
+        // The changed modules alone are over budget. They are the subject of the
+        // report and are never dropped, so say the cap was not met rather than
+        // implying this output fits.
+        let mut text = bare;
+        if matches!(format, Format::Md) {
+            let n = est_tokens(&text);
+            text.push_str(&format!(
+                "\n---\n[ctx] BUDGET NOT MET: the changed modules alone are ~{n} tokens, over \
+                 the {budget}-token budget. All neighbors were dropped. Narrow the diff, or use \
+                 `--view interface`.\n"
+            ));
+        }
+        return text;
+    }
+    let (mut lo, mut hi) = (0usize, max_neighbors);
+    let mut best = bare;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let text = render(Some(mid));
+        if est_tokens(&text) <= budget {
+            best = text;
+            lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best
+}
+
+/// Stamp the emitted view and budget verdict into the output itself.
+///
+/// An agent that asked for `full` and silently received `interface` will look for
+/// call edges that were deleted; one handed an over-budget map needs to know the
+/// cap was not met. Both facts are free to include and impossible to recover.
+fn annotate_budget(text: String, view: View, budget: usize, fit: bool, format: Format) -> String {
+    let verdict = if fit {
+        format!("fitted to {budget} tokens")
+    } else {
+        format!("BUDGET NOT MET: exceeds {budget} tokens")
+    };
+    match format {
+        Format::Md => text.replacen(
+            "# Codebase Topology Map\n",
+            &format!("# Codebase Topology Map\nview: {} ({verdict})\n", view.name()),
+            1,
+        ),
+        Format::Json => text,
+    }
+}
+
+/// Render a subtree, optionally fitted to a token budget.
+///
+/// Shared by the CLI and the MCP server so both honor the same budget. Fitting
+/// reduces detail first (full → interface → skeleton); if that is not enough it
+/// drops the least-central *neighbors*, never the target — the target is the
+/// thing you asked about, so it is the one module that must survive.
+fn subtree_text(
+    g: &Graph,
+    module: &str,
+    view: View,
+    format: Format,
+    budget: Option<usize>,
+) -> Result<String> {
+    let matches_query = |name: &str| {
+        name == module
+            || name.ends_with(&format!("::{module}"))
+            || name.ends_with(&format!(".{module}"))
+    };
+    if !g.modules.iter().any(|m| matches_query(&m.name)) {
+        bail!("{}", not_found_message(g, module));
+    }
+    // Centrality of the whole graph, so neighbor ranking does not shift with the
+    // view or the cap.
+    let rank_of: std::collections::HashMap<&str, usize> = query::centrality_order(g)
+        .into_iter()
+        .enumerate()
+        .map(|(pos, i)| (g.modules[i].name.as_str(), pos))
+        .collect();
+
+    let render_at = |v: View, neighbor_cap: Option<usize>| -> String {
+        let mut gg = g.clone();
+        view::apply(&mut gg, v);
+        let targets: Vec<&Module> = gg.modules.iter().filter(|m| matches_query(&m.name)).collect();
+        let target_names: BTreeSet<&str> = targets.iter().map(|m| m.name.as_str()).collect();
+        let (mut upstream, mut downstream) = query::neighbors(&gg, &target_names);
+        let mut dropped = 0usize;
+        if let Some(cap) = neighbor_cap {
+            let by_rank = |set: &mut Vec<&Module>| {
+                set.sort_by_key(|m| rank_of.get(m.name.as_str()).copied().unwrap_or(usize::MAX));
+            };
+            by_rank(&mut upstream);
+            by_rank(&mut downstream);
+            // Split the cap between the two sides so neither starves the other.
+            let half = cap.div_ceil(2);
+            let up_keep = half.min(upstream.len());
+            let down_keep = (cap - up_keep).min(downstream.len());
+            dropped = (upstream.len() - up_keep) + (downstream.len() - down_keep);
+            upstream.truncate(up_keep);
+            downstream.truncate(down_keep);
+            // Restore name order for a stable, readable rendering.
+            upstream.sort_by(|a, b| a.name.cmp(&b.name));
+            downstream.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        match format {
+            Format::Md => {
+                let mut s = render::subtree_md(module, &targets, &upstream, &downstream);
+                if dropped > 0 {
+                    s.push_str(&format!(
+                        "\n---\n{dropped} less-central neighbor(s) omitted to fit the token \
+                         budget. Ask for one by name with `ctx subtree <module>`.\n"
+                    ));
+                }
+                s
+            }
+            Format::Json => {
+                let mut v = serde_json::json!({
+                    "query": module,
+                    "target": targets,
+                    "upstream": upstream,
+                    "downstream": downstream,
+                });
+                if dropped > 0 {
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("neighbors_omitted".into(), serde_json::json!(dropped));
+                    }
+                }
+                serde_json::to_string_pretty(&v).unwrap_or_default() + "\n"
+            }
+        }
+    };
+
+    let Some(budget) = budget else {
+        return Ok(render_at(view, None));
+    };
+
+    let max_neighbors = {
+        let names: BTreeSet<&str> = g
+            .modules
+            .iter()
+            .filter(|m| matches_query(&m.name))
+            .map(|m| m.name.as_str())
+            .collect();
+        let (u, d) = query::neighbors(g, &names);
+        u.len() + d.len()
+    };
+
+    // Richest view whose PRUNED form fits, not the first view that fits whole.
+    // Returning early at the coarsest view left most of the budget unspent —
+    // `--max-tokens 4000` and `--max-tokens 12000` produced identical output —
+    // when the budget could have bought `interface` detail on fewer neighbors.
+    let ladder = [View::Full, View::Interface, View::Skeleton];
+    let start = ladder.iter().position(|&v| v == view).unwrap_or(0);
+    let mut best: Option<String> = None;
+    for &v in &ladder[start..] {
+        let whole = render_at(v, None);
+        if est_tokens(&whole) <= budget {
+            return Ok(whole);
+        }
+        // Largest neighbor set that fits at this detail level.
+        let (mut lo, mut hi) = (0usize, max_neighbors);
+        let mut fit_here: Option<String> = None;
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+            let text = render_at(v, Some(mid));
+            if est_tokens(&text) <= budget {
+                fit_here = Some(text);
+                lo = mid + 1;
+            } else if mid == 0 {
+                break;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        if let Some(t) = fit_here {
+            // Richest rung wins: stop at the first view that fits when pruned.
+            return Ok(t);
+        }
+        best = Some(render_at(v, Some(0)));
+    }
+
+    // Not satisfiable at any rung: the target module alone is over budget. Emit
+    // the coarsest form and say so in band rather than implying a fit.
+    let mut text = best.unwrap_or_else(|| render_at(View::Skeleton, Some(0)));
+    if matches!(format, Format::Md) {
+        text.push_str(&format!(
+            "\n---\n[ctx] BUDGET NOT MET: the target module alone is ~{} tokens, over the \
+             {budget}-token budget. Use `ctx def`/`ctx context <symbol>` for a smaller slice.\n",
+            est_tokens(&text)
+        ));
+    }
+    Ok(text)
+}
+
+
+/// Parse `--alias Old=New` into a container rename pair.
+fn parse_alias(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((a, b)) if !a.trim().is_empty() && !b.trim().is_empty() => {
+            Ok((a.trim().to_string(), b.trim().to_string()))
+        }
+        _ => Err(format!("expected Old=New, got '{s}'")),
+    }
+}
+
+/// A module-not-found error with near misses instead of the whole index.
+///
+/// Dumping every module name cost 24 KB on a 720-module repo — a typo should not
+/// spend thousands of tokens of an agent's context. Candidates are ranked by
+/// substring containment, then by shared prefix length with the query.
+fn not_found_message(g: &Graph, query: &str) -> String {
+    const MAX_SUGGESTIONS: usize = 12;
+    let q = query.to_lowercase();
+    let shared_prefix = |name: &str| -> usize {
+        name.to_lowercase()
+            .chars()
+            .zip(q.chars())
+            .take_while(|(a, b)| a == b)
+            .count()
+    };
+    let mut ranked: Vec<(&str, bool, usize)> = g
+        .modules
+        .iter()
+        .map(|m| {
+            let lower = m.name.to_lowercase();
+            let last = lower.rsplit(['.', ':']).next().unwrap_or(&lower).to_string();
+            (
+                m.name.as_str(),
+                lower.contains(&q) || last.contains(&q),
+                shared_prefix(&m.name),
+            )
+        })
+        .collect();
+    // Contains-match first, then longest shared prefix, then name for stability.
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(b.0)));
+    let suggestions: Vec<&str> = ranked
+        .iter()
+        .filter(|(_, contains, prefix)| *contains || *prefix > 0)
+        .take(MAX_SUGGESTIONS)
+        .map(|(n, _, _)| *n)
+        .collect();
+
+    let total = g.modules.len();
+    if suggestions.is_empty() {
+        return format!(
+            "no module matching '{query}' among {total} modules.\n\
+             Run `ctx modules` for the full list, or `ctx core` for the ones that matter most."
+        );
+    }
+    format!(
+        "no module matching '{query}' among {total} modules. Closest:\n  {}\n\
+         Run `ctx modules` for the full list, or `ctx core` for the ones that matter most.",
+        suggestions.join("\n  ")
+    )
+}
+
+/// Bytes per token for budget arithmetic.
+///
+/// `len/4` is the familiar rule of thumb, but measured against a real tokenizer
+/// on this tool's own output it under-counts by 5-23% — code and Markdown are
+/// denser than prose English. A cap that overshoots is not a cap, so budgets use
+/// a conservative divisor: better to under-fill than to blow the window.
+const BYTES_PER_TOKEN: usize = 3;
+
+/// Estimated tokens for rendered output.
+fn est_tokens(text: &str) -> usize {
+    text.len() / BYTES_PER_TOKEN
+}
+
+/// Most a budget-pruned map will spend on prose (Markdown) modules, as a share
+/// of its rendered size. Docs link to each other and earn genuine centrality, so
+/// without a ceiling they can take a third of a small orientation budget in a
+/// codebase map. Applies only when pruning is required — an unbudgeted map, and
+/// a budget met by detail reduction alone, are never rebalanced.
+const PROSE_BUDGET_SHARE: f64 = 0.10;
+
+/// The outcome of fitting a render to a token budget.
+struct Budgeted {
+    view: View,
+    text: String,
+    /// Whether the budget was actually met.
+    fit: bool,
+    /// Modules dropped to make it fit (0 when detail reduction sufficed).
+    omitted: usize,
+}
+
 /// Render `g` at the richest view at or below `start` whose output fits
-/// `max_tokens` (~len/4). Never truncates; if even skeleton is over budget it
-/// returns skeleton with `fit = false`. Returns (view_used, text, fit).
-fn render_budgeted(g: &Graph, start: View, format: Format, max_tokens: usize) -> (View, String, bool) {
+/// `max_tokens` (~len/4).
+///
+/// Detail is reduced first (full → interface → skeleton). If even skeleton is
+/// over budget, detail is exhausted and the only remaining lever is dropping
+/// modules, so the least-central ones are pruned until the map fits — the
+/// budget is a real cap, not a suggestion. Items within a kept module are never
+/// truncated: you get fewer modules, each still whole.
+///
+/// `fit = false` only when a single module already exceeds the budget.
+fn render_budgeted(g: &Graph, start: View, format: Format, max_tokens: usize) -> Budgeted {
     let ladder = [View::Full, View::Interface, View::Skeleton];
     let start_idx = ladder.iter().position(|&v| v == start).unwrap_or(0);
     let render = |v: View| -> String {
@@ -673,20 +1281,273 @@ fn render_budgeted(g: &Graph, start: View, format: Format, max_tokens: usize) ->
             Format::Json => serde_json::to_string_pretty(&gg).unwrap_or_default(),
         }
     };
-    let mut coarsest = (View::Skeleton, String::new());
     for &v in &ladder[start_idx..] {
         let text = render(v);
-        if text.len() / 4 <= max_tokens {
-            return (v, text, true);
+        if est_tokens(&text) <= max_tokens {
+            return Budgeted { view: v, text, fit: true, omitted: 0 };
         }
-        coarsest = (v, text);
     }
-    (coarsest.0, coarsest.1, false)
+
+    // Detail exhausted: prune modules. Skeleton is applied once up front so the
+    // search clones a much smaller graph on each probe.
+    let mut skel = g.clone();
+    view::apply(&mut skel, View::Skeleton);
+    let total = skel.modules.len();
+
+    // Largest `keep` that fits. Output grows monotonically with `keep`, so
+    // binary search costs ~log2(total) renders instead of a linear scan.
+    let (mut lo, mut hi) = (1usize, total);
+    let mut best: Option<(usize, String, usize)> = None;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let (text, omitted) = render_pruned(&skel, format, max_tokens, mid, total);
+        if est_tokens(&text) <= max_tokens {
+            best = Some((mid, text, omitted));
+            lo = mid + 1;
+        } else {
+            if mid == 1 {
+                // Even one module is over budget — emit it and say so.
+                return Budgeted { view: View::Skeleton, text, fit: false, omitted };
+            }
+            hi = mid - 1;
+        }
+    }
+
+    match best {
+        Some((_, text, omitted)) => Budgeted { view: View::Skeleton, text, fit: true, omitted },
+        // Unreachable in practice: mid == 1 returns above.
+        None => {
+            let (text, omitted) = render_pruned(&skel, format, max_tokens, 1, total);
+            Budgeted { view: View::Skeleton, text, fit: false, omitted }
+        }
+    }
+}
+
+/// Render a skeleton graph pruned to its `keep` most central modules, annotated
+/// with what was dropped so the omission is visible in the output itself.
+/// `skel` must already have the skeleton view applied.
+fn render_pruned(
+    skel: &Graph,
+    format: Format,
+    budget: usize,
+    keep: usize,
+    total: usize,
+) -> (String, usize) {
+    let mut gg = skel.clone();
+    // Scarce budget goes to code first: prose keeps its rank but not its space.
+    let stats = view::prune_to_central(&mut gg, keep, PROSE_BUDGET_SHARE);
+    let shown = gg.modules.len();
+    let omitted = stats.omitted;
+    let text = match format {
+        Format::Md => {
+            let mut s = render::markdown(&gg);
+            if omitted > 0 {
+                let prose_note = if stats.prose_capped > 0 {
+                    format!(
+                        "{} of the omitted modules are docs that were central enough to keep \
+                         but would have pushed prose past {}% of the map.\n",
+                        stats.prose_capped,
+                        (PROSE_BUDGET_SHARE * 100.0).round() as u32
+                    )
+                } else {
+                    String::new()
+                };
+                s.push_str(&format!(
+                    "\n---\n\
+                     {omitted} of {total} modules omitted: kept the {shown} most central, \
+                     targeting the {budget}-token budget.\n\
+                     {prose_note}\
+                     Dependency edges above may name an omitted module — that name is still \
+                     what to ask for.\n\
+                     Use `ctx subtree <module>` or `ctx context <symbol>` for anything not \
+                     listed; `ctx core` ranks the full set.\n"
+                ));
+            }
+            s
+        }
+        Format::Json => {
+            let mut v = serde_json::to_value(&gg).unwrap_or_default();
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("modules_shown".into(), serde_json::json!(shown));
+                obj.insert("modules_total".into(), serde_json::json!(total));
+                obj.insert("modules_omitted".into(), serde_json::json!(omitted));
+                obj.insert("pruned_to_budget".into(), serde_json::json!(budget));
+            }
+            serde_json::to_string_pretty(&v).unwrap_or_default()
+        }
+    };
+    (text, omitted)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_range;
+    use super::{parse_range, render_budgeted, snippet_for, Format, View};
+    use crate::extract::build_graph;
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// A repo with enough modules that a small budget cannot be met by detail
+    /// reduction alone, forcing the pruning rung.
+    ///
+    /// Classes, not functions: skeleton view drops bare `def`s, so a repo of
+    /// plain functions collapses to almost nothing and never needs pruning.
+    fn wide_repo() -> std::path::PathBuf {
+        // Unique per call: these tests run in parallel and each removes its dir,
+        // so a shared path would have them deleting each other's fixture.
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ctx_budget_{}_{}", std::process::id(), id));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..40 {
+            let body: String = (0..20)
+                .map(|j| {
+                    format!("class ClassWithADeliberatelyLongName_{i}_{j}:\n    pass\n\n")
+                })
+                .collect();
+            fs::write(dir.join(format!("mod_{i}.py")), body).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn budget_is_a_hard_cap_once_detail_is_exhausted() {
+        let dir = wide_repo();
+        let g = build_graph(&dir).unwrap();
+        let total = g.modules.len();
+        let budget = 2_000;
+        let b = render_budgeted(&g, View::Full, Format::Md, budget);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(b.fit, "a 2000-token budget should be satisfiable by pruning");
+        assert!(
+            b.text.len() / 4 <= budget,
+            "emitted ~{} tok exceeds the {budget} tok budget",
+            b.text.len() / 4
+        );
+        assert!(b.omitted > 0, "pruning should have dropped modules");
+        assert!(b.omitted < total, "pruning should not drop everything");
+        assert!(
+            b.text.contains("modules omitted"),
+            "a pruned map must disclose the omission in its output"
+        );
+    }
+
+    /// The prose cap must never touch an unbudgeted map — that path is what
+    /// writes a committed CODEBASE_MAP.md, which has to stay complete.
+    #[test]
+    fn unbudgeted_map_keeps_every_doc() {
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ctx_docs_{}_{}", std::process::id(), id));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("code.py"), "class Solo:\n    pass\n").unwrap();
+        for i in 0..6 {
+            let body: String = (0..30)
+                .map(|j| format!("## Section {i}_{j} with a reasonably long heading\n\n"))
+                .collect();
+            fs::write(dir.join(format!("doc_{i}.md")), format!("# D{i}\n\n{body}")).unwrap();
+        }
+        let mut g = build_graph(&dir).unwrap();
+        let total = g.modules.len();
+        // The no-budget path: apply the view and render, no pruning of any kind.
+        crate::view::apply(&mut g, View::Full);
+        let text = crate::render::markdown(&g);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(g.modules.len(), total, "no module may be dropped");
+        for i in 0..6 {
+            assert!(
+                text.contains(&format!("doc_{i}")),
+                "doc_{i} must survive an unbudgeted render"
+            );
+        }
+    }
+
+    #[test]
+    fn generous_budget_prunes_nothing() {
+        let dir = wide_repo();
+        let g = build_graph(&dir).unwrap();
+        let b = render_budgeted(&g, View::Full, Format::Md, 10_000_000);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(b.fit);
+        assert_eq!(b.omitted, 0, "nothing should be dropped when everything fits");
+        assert!(!b.text.contains("modules omitted"));
+    }
+
+    #[test]
+    fn unmeetable_budget_reports_no_fit_without_hanging() {
+        let dir = wide_repo();
+        let g = build_graph(&dir).unwrap();
+        // Not satisfiable: a single module already exceeds one token.
+        let b = render_budgeted(&g, View::Full, Format::Md, 1);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(!b.fit, "an unmeetable budget must report fit = false");
+        assert!(!b.text.is_empty(), "something usable should still be emitted");
+    }
+
+    #[test]
+    fn budget_render_is_deterministic() {
+        let dir = wide_repo();
+        let g = build_graph(&dir).unwrap();
+        let a = render_budgeted(&g, View::Full, Format::Md, 2_000);
+        let b = render_budgeted(&g, View::Full, Format::Md, 2_000);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(a.text, b.text, "same graph and budget must render identically");
+        assert_eq!(a.omitted, b.omitted);
+    }
+
+    #[test]
+    fn snippet_is_measured_and_scales_its_advice() {
+        // Small repo: reading the whole map is fine, and the block must not
+        // manufacture a low-resolution warning out of a repo with no call sites.
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ctx_snip_{}_{}", std::process::id(), id));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.py"), "class One:\n    pass\n").unwrap();
+        let g = build_graph(&dir).unwrap();
+        let small = snippet_for(&g);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(small.contains("<!-- ctx:begin"), "must be delimited for in-place regen");
+        assert!(small.contains("<!-- ctx:end -->"));
+        assert!(small.contains("1 modules") || small.contains("1 module"));
+        assert!(
+            small.contains("small enough to read directly"),
+            "a tiny repo should not be told to budget: {small}"
+        );
+        assert!(
+            !small.contains("calibrate with"),
+            "no call sites means no resolution verdict to give: {small}"
+        );
+        assert!(
+            small.contains("INCOMPLETE") && small.contains("NOT INDEXED"),
+            "the callers caveat is safety-critical and must always be present"
+        );
+    }
+
+    #[test]
+    fn snippet_warns_when_an_unbudgeted_map_is_expensive() {
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ctx_snipbig_{}_{}", std::process::id(), id));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..40 {
+            let body: String = (0..25)
+                .map(|j| format!("class ClassWithAQuiteLongName_{i}_{j}:\n    pass\n\n"))
+                .collect();
+            fs::write(dir.join(format!("m_{i}.py")), body).unwrap();
+        }
+        let g = build_graph(&dir).unwrap();
+        let big = snippet_for(&g);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            big.contains("Never run an unbudgeted map here"),
+            "an expensive map must be called out: {big}"
+        );
+        assert!(big.contains("--max-tokens"), "{big}");
+    }
 
     #[test]
     fn parse_range_forms() {

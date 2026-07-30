@@ -208,6 +208,76 @@ fn collect_callers(
     }
 }
 
+/// How many definitions the graph holds for this query.
+///
+/// This is the number that decides whether reverse-edge resolution could have
+/// been ambiguous: a method name with several definitions cannot be attributed
+/// from an opaque receiver, so those call sites are dropped rather than guessed.
+/// `callers` reports it, because "1 caller" is a very different claim when the
+/// graph knows the name three times over.
+fn definition_count(g: &Graph, q: &[&str]) -> usize {
+    let Some(&last) = q.last() else { return 0 };
+    // Deliberately ignores any qualifier. Ambiguity is a property of the NAME as
+    // written at the call site: `x.run()` cannot be pinned to `A::run` or
+    // `B::run` no matter how the query is spelled, so counting only `A::run`
+    // would silence the warning exactly when a user follows the documented
+    // advice to qualify.
+    let mut hits = Vec::new();
+    for m in &g.modules {
+        collect_defs(&m.items, m, None, last, None, &mut hits);
+    }
+    hits.len()
+}
+
+
+/// Kinds of every definition of this name (type-like or not).
+fn definition_kinds(g: &Graph, q: &[&str]) -> Vec<String> {
+    let Some(&last) = q.last() else { return Vec::new() };
+    let mut hits = Vec::new();
+    for m in &g.modules {
+        collect_defs(&m.items, m, None, last, None, &mut hits);
+    }
+    hits.into_iter().map(|h| h.kind).collect()
+}
+
+fn is_type_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "struct" | "enum" | "trait" | "interface" | "type" | "class"
+    )
+}
+
+/// Every item whose SIGNATURE mentions `type_name` — the reverse of the forward
+/// index `context` already builds.
+///
+/// A type has no call edges, so `callers SteerConfig` used to answer "no callers
+/// found" for a struct referenced by a dozen files. That reads as "safe to
+/// change" for the single most common breaking change there is: altering a type.
+/// Signatures are where a type change actually breaks callers — fields,
+/// parameters, return types — so scanning them is both cheap and the right scope.
+fn type_references<'a>(g: &'a Graph, type_name: &str) -> Vec<(&'a Module, &'a Item)> {
+    fn walk<'a>(
+        items: &'a [Item],
+        m: &'a Module,
+        type_name: &str,
+        out: &mut Vec<(&'a Module, &'a Item)>,
+    ) {
+        for it in items {
+            // Skip the definition itself.
+            let is_self = it.name.as_deref() == Some(type_name) && is_type_kind(&it.kind);
+            if !is_self && identifiers(&it.signature).iter().any(|n| n == type_name) {
+                out.push((m, it));
+            }
+            walk(&it.children, m, type_name, out);
+        }
+    }
+    let mut out = Vec::new();
+    for m in &g.modules {
+        walk(&m.items, m, type_name, &mut out);
+    }
+    out
+}
+
 pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
     let q = segments(query);
     if q.is_empty() {
@@ -219,6 +289,26 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
         collect_callers(&m.items, m, &mut path, &q, &mut found);
     }
     found.sort_by(|a, b| (&a.qualname, a.line).cmp(&(&b.qualname, b.line)));
+
+    // Reverse edges exist only for calls that resolved, so `callers` must never
+    // present its count as an answer without the known loss channels alongside
+    // it. Two are knowable from here.
+    let defs = definition_count(g, &q);
+    let bare_name = q.last().copied().unwrap_or(query);
+    let ambiguous = defs > 1;
+    // A suppressed ubiquitous name (`get`, `open`, `push`, ...) has NO reverse
+    // edges at all, by design — including for a project-defined method that
+    // merely shares the name. An empty result there is silence, not absence.
+    let suppressed = crate::extract::is_suppressed_method_name(bare_name);
+    let lower_bound = ambiguous || suppressed;
+    // A type is never "called", so call edges alone answer the wrong question.
+    let kinds = definition_kinds(g, &q);
+    let is_type = !kinds.is_empty() && kinds.iter().all(|k| is_type_kind(k));
+    let refs = if is_type {
+        type_references(g, bare_name)
+    } else {
+        Vec::new()
+    };
 
     if json_out {
         let arr: Vec<_> = found
@@ -232,16 +322,84 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
                 })
             })
             .collect();
-        return serde_json::to_string_pretty(&json!({ "query": query, "callers": arr }))
-            .unwrap_or_default()
+        return serde_json::to_string_pretty(&json!({
+            "query": query,
+            "callers": arr,
+            "definitions": defs,
+            // Never claim completeness: resolution can drop a call site for
+            // reasons not visible from here (module-level calls, function-local
+            // imports). These flag the two knowable causes; absent flags mean
+            // "no known reason to distrust this", not "guaranteed complete".
+            "lower_bound": lower_bound,
+            "ambiguous_name": ambiguous,
+            "suppressed_common_name": suppressed,
+            "references": refs
+                .iter()
+                .map(|(m, it)| json!({
+                    "module": m.name,
+                    "file": m.file,
+                    "line": it.line,
+                    "kind": it.kind,
+                    "signature": it.signature,
+                }))
+                .collect::<Vec<_>>(),
+        }))
+        .unwrap_or_default()
             + "\n";
     }
 
+    // Spelled out the same way whether or not anything was found: the risk of
+    // acting on an incomplete blast radius does not depend on the count.
+    let recall_note = if suppressed {
+        format!(
+            "\nNOT INDEXED: '{bare_name}' is on the suppressed list of ubiquitous method names, \
+             so ctx indexes NO reverse edges for it — including for a project-defined method of \
+             that name. The result above carries no information about whether callers exist.\n\
+             Use grep for this one:  rg -n '\\b{bare_name}\\s*\\('\n"
+        )
+    } else if ambiguous {
+        format!(
+            "\nINCOMPLETE: '{bare_name}' has {defs} definitions in this graph. Calls through a \
+             receiver that cannot be pinned to one of them are dropped, never guessed, so the \
+             list above is a LOWER BOUND.\n\
+             Before changing this signature, confirm with:  rg -n '\\b{bare_name}\\s*\\('\n"
+        )
+    } else {
+        String::new()
+    };
+
+    if !refs.is_empty() {
+        let mut out = format!(
+            "'{query}' is a type, so it has no call edges. {} item(s) reference it \
+             in a signature — these are what a change to it can break:\n\n",
+            refs.len()
+        );
+        for (m, it) in &refs {
+            out.push_str(&format!(
+                "{}  ({}:{})\n    {}\n",
+                m.name, m.file, it.line, it.signature
+            ));
+        }
+        if !found.is_empty() {
+            out.push_str(&format!("\nplus {} resolved call edge(s).\n", found.len()));
+        }
+        out.push_str(
+            "\nSignature references only: uses inside function BODIES are not indexed.\n",
+        );
+        return out + &recall_note;
+    }
+
     if found.is_empty() {
+        let type_note = if is_type {
+            "\n(this name is a type: types have no call edges, and nothing references it \
+             in a signature)\n"
+        } else {
+            ""
+        };
         return format!(
             "no callers found for '{query}'\n\
              (only resolved call edges are indexed; ambiguous calls and \
-             ubiquitous std-named methods are intentionally dropped)\n"
+             ubiquitous std-named methods are intentionally dropped)\n{type_note}{recall_note}"
         );
     }
     let mut out = format!("{} caller(s) of '{}':\n\n", found.len(), query);
@@ -268,6 +426,7 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
     if found.iter().any(|c| c.edges.iter().any(|e| e.heuristic)) {
         out.push_str("\n(~ = heuristic edge: attributed by receiver inference, not import/path)\n");
     }
+    out.push_str(&recall_note);
     out
 }
 
@@ -545,60 +704,18 @@ fn append_capped(out: &mut String, lines: impl Iterator<Item = String>, cap: usi
     }
 }
 
-/// A module plus its immediate upstream/downstream neighbors, rendered.
-/// Shared by the CLI `subtree` command and the MCP server.
-pub fn subtree(g: &Graph, module: &str, json_out: bool) -> String {
-    let targets: Vec<&Module> = g
-        .modules
-        .iter()
-        .filter(|m| {
-            m.name == module
-                || m.name.ends_with(&format!("::{module}"))
-                || m.name.ends_with(&format!(".{module}"))
-        })
-        .collect();
-    if targets.is_empty() {
-        return format!("no module matching '{module}'\n");
-    }
-    let target_names: BTreeSet<&str> = targets.iter().map(|m| m.name.as_str()).collect();
-    let (upstream, downstream) = neighbors(g, &target_names);
-    if json_out {
-        serde_json::to_string_pretty(&json!({
-            "query": module,
-            "target": targets,
-            "upstream": upstream,
-            "downstream": downstream,
-        }))
-        .unwrap_or_default()
-            + "\n"
-    } else {
-        crate::render::subtree_md(module, &targets, &upstream, &downstream)
-    }
-}
-
 // ---- core (centrality) -----------------------------------------------------
 
-/// Rank modules by dependency centrality — PageRank over the module graph
-/// (edge `m -> d` for each dep `d` of `m`), so heavily-depended-upon modules
-/// score highest. Deterministic: fixed damping and iteration count.
-pub fn core(
-    g: &Graph,
-    limit: usize,
-    churn: Option<&HashMap<String, usize>>,
-    json_out: bool,
-) -> String {
-    let n = g.modules.len();
-    if n == 0 {
-        return "no modules\n".to_string();
-    }
+/// Out-edges as module indices: `m -> d` for each dep `d` of `m` that resolves
+/// to a module in this graph.
+fn out_edges(g: &Graph) -> Vec<Vec<usize>> {
     let index: HashMap<&str, usize> = g
         .modules
         .iter()
         .enumerate()
         .map(|(i, m)| (m.name.as_str(), i))
         .collect();
-    let out: Vec<Vec<usize>> = g
-        .modules
+    g.modules
         .iter()
         .map(|m| {
             m.deps
@@ -606,7 +723,21 @@ pub fn core(
                 .filter_map(|d| index.get(d.as_str()).copied())
                 .collect()
         })
-        .collect();
+        .collect()
+}
+
+/// PageRank over the module graph (edge `m -> d` for each dep `d` of `m`), so
+/// heavily-depended-upon modules score highest. Deterministic: fixed damping
+/// and iteration count, so the same graph always yields the same ranks.
+///
+/// Shared by `core` and by budget-driven pruning, so "central" means the same
+/// thing whether you are ranking modules or deciding which to drop.
+pub fn pagerank(g: &Graph) -> Vec<f64> {
+    let n = g.modules.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let out = out_edges(g);
     let outdeg: Vec<usize> = out.iter().map(Vec::len).collect();
 
     let damping = 0.85;
@@ -625,6 +756,45 @@ pub fn core(
         }
         rank = next;
     }
+    rank
+}
+
+/// Module indices ordered most- to least-central.
+///
+/// Modules with no resolved dependency edges all sit at the same PageRank
+/// baseline, and on a large repo that tie group is most of the tree. Breaking
+/// those ties by name alone would fill a budget with whatever sorts first, so
+/// code outranks prose within a tie: a Markdown heading map is orientation, but
+/// a `CHANGELOG` should not displace a module something actually imports.
+/// Ties then fall back to name, keeping the order stable across runs.
+pub fn centrality_order(g: &Graph) -> Vec<usize> {
+    let rank = pagerank(g);
+    let is_code = |i: usize| g.modules[i].lang != Lang::Markdown;
+    let mut order: Vec<usize> = (0..g.modules.len()).collect();
+    order.sort_by(|&a, &b| {
+        rank[b]
+            .partial_cmp(&rank[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(is_code(b).cmp(&is_code(a)))
+            .then(g.modules[a].name.cmp(&g.modules[b].name))
+    });
+    order
+}
+
+/// Rank modules by dependency centrality, optionally weighted by git churn.
+pub fn core(
+    g: &Graph,
+    limit: usize,
+    churn: Option<&HashMap<String, usize>>,
+    json_out: bool,
+) -> String {
+    let n = g.modules.len();
+    if n == 0 {
+        return "no modules\n".to_string();
+    }
+    let out = out_edges(g);
+    let outdeg: Vec<usize> = out.iter().map(Vec::len).collect();
+    let rank = pagerank(g);
 
     let mut indeg = vec![0usize; n];
     for edges in &out {
@@ -781,6 +951,14 @@ pub fn coverage_report(g: &Graph, unsupported: &[(String, usize)], json_out: boo
     }
 
     let mut out = format!("# ctx coverage report — {}\n\n", g.root);
+    // This report exists to be honest about scope; a filter that removed part of
+    // the tree must be stated, or "no blind spots" means nothing.
+    if let Some(f) = crate::extract::filter_note() {
+        out.push_str(&format!(
+            "SCOPE: FILTERED ({f}). Files outside this filter were never scanned and are \
+             NOT counted as blind spots below. Re-run without filters for whole-repo coverage.\n\n"
+        ));
+    }
     let langs: Vec<String> = by_lang.iter().map(|(l, n)| format!("{l} {n}")).collect();
     out.push_str(&format!(
         "Modules: {}  ({})\n\n",
@@ -946,7 +1124,23 @@ fn fmt_callers(names: &[String]) -> String {
 /// signature-changed public items are (potentially) breaking; each is listed
 /// with the callers it affects (removed → who used it in `base`; changed →
 /// who uses it in `current`).
-pub fn api_report(base: &Graph, current: &Graph, label: &str, json_out: bool) -> String {
+/// Public-API diff. Returns the rendered report, the count of **removed** items,
+/// and the count of **signature-changed** items.
+///
+/// The two are separate because only one of them is unambiguous. A removal always
+/// breaks callers. A signature change might be adding an optional parameter or a
+/// struct field — routine and compatible — and ctx has no type system, so it
+/// cannot tell that from changing a parameter's type. Collapsing both into one
+/// "breaking" number makes a CI gate fail on ordinary additive commits, and a
+/// gate that cries wolf gets switched off, which is worse than no gate.
+///
+/// Counts are returned rather than left for callers to parse out of the prose.
+pub fn api_report(
+    base: &Graph,
+    current: &Graph,
+    label: &str,
+    json_out: bool,
+) -> (String, usize, usize) {
     let bs = public_surface(base);
     let cs = public_surface(current);
 
@@ -962,18 +1156,18 @@ pub fn api_report(base: &Graph, current: &Graph, label: &str, json_out: bool) ->
     let added: Vec<(&String, &Surface)> = cs.iter().filter(|(q, _)| !bs.contains_key(*q)).collect();
 
     if json_out {
-        return serde_json::to_string_pretty(&json!({
+        return (serde_json::to_string_pretty(&json!({
             "since": label,
             "removed": removed.iter().map(|(q, b)| json!({"name": q, "kind": b.kind, "signature": b.signature, "callers": caller_names(base, &b.match_q)})).collect::<Vec<_>>(),
             "changed": changed.iter().map(|(q, b, c)| json!({"name": q, "kind": c.kind, "was": b.signature, "now": c.signature, "callers": caller_names(current, &c.match_q)})).collect::<Vec<_>>(),
             "added": added.iter().map(|(q, c)| json!({"name": q, "kind": c.kind, "signature": c.signature})).collect::<Vec<_>>(),
         }))
         .unwrap_or_default()
-            + "\n";
+            + "\n", removed.len(), changed.len());
     }
 
     if removed.is_empty() && changed.is_empty() && added.is_empty() {
-        return format!("no public API changes vs {label}\n");
+        return (format!("no public API changes vs {label}\n"), 0, 0);
     }
 
     let mut out = format!("# API changes vs {label}\n");
@@ -1007,7 +1201,7 @@ pub fn api_report(base: &Graph, current: &Graph, label: &str, json_out: bool) ->
             out.push_str(&format!("- {q}  [{}]  {}\n", c.kind, c.signature));
         }
     }
-    out
+    (out, removed.len(), changed.len())
 }
 
 #[cfg(test)]
@@ -1033,6 +1227,280 @@ mod tests {
         }
         let g = build_graph(&dir).unwrap();
         (g, dir)
+    }
+
+    #[test]
+    fn centrality_ranks_depended_upon_modules_first() {
+        // b and c both import a; a imports nothing. a is the most depended-upon.
+        let (g, dir) = graph(&[
+            ("a.py", "def core():\n    pass\n"),
+            ("b.py", "from a import core\n\ndef useb():\n    core()\n"),
+            ("c.py", "from a import core\n\ndef usec():\n    core()\n"),
+        ]);
+        let order = centrality_order(&g);
+        let top = g.modules[order[0]].name.clone();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(top, "a", "most depended-upon module should rank first");
+    }
+
+    #[test]
+    fn centrality_prefers_code_over_prose_on_ties() {
+        // Neither has dependency edges, so both sit at the PageRank baseline and
+        // the tie-break decides. Name order alone would put the doc first.
+        let (g, dir) = graph(&[
+            ("aaa_doc.md", "# Doc\n\n## A section\n"),
+            ("zzz_code.py", "def solo():\n    pass\n"),
+        ]);
+        let order = centrality_order(&g);
+        let first = g.modules[order[0]].name.clone();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(first, "zzz_code", "code should outrank prose at equal rank");
+    }
+
+    #[test]
+    fn prune_keeps_the_most_central_and_counts_the_rest() {
+        let (mut g, dir) = graph(&[
+            ("a.py", "def core():\n    pass\n"),
+            ("b.py", "from a import core\n\ndef useb():\n    core()\n"),
+            ("c.py", "from a import core\n\ndef usec():\n    core()\n"),
+        ]);
+        let total = g.modules.len();
+        let stats = crate::view::prune_to_central(&mut g, 1, 0.10);
+        let kept: Vec<String> = g.modules.iter().map(|m| m.name.clone()).collect();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(stats.omitted, total - 1);
+        assert_eq!(kept, ["a"], "the single kept module should be the central one");
+    }
+
+    /// A repo full of cross-linked docs and code that imports only external
+    /// packages: which side "wins" a naive ranking is luck, so a codebase map
+    /// must never come back as pure prose.
+    #[test]
+    fn pruned_map_always_retains_code_when_code_exists() {
+        let mut files: Vec<(String, String)> = Vec::new();
+        // Docs that link each other, so they earn real (non-baseline) PageRank.
+        let index: String = (0..12)
+            .map(|i| format!("- [Guide {i}](guide_{i}.md)\n"))
+            .collect();
+        files.push(("README.md".into(), format!("# Index\n\n{index}")));
+        for i in 0..12 {
+            let body: String = (0..30)
+                .map(|j| format!("## Guide {i} section {j} with a long heading\n\n"))
+                .collect();
+            files.push((
+                format!("guide_{i}.md"),
+                format!("# Guide {i}\n\n{body}\nSee [index](README.md)\n"),
+            ));
+        }
+        for i in 0..6 {
+            files.push((
+                format!("mod_{i}.py"),
+                "import os, json\n\nclass Worker:\n    def run(self):\n        pass\n".into(),
+            ));
+        }
+        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let (mut g, dir) = graph(&refs);
+
+        // Every nontrivial keep count must retain at least one code module.
+        for keep in [1usize, 2, 5, 10] {
+            let mut gg = g.clone();
+            crate::view::prune_to_central(&mut gg, keep, 0.10);
+            let code = gg.modules.iter().filter(|m| m.lang != Lang::Markdown).count();
+            assert!(
+                code > 0,
+                "keep={keep} produced a map with no code modules at all"
+            );
+        }
+        let stats = crate::view::prune_to_central(&mut g, 4, 0.10);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(stats.omitted > 0);
+    }
+
+    #[test]
+    fn prose_is_held_to_its_share_of_a_pruned_map() {
+        // One small code module against several large docs: uncapped, prose would
+        // dominate the map.
+        let mut files: Vec<(String, String)> = vec![(
+            "code.py".to_string(),
+            "class TheOnlyClassHere:\n    pass\n".to_string(),
+        )];
+        for i in 0..8 {
+            let body: String = (0..30)
+                .map(|j| format!("## Heading number {i}_{j} with a fairly long title\n\n"))
+                .collect();
+            files.push((format!("doc_{i}.md"), format!("# Doc {i}\n\n{body}")));
+        }
+        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let (mut g, dir) = graph(&refs);
+        // keep must be < module count, or pruning is not required and the
+        // ceiling deliberately does not engage.
+        let stats = crate::view::prune_to_central(&mut g, 8, 0.10);
+        let prose_left = g.modules.iter().filter(|m| m.lang == Lang::Markdown).count();
+        let code_left = g.modules.iter().filter(|m| m.lang != Lang::Markdown).count();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(stats.prose_capped > 0, "oversized prose should be capped");
+        assert_eq!(code_left, 1, "code must survive the prose ceiling");
+        assert!(prose_left < 8, "some docs should have been dropped");
+    }
+
+    #[test]
+    fn docs_only_repo_is_exempt_from_the_prose_ceiling() {
+        // No code to balance against: emptying the map would be worse than an
+        // unbalanced one.
+        let (mut g, dir) = graph(&[
+            ("a.md", "# A\n\n## One\n\n## Two\n"),
+            ("b.md", "# B\n\n## Three\n"),
+        ]);
+        let stats = crate::view::prune_to_central(&mut g, 2, 0.10);
+        let left = g.modules.len();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(stats.prose_capped, 0, "a docs-only repo keeps its docs");
+        assert_eq!(left, 2);
+    }
+
+    #[test]
+    fn small_docs_survive_alongside_dominant_code() {
+        // The allowance is 10% of the *code* size, so code has to genuinely
+        // dominate for a doc to fit.
+        let big: String = (0..60)
+            .map(|j| format!("class ClassWithAGenerouslyLongName_{j}:\n    pass\n\n"))
+            .collect();
+        let (mut g, dir) = graph(&[("code.py", big.as_str()), ("tiny.md", "# T\n")]);
+        let stats = crate::view::prune_to_central(&mut g, 2, 0.10);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(stats.prose_capped, 0, "a doc well under 10% must be kept");
+        assert_eq!(g.modules.len(), 2);
+    }
+
+    #[test]
+    fn prune_is_a_noop_when_keep_covers_everything() {
+        let (mut g, dir) = graph(&[("a.py", "def f():\n    pass\n")]);
+        let before = g.modules.len();
+        let stats = crate::view::prune_to_central(&mut g, before + 10, 0.10);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(stats.omitted, 0);
+        assert_eq!(g.modules.len(), before);
+    }
+
+    #[test]
+    fn callers_discloses_ambiguity_and_stays_quiet_otherwise() {
+        // Two `run` methods: an opaque receiver cannot be pinned to either, so
+        // edges are dropped and the count is a lower bound the caller must know
+        // about. `solo` has one definition, so no warning belongs on it.
+        let (g, dir) = graph(&[(
+            "a.py",
+            "class A:\n    def run(self):\n        pass\n\n\nclass B:\n    def run(self):\n        pass\n\n\ndef solo():\n    pass\n",
+        )]);
+        let ambiguous = callers(&g, "run", false);
+        let unique = callers(&g, "solo", false);
+        let json = callers(&g, "run", true);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(ambiguous.contains("INCOMPLETE"), "ambiguity must be disclosed");
+        assert!(ambiguous.contains("2 definitions"));
+        assert!(ambiguous.contains("rg -n"), "must offer the confirming command");
+        assert!(
+            !unique.contains("INCOMPLETE"),
+            "a uniquely-named symbol must not raise a false alarm"
+        );
+        // Qualifying the query must not silence the warning: ambiguity is a
+        // property of the name at the call site, not of how it was spelled.
+        let qualified = callers(&g, "A::run", false);
+        assert!(
+            qualified.contains("INCOMPLETE"),
+            "qualifying must not hide the ambiguity"
+        );
+        assert!(json.contains("\"lower_bound\": true"), "machine callers need the flag");
+    }
+
+    #[test]
+    fn suppressed_common_names_say_they_are_not_indexed() {
+        // `open` is on the suppressed ubiquitous-method list, so NO reverse edges
+        // exist for it — an empty result must not read as "no callers".
+        let (g, dir) = graph(&[(
+            "m.py",
+            "class Clock:\n    def open(self):\n        pass\n\n\ndef driver(c):\n    c.open()\n",
+        )]);
+        let text = callers(&g, "open", false);
+        let json = callers(&g, "open", true);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(text.contains("NOT INDEXED"), "suppression must be disclosed: {text}");
+        assert!(json.contains("\"suppressed_common_name\": true"));
+        assert!(json.contains("\"lower_bound\": true"));
+        assert!(!json.contains("\"complete\": true"), "must never claim completeness");
+    }
+
+    #[test]
+    fn cross_language_method_names_do_not_create_edges() {
+        // A Python call to `apply_template` must not be attributed to a Rust
+        // method of the same name — that invents a Python -> Rust dependency.
+            let (g, dir) = graph(&[
+            (
+                "user.py",
+                "import os\n\ndef go(tok):\n    tok.apply_template('x')\n",
+            ),
+            (
+                "src/engine.rs",
+                "pub struct Engine;\nimpl Engine {\n    pub fn apply_template(&self, s: &str) {}\n}\n",
+            ),
+        ]);
+        let text = callers(&g, "apply_template", false);
+        let py = g.modules.iter().find(|m| m.name == "user").unwrap();
+        let deps = py.deps.clone();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            deps.is_empty(),
+            "a Python module must not gain a Rust dep from a shared method name: {deps:?}"
+        );
+        assert!(
+            !text.contains("user.go"),
+            "the Python call must not be reported as a caller of the Rust method: {text}"
+        );
+    }
+
+    #[test]
+    fn module_level_calls_are_attributed_to_the_module() {
+        // Top-level code is invisible if only function bodies are scanned, which
+        // silently loses callers in scripts, tests and __init__ wiring.
+        let (g, dir) = graph(&[
+            ("lib.py", "def frequencies(x):\n    return x\n"),
+            ("top.py", "from lib import frequencies\n\nFR = frequencies(3)\n"),
+        ]);
+        let text = callers(&g, "frequencies", false);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            text.contains("top"),
+            "a module-level call must be reported: {text}"
+        );
+    }
+
+    #[test]
+    fn type_queries_report_signature_references() {
+        // A type has no call edges; "no callers found" reads as "safe to change"
+        // for the most common breaking change there is.
+        let (g, dir) = graph(&[
+            ("a.py", "class Config:\n    pass\n"),
+            ("b.py", "from a import Config\n\ndef build(c: Config) -> Config:\n    return c\n"),
+        ]);
+        let text = callers(&g, "Config", false);
+        let json = callers(&g, "Config", true);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(text.contains("is a type"), "type queries need the type path: {text}");
+        assert!(text.contains("build"), "the referencing signature must be listed");
+        assert!(json.contains("\"references\""));
+    }
+
+    #[test]
+    fn colliding_module_names_are_made_unique() {
+        // `foo.py` and `foo.ts` both want to be module `foo`; indexing by name
+        // used to make one unreachable, silently dropping its reverse edges.
+        let (g, dir) = graph(&[
+            ("foo.py", "def build_model():\n    pass\n"),
+            ("foo.ts", "export function buildModel() {}\n"),
+        ]);
+        let names: Vec<&str> = g.modules.iter().map(|m| m.name.as_str()).collect();
+        let unique: BTreeSet<&&str> = names.iter().collect();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(names.len(), unique.len(), "module names must be unique: {names:?}");
     }
 
     #[test]
@@ -1213,11 +1681,16 @@ mod tests {
             "src/api.rs",
             "pub fn stable() {}\npub fn morph(a: i32, b: i32) {}\npub fn fresh() {}\n",
         )]);
-        let out = api_report(&base.0, &cur.0, "HEAD", false);
+        let (out, removed_n, changed_n) = api_report(&base.0, &cur.0, "HEAD", false);
         assert!(out.contains("## Removed") && out.contains("api::gone"), "{out}");
         assert!(out.contains("## Changed") && out.contains("api::morph"), "{out}");
         assert!(out.contains("## Added") && out.contains("api::fresh"), "{out}");
         assert!(!out.contains("stable"), "unchanged item must not appear:\n{out}");
+        // Counted separately on purpose: a removal always breaks callers, while a
+        // signature change may be an added optional parameter. Only the first is
+        // safe to gate CI on.
+        assert_eq!(removed_n, 1, "removals drive --strict");
+        assert_eq!(changed_n, 1, "signature changes are reported, not gated");
         let _ = fs::remove_dir_all(base.1);
         let _ = fs::remove_dir_all(cur.1);
     }

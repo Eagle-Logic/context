@@ -14,9 +14,52 @@ pub fn extract(src: &str) -> Result<FileFacts> {
 
     let mut facts = FileFacts::default();
     let mut items = Vec::new();
-    visit(tree.root_node(), src, &mut items, &mut facts);
+    let root = tree.root_node();
+    visit(root, src, &mut items, &mut facts);
+    if let Some(it) = module_level_item(root, src) {
+        items.insert(0, it);
+    }
     facts.items = items;
     Ok(facts)
+}
+
+/// Calls made at module level, as a synthetic unnamed item.
+///
+/// Only function bodies were scanned, so a call in top-level code — extremely
+/// common in scripts, test modules and `__init__.py` wiring — was invisible to
+/// `callers`. Being unnamed, it reports the module itself as the caller and
+/// never pollutes `def` lookups.
+fn module_level_item(root: Node, src: &str) -> Option<Item> {
+    let mut cursor = root.walk();
+    let mut raw_calls = Vec::new();
+    for child in root.named_children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "import_statement"
+                | "import_from_statement"
+                | "future_import_statement"
+                | "decorated_definition"
+                | "class_definition"
+                | "function_definition"
+        ) {
+            continue;
+        }
+        raw_calls.extend(collect_calls(child, src));
+    }
+    if raw_calls.is_empty() {
+        return None;
+    }
+    Some(Item {
+        kind: "def".to_string(),
+        signature: "<module level>".to_string(),
+        line: 1,
+        doc: None,
+        calls: Vec::new(),
+        children: Vec::new(),
+        arity: None,
+        name: None,
+        raw_calls,
+    })
 }
 
 fn visit(node: Node, src: &str, items: &mut Vec<Item>, facts: &mut FileFacts) {

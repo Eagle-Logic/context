@@ -169,6 +169,80 @@ fn walk(items: &[Item], container: Option<&str>, file: &str, out: &mut Vec<Membe
 /// callers can still hold and pass the flattened result.
 pub struct MemberView(Member);
 
+/// Infer `source container -> port container` renames from member-set overlap.
+///
+/// Container is part of every member key, so renaming a type invalidates all of
+/// its members at once: a faithful port that renamed `TriStateRouter` to
+/// `IntentGate` reported 22 members "missing" and 100 "added", which is a report
+/// nobody can act on. Renaming the main type is the normal case in a port, not an
+/// edge case.
+///
+/// The evidence is already present — those members match on name and role and
+/// differ only in container — so no new parsing is needed: pair up containers by
+/// how many members they share, take the strongest unambiguous pairings, and key
+/// through them. Inference is reported, never silent, because a wrong pairing
+/// would otherwise masquerade as a clean parity result.
+fn infer_container_aliases(
+    source: &[&Member],
+    target: &[&Member],
+    aliases: &AliasMap,
+) -> BTreeMap<String, String> {
+    // Members are keyed by every name they could legitimately carry in the port,
+    // so a systematic rename table (`__init__` -> `new`) counts toward the
+    // overlap. Without this, a port that renamed BOTH the type and its members
+    // shares almost no literal names and the pairing is never found — which is
+    // exactly the mechanical-port case this exists to serve.
+    let group = |ms: &[&Member], expand: bool| -> BTreeMap<String, BTreeSet<(String, Role)>> {
+        let mut g: BTreeMap<String, BTreeSet<(String, Role)>> = BTreeMap::new();
+        for m in ms {
+            if let Some(c) = &m.container {
+                let e = g.entry(canon(c)).or_default();
+                e.insert(m.nr());
+                if expand {
+                    if let Some(alts) = aliases.get(&m.name) {
+                        for a in alts {
+                            e.insert((a.clone(), m.role));
+                        }
+                    }
+                }
+            }
+        }
+        g
+    };
+    let src = group(source, true);
+    let tgt = group(target, false);
+
+    // Candidate pairings, strongest first. Require real evidence: at least two
+    // shared members, and a majority of the smaller container.
+    let mut cands: Vec<(usize, String, String)> = Vec::new();
+    for (sc, smem) in &src {
+        for (tc, tmem) in &tgt {
+            if sc == tc {
+                continue; // same container: nothing to alias
+            }
+            let overlap = smem.intersection(tmem).count();
+            let smaller = smem.len().min(tmem.len());
+            if overlap >= 2 && smaller > 0 && overlap * 2 >= smaller {
+                cands.push((overlap, sc.clone(), tc.clone()));
+            }
+        }
+    }
+    // Deterministic: strongest overlap wins, ties broken by name.
+    cands.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+
+    let mut out = BTreeMap::new();
+    let mut used_t: BTreeSet<String> = BTreeSet::new();
+    for (_, sc, tc) in cands {
+        // One-to-one only; a container that already paired is not reused.
+        if out.contains_key(&sc) || used_t.contains(&tc) {
+            continue;
+        }
+        used_t.insert(tc.clone());
+        out.insert(sc, tc);
+    }
+    out
+}
+
 /// Produce the parity report comparing a source member bag against the union
 /// of target member bags. Returns the rendered text and the count of members
 /// missing from the port (for `--strict`).
@@ -176,10 +250,18 @@ pub fn report(
     source: &[MemberView],
     target: &[MemberView],
     aliases: &AliasMap,
+    container_aliases: &BTreeMap<String, String>,
     json_out: bool,
 ) -> (String, usize) {
     let source: Vec<&Member> = source.iter().map(|m| &m.0).collect();
     let target: Vec<&Member> = target.iter().map(|m| &m.0).collect();
+
+    // Explicit `--alias Old=New` wins; anything left is inferred from overlap.
+    let mut containers: BTreeMap<String, String> = infer_container_aliases(&source, &target, aliases);
+    let inferred: BTreeMap<String, String> = containers.clone();
+    for (k, v) in container_aliases {
+        containers.insert(canon(k), canon(v));
+    }
 
     let t_by_key: BTreeMap<Key, &Member> = target.iter().map(|m| (m.key(), *m)).collect();
     let mut t_by_nr: BTreeMap<(String, Role), Vec<&Member>> = BTreeMap::new();
@@ -206,17 +288,64 @@ pub fn report(
     let mut aligned = 0usize;
 
     for s in &source {
-        // Resolve the target: exact key first, then any aliased key.
+        // Resolve the target by trying every legitimate spelling: the exact key,
+        // then the container rename, the member rename, and — the mechanical-port
+        // case — both at once. A port that renamed the type AND its members needs
+        // the combination; checking them separately finds neither.
         let mut resolved: Option<(&Member, Option<String>)> = None;
-        if let Some(t) = t_by_key.get(&s.key()) {
-            resolved = Some((t, None));
-        } else if let Some(alts) = aliases.get(&s.name) {
-            for alt in alts {
-                let mut k = s.key();
-                k.1 = alt.clone();
-                if let Some(t) = t_by_key.get(&k) {
-                    resolved = Some((t, Some(alt.clone())));
-                    break;
+        let aliased_container = s
+            .container
+            .as_deref()
+            .map(canon)
+            .and_then(|c| containers.get(&c).cloned());
+        // A renamed container is also a rename of the type member itself.
+        let name_alts: Vec<String> = {
+            let mut v = vec![s.name.clone()];
+            if let Some(alts) = aliases.get(&s.name) {
+                v.extend(alts.iter().cloned());
+            }
+            if s.container.is_none() {
+                if let Some(tc) = containers.get(&canon(&s.name)) {
+                    v.push(tc.clone());
+                }
+            }
+            v
+        };
+        'search: for (ci, container) in [s.key().0, aliased_container.clone()]
+            .into_iter()
+            .enumerate()
+        {
+            let Some(_) = container.as_ref().or(Some(&String::new())) else {
+                continue;
+            };
+            for (ni, name) in name_alts.iter().enumerate() {
+                // A type member has no container, so key on the candidate name;
+                // canon() is applied by the target index, so compare canonically.
+                let k: Key = (container.clone(), name.clone(), s.role);
+                let hit = t_by_key.get(&k).copied().or_else(|| {
+                    // The type-rename candidate is stored canonically.
+                    t_by_key
+                        .iter()
+                        .find(|((c, n, r), _)| {
+                            *c == container && *r == s.role && canon(n) == canon(name)
+                        })
+                        .map(|(_, m)| *m)
+                });
+                if let Some(t) = hit {
+                    let note = match (ci > 0, ni > 0) {
+                        (false, false) => None,
+                        (true, false) => Some(format!(
+                            "container {}",
+                            aliased_container.clone().unwrap_or_default()
+                        )),
+                        (false, true) => Some(name.clone()),
+                        (true, true) => Some(format!(
+                            "container {} + member {name}",
+                            aliased_container.clone().unwrap_or_default()
+                        )),
+                    };
+                    resolved = Some((t, note));
+                    break 'search;
                 }
             }
         }
@@ -349,6 +478,17 @@ pub fn report(
             ));
         }
     }
+    if !inferred.is_empty() {
+        o.push_str(&format!(
+            "\n## Inferred container renames ({})\n\
+             Paired by shared member sets, not by name — verify these before trusting the \
+             alignment above. Override with `--alias Old=New`.\n",
+            inferred.len()
+        ));
+        for (sc, tc) in &inferred {
+            o.push_str(&format!("  {sc}  →  {tc}\n"));
+        }
+    }
     if !ambiguous.is_empty() {
         o.push_str(&format!(
             "\n## Ambiguous ({}) — name matches, container differs (moved?)\n",
@@ -370,12 +510,10 @@ pub fn report(
         ));
         for (s, t, alt) in &via_alias {
             o.push_str(&format!(
-                "  {:<4} {}  →  {}   (via {} → {})\n",
+                "  {:<4} {}  →  {}   (via {alt})\n",
                 s.role.name(),
                 s.qual(),
-                t.qual(),
-                s.name,
-                alt
+                t.qual()
             ));
         }
     }
@@ -440,6 +578,38 @@ mod tests {
     }
 
     #[test]
+    fn a_renamed_container_is_inferred_from_shared_members() {
+        // The normal mechanical-port case: the type was renamed, so every member
+        // key is invalidated at once and an exact matcher reports total failure.
+        let py = members("a.py", "class TriStateRouter:\n    def route(self, p):\n        pass\n    def zone(self, s):\n        pass\n    def embed(self, t):\n        pass\n");
+        let rs = members("b.rs", "pub struct IntentGate;\nimpl IntentGate {\n    pub fn route(&self, p: &str) {}\n    pub fn zone(&self, s: f32) {}\n    pub fn embed(&self, t: &[String]) {}\n}\n");
+        let (out, missing) = report(&py, &rs, &AliasMap::new(), &BTreeMap::new(), false);
+        assert_eq!(missing, 0, "a pure container rename must not read as missing: {out}");
+        assert!(out.contains("Inferred container renames"), "must disclose: {out}");
+    }
+
+    #[test]
+    fn container_and_member_renames_combine() {
+        // Type renamed AND `__init__` -> `new`: neither alias alone finds it.
+        let py = members("a.py", "class TriStateRouter:\n    def __init__(self, a):\n        pass\n    def route(self, p):\n        pass\n    def zone(self, s):\n        pass\n");
+        let rs = members("b.rs", "pub struct IntentGate;\nimpl IntentGate {\n    pub fn new(a: u32) -> Self { IntentGate }\n    pub fn route(&self, p: &str) {}\n    pub fn zone(&self, s: f32) {}\n}\n");
+        let (out, missing) = report(&py, &rs, &py_rust_aliases(), &BTreeMap::new(), false);
+        assert_eq!(missing, 0, "combined rename must align: {out}");
+        assert!(out.contains("IntentGate.new"), "{out}");
+    }
+
+    #[test]
+    fn unrelated_containers_are_not_paired() {
+        // Guard against the inference inventing a rename: no shared members means
+        // no pairing, and the report must still say they are missing.
+        let py = members("a.py", "class Alpha:\n    def one(self):\n        pass\n    def two(self):\n        pass\n");
+        let rs = members("b.rs", "pub struct Beta;\nimpl Beta {\n    pub fn nine(&self) {}\n    pub fn ten(&self) {}\n}\n");
+        let (out, missing) = report(&py, &rs, &AliasMap::new(), &BTreeMap::new(), false);
+        assert!(missing > 0, "unrelated types must not be paired: {out}");
+        assert!(!out.contains("Inferred container renames"), "{out}");
+    }
+
+    #[test]
     fn canon_folds_naming_conventions() {
         assert_eq!(canon("computeGate"), "computegate");
         assert_eq!(canon("compute_gate"), "computegate");
@@ -457,7 +627,7 @@ mod tests {
             "gate.rs",
             "pub struct Gate;\nimpl Gate {\n    pub fn run(&self, x: i32) -> i32 { x }\n}\n",
         );
-        let (out, missing) = report(&py, &rs, &AliasMap::new(), false);
+        let (out, missing) = report(&py, &rs, &AliasMap::new(), &BTreeMap::new(), false);
         assert_eq!(missing, 0, "{out}");
         assert!(out.contains("aligned 2"), "{out}"); // Gate + Gate.run
     }
@@ -472,7 +642,7 @@ mod tests {
             "m.rs",
             "pub fn run(x: i32) -> i32 { x }\npub fn extra() {}\n",
         );
-        let (out, missing) = report(&py, &rs, &AliasMap::new(), false);
+        let (out, missing) = report(&py, &rs, &AliasMap::new(), &BTreeMap::new(), false);
         assert_eq!(missing, 1, "{out}"); // `gone` missing
         assert!(out.contains("Missing in port") && out.contains("gone"), "{out}");
         assert!(out.contains("Arity drift") && out.contains("run"), "{out}"); // 2 → 1
@@ -491,7 +661,7 @@ mod tests {
             "c.rs",
             "pub fn normalize(x: i32) -> i32 { x }\npub fn run(x: i32) -> i32 { x }\n",
         );
-        let (out, _) = report(&py, &rs, &AliasMap::new(), false);
+        let (out, _) = report(&py, &rs, &AliasMap::new(), &BTreeMap::new(), false);
         assert!(out.contains("Call drift") && out.contains("normalize"), "{out}");
     }
 
@@ -503,11 +673,11 @@ mod tests {
             "pub struct Gate;\nimpl Gate {\n    pub fn new(cfg: Cfg) -> Self { Gate }\n}\n",
         );
         // Without aliases, __init__ has no counterpart → missing.
-        let plain = report(&py, &rs, &AliasMap::new(), false);
+        let plain = report(&py, &rs, &AliasMap::new(), &BTreeMap::new(), false);
         assert_eq!(plain.1, 1, "{}", plain.0);
         assert!(plain.0.contains("__init__"), "{}", plain.0);
         // With the py→rust table, __init__ aligns to new and is shown as such.
-        let aliased = report(&py, &rs, &py_rust_aliases(), false);
+        let aliased = report(&py, &rs, &py_rust_aliases(), &BTreeMap::new(), false);
         assert_eq!(aliased.1, 0, "{}", aliased.0);
         assert!(aliased.0.contains("Aligned via alias"), "{}", aliased.0);
         assert!(!aliased.0.contains("## Added"), "new must not read as added:\n{}", aliased.0);
