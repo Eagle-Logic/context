@@ -82,8 +82,10 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
         /// Detail level: skeleton (architecture only), interface (public API),
-        /// full (private items + call edges)
-        #[arg(long, value_enum, default_value_t = View::Full)]
+        /// full (private items + call edges). Defaults to skeleton: an
+        /// unbudgeted `full` map is ~258k tokens on a large repo, and the
+        /// expensive view should be asked for, not stumbled into.
+        #[arg(long, value_enum, default_value_t = View::Skeleton)]
         view: View,
         /// Fit the output to a token budget: emit the richest view at or below
         /// `--view` whose ~token count fits, reporting the choice on stderr. If
@@ -177,6 +179,10 @@ enum Cmd {
         /// Report public-API changes (removed/changed signatures + who breaks)
         #[arg(long)]
         api: bool,
+        /// Fit the output to a token budget: sheds least-central neighbors.
+        /// Changed modules are always kept.
+        #[arg(long)]
+        max_tokens: Option<usize>,
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
         #[arg(long, value_enum, default_value_t = View::Full)]
@@ -192,6 +198,10 @@ enum Cmd {
         /// Report public-API changes between the refs (removed/changed + who breaks)
         #[arg(long)]
         api: bool,
+        /// Fit the output to a token budget: sheds least-central neighbors.
+        /// Changed modules are always kept.
+        #[arg(long)]
+        max_tokens: Option<usize>,
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
         #[arg(long, value_enum, default_value_t = View::Full)]
@@ -328,7 +338,10 @@ fn main() -> Result<()> {
                         b.view.name(),
                         est_tokens(&b.text),
                     );
-                    b.text
+                    // stdout is what a pipe, an `-o` file and an MCP caller see;
+                    // a verdict that only reaches stderr is a verdict nobody
+                    // downstream can act on.
+                    annotate_budget(b.text, b.view, budget, b.fit, format)
                 }
                 None => {
                     view::apply(&mut g, view);
@@ -438,6 +451,7 @@ fn main() -> Result<()> {
             path,
             since,
             api,
+            max_tokens: _,
             format,
             view: _,
         } if api => {
@@ -465,6 +479,7 @@ fn main() -> Result<()> {
             path,
             since,
             api: _,
+            max_tokens,
             format,
             view,
         } => {
@@ -497,29 +512,21 @@ fn main() -> Result<()> {
             }
             let target_names: BTreeSet<&str> = targets.iter().map(|m| m.name.as_str()).collect();
             let (upstream, downstream) = query::neighbors(&g, &target_names);
-            match format {
-                Format::Md => print!(
-                    "{}",
-                    render::changed_md(label, &targets, &upstream, &downstream)
-                ),
-                Format::Json => {
-                    let json = serde_json::json!({
-                        "since": label,
-                        "changed": targets,
-                        "upstream": upstream,
-                        "downstream": downstream,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&json)?);
-                }
-            }
+            print!(
+                "{}",
+                impact_text(
+                    &g, label, &targets, &upstream, &downstream, format, max_tokens
+                )
+            );
         }
         Cmd::Diff {
             range,
             path,
             api,
+            max_tokens,
             format,
             view,
-        } => run_diff(&range, &path, api, format, view)?,
+        } => run_diff(&range, &path, api, format, view, max_tokens)?,
         Cmd::Parity {
             source,
             target,
@@ -579,7 +586,14 @@ fn members_for(path: &std::path::Path) -> Result<Vec<parity::MemberView>> {
 /// `ctx diff A..B` — map the file changes between two refs onto B's module
 /// graph (B defaults to the working tree). With `--api`, diff the public API
 /// surface between the two refs instead.
-fn run_diff(range: &str, path: &std::path::Path, api: bool, format: Format, view: View) -> Result<()> {
+fn run_diff(
+    range: &str,
+    path: &std::path::Path,
+    api: bool,
+    format: Format,
+    view: View,
+    max_tokens: Option<usize>,
+) -> Result<()> {
     let (a, b) = parse_range(range);
     let repo = git::repo_root(path)?;
     let rel = path
@@ -647,21 +661,12 @@ fn run_diff(range: &str, path: &std::path::Path, api: bool, format: Format, view
     } else {
         let target_names: BTreeSet<&str> = targets.iter().map(|m| m.name.as_str()).collect();
         let (upstream, downstream) = query::neighbors(&head, &target_names);
-        match format {
-            Format::Md => print!(
-                "{}",
-                render::changed_md(&label, &targets, &upstream, &downstream)
-            ),
-            Format::Json => {
-                let json = serde_json::json!({
-                    "range": label,
-                    "changed": targets,
-                    "upstream": upstream,
-                    "downstream": downstream,
-                });
-                println!("{}", serde_json::to_string_pretty(&json)?);
-            }
-        }
+        print!(
+            "{}",
+            impact_text(
+                &head, &label, &targets, &upstream, &downstream, format, max_tokens
+            )
+        );
     }
     cleanup(&repo, wt_b);
     Ok(())
@@ -708,6 +713,136 @@ fn graph_at(
 fn cleanup(repo: &std::path::Path, wt: Option<PathBuf>) {
     if let Some(wt) = wt {
         git::remove_worktree(repo, &wt);
+    }
+}
+
+/// Render a change-impact report, optionally fitted to a token budget.
+///
+/// Shared by `changed` and `diff`. Changed modules are always kept — they are the
+/// subject of the report — so only neighbors are shed, least-central first. A
+/// single commit on a 14-module repo rendered ~10k tokens unbudgeted, which is
+/// the wrong shape for something meant to be read during review.
+fn impact_text(
+    g: &Graph,
+    label: &str,
+    targets: &[&Module],
+    upstream: &[&Module],
+    downstream: &[&Module],
+    format: Format,
+    budget: Option<usize>,
+) -> String {
+    let rank_of: std::collections::HashMap<&str, usize> = query::centrality_order(g)
+        .into_iter()
+        .enumerate()
+        .map(|(pos, i)| (g.modules[i].name.as_str(), pos))
+        .collect();
+
+    let render = |cap: Option<usize>| -> String {
+        let mut up: Vec<&Module> = upstream.to_vec();
+        let mut down: Vec<&Module> = downstream.to_vec();
+        let mut dropped = 0usize;
+        if let Some(cap) = cap {
+            let by_rank = |set: &mut Vec<&Module>| {
+                set.sort_by_key(|m| rank_of.get(m.name.as_str()).copied().unwrap_or(usize::MAX));
+            };
+            by_rank(&mut up);
+            by_rank(&mut down);
+            let half = cap.div_ceil(2);
+            let up_keep = half.min(up.len());
+            let down_keep = (cap - up_keep).min(down.len());
+            dropped = (up.len() - up_keep) + (down.len() - down_keep);
+            up.truncate(up_keep);
+            down.truncate(down_keep);
+            up.sort_by(|a, b| a.name.cmp(&b.name));
+            down.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        match format {
+            Format::Md => {
+                let mut s = render::changed_md(label, targets, &up, &down);
+                if dropped > 0 {
+                    s.push_str(&format!(
+                        "\n---\n{dropped} less-central neighbor(s) omitted to fit the token \
+                         budget. The changed modules themselves are always kept.\n"
+                    ));
+                }
+                s
+            }
+            Format::Json => {
+                let mut v = serde_json::json!({
+                    "since": label,
+                    "changed": targets,
+                    "upstream": up,
+                    "downstream": down,
+                });
+                if dropped > 0 {
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("neighbors_omitted".into(), serde_json::json!(dropped));
+                    }
+                }
+                serde_json::to_string_pretty(&v).unwrap_or_default() + "\n"
+            }
+        }
+    };
+
+    let Some(budget) = budget else {
+        return render(None);
+    };
+    let whole = render(None);
+    if est_tokens(&whole) <= budget {
+        return whole;
+    }
+    let max_neighbors = upstream.len() + downstream.len();
+    let bare = render(Some(0));
+    if est_tokens(&bare) > budget {
+        // The changed modules alone are over budget. They are the subject of the
+        // report and are never dropped, so say the cap was not met rather than
+        // implying this output fits.
+        let mut text = bare;
+        if matches!(format, Format::Md) {
+            let n = est_tokens(&text);
+            text.push_str(&format!(
+                "\n---\n[ctx] BUDGET NOT MET: the changed modules alone are ~{n} tokens, over \
+                 the {budget}-token budget. All neighbors were dropped. Narrow the diff, or use \
+                 `--view interface`.\n"
+            ));
+        }
+        return text;
+    }
+    let (mut lo, mut hi) = (0usize, max_neighbors);
+    let mut best = bare;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let text = render(Some(mid));
+        if est_tokens(&text) <= budget {
+            best = text;
+            lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best
+}
+
+/// Stamp the emitted view and budget verdict into the output itself.
+///
+/// An agent that asked for `full` and silently received `interface` will look for
+/// call edges that were deleted; one handed an over-budget map needs to know the
+/// cap was not met. Both facts are free to include and impossible to recover.
+fn annotate_budget(text: String, view: View, budget: usize, fit: bool, format: Format) -> String {
+    let verdict = if fit {
+        format!("fitted to {budget} tokens")
+    } else {
+        format!("BUDGET NOT MET: exceeds {budget} tokens")
+    };
+    match format {
+        Format::Md => text.replacen(
+            "# Codebase Topology Map\n",
+            &format!("# Codebase Topology Map\nview: {} ({verdict})\n", view.name()),
+            1,
+        ),
+        Format::Json => text,
     }
 }
 
@@ -796,15 +931,6 @@ fn subtree_text(
         return Ok(render_at(view, None));
     };
 
-    let ladder = [View::Full, View::Interface, View::Skeleton];
-    let start = ladder.iter().position(|&v| v == view).unwrap_or(0);
-    for &v in &ladder[start..] {
-        let text = render_at(v, None);
-        if est_tokens(&text) <= budget {
-            return Ok(text);
-        }
-    }
-    // Detail exhausted: shed neighbors, largest fitting set wins.
     let max_neighbors = {
         let names: BTreeSet<&str> = g
             .modules
@@ -815,22 +941,54 @@ fn subtree_text(
         let (u, d) = query::neighbors(g, &names);
         u.len() + d.len()
     };
-    let (mut lo, mut hi) = (0usize, max_neighbors);
-    let mut best = render_at(View::Skeleton, Some(0));
-    while lo <= hi {
-        let mid = lo + (hi - lo) / 2;
-        let text = render_at(View::Skeleton, Some(mid));
-        if est_tokens(&text) <= budget {
-            best = text;
-            lo = mid + 1;
-        } else if mid == 0 {
-            break;
-        } else {
-            hi = mid - 1;
+
+    // Richest view whose PRUNED form fits, not the first view that fits whole.
+    // Returning early at the coarsest view left most of the budget unspent —
+    // `--max-tokens 4000` and `--max-tokens 12000` produced identical output —
+    // when the budget could have bought `interface` detail on fewer neighbors.
+    let ladder = [View::Full, View::Interface, View::Skeleton];
+    let start = ladder.iter().position(|&v| v == view).unwrap_or(0);
+    let mut best: Option<String> = None;
+    for &v in &ladder[start..] {
+        let whole = render_at(v, None);
+        if est_tokens(&whole) <= budget {
+            return Ok(whole);
         }
+        // Largest neighbor set that fits at this detail level.
+        let (mut lo, mut hi) = (0usize, max_neighbors);
+        let mut fit_here: Option<String> = None;
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+            let text = render_at(v, Some(mid));
+            if est_tokens(&text) <= budget {
+                fit_here = Some(text);
+                lo = mid + 1;
+            } else if mid == 0 {
+                break;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        if let Some(t) = fit_here {
+            // Richest rung wins: stop at the first view that fits when pruned.
+            return Ok(t);
+        }
+        best = Some(render_at(v, Some(0)));
     }
-    Ok(best)
+
+    // Not satisfiable at any rung: the target module alone is over budget. Emit
+    // the coarsest form and say so in band rather than implying a fit.
+    let mut text = best.unwrap_or_else(|| render_at(View::Skeleton, Some(0)));
+    if matches!(format, Format::Md) {
+        text.push_str(&format!(
+            "\n---\n[ctx] BUDGET NOT MET: the target module alone is ~{} tokens, over the \
+             {budget}-token budget. Use `ctx def`/`ctx context <symbol>` for a smaller slice.\n",
+            est_tokens(&text)
+        ));
+    }
+    Ok(text)
 }
+
 
 /// A module-not-found error with near misses instead of the whole index.
 ///
@@ -1007,8 +1165,8 @@ fn render_pruned(
                 };
                 s.push_str(&format!(
                     "\n---\n\
-                     {omitted} of {total} modules omitted: kept the {shown} most central \
-                     to fit the {budget}-token budget.\n\
+                     {omitted} of {total} modules omitted: kept the {shown} most central, \
+                     targeting the {budget}-token budget.\n\
                      {prose_note}\
                      Dependency edges above may name an omitted module — that name is still \
                      what to ask for.\n\

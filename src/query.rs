@@ -951,6 +951,14 @@ pub fn coverage_report(g: &Graph, unsupported: &[(String, usize)], json_out: boo
     }
 
     let mut out = format!("# ctx coverage report — {}\n\n", g.root);
+    // This report exists to be honest about scope; a filter that removed part of
+    // the tree must be stated, or "no blind spots" means nothing.
+    if let Some(f) = crate::extract::filter_note() {
+        out.push_str(&format!(
+            "SCOPE: FILTERED ({f}). Files outside this filter were never scanned and are \
+             NOT counted as blind spots below. Re-run without filters for whole-repo coverage.\n\n"
+        ));
+    }
     let langs: Vec<String> = by_lang.iter().map(|(l, n)| format!("{l} {n}")).collect();
     out.push_str(&format!(
         "Modules: {}  ({})\n\n",

@@ -10,11 +10,16 @@ pub fn markdown(g: &Graph) -> String {
         "Call edges: `→ name` resolved via import/path; `name~` inferred by receiver heuristic.\n",
     );
     out.push_str(&format!(
-        "root: {} | files: {} | modules: {}\n\n",
+        "root: {} | files: {} | modules: {}\n",
         g.root,
         g.file_count,
         g.modules.len()
     ));
+    // A filtered map is a partial map; saying so costs one line.
+    if let Some(f) = crate::extract::filter_note() {
+        out.push_str(&format!("scope: FILTERED ({f}) — modules outside it are absent\n"));
+    }
+    out.push('\n');
     for m in &g.modules {
         module_md(m, &mut out);
     }

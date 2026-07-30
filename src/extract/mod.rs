@@ -54,6 +54,36 @@ fn filter() -> &'static Filter {
     FILTER.get_or_init(Filter::default)
 }
 
+/// One-line description of the active scan filter, or None when unfiltered.
+///
+/// A filtered graph is a different graph: deps vanish, modules disappear, and
+/// `doctor` would otherwise report a clean bill of health for a tree it never
+/// looked at. Reports that claim coverage must disclose their scope.
+pub fn filter_note() -> Option<String> {
+    let f = filter();
+    if f.exclude.is_empty() && f.langs.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !f.langs.is_empty() {
+        let names: Vec<&str> = f
+            .langs
+            .iter()
+            .map(|l| match l {
+                Lang::Rust => "rust",
+                Lang::Python => "python",
+                Lang::TypeScript => "ts",
+                Lang::Markdown => "md",
+            })
+            .collect();
+        parts.push(format!("--lang {}", names.join(",")));
+    }
+    for e in &f.exclude {
+        parts.push(format!("--exclude '{e}'"));
+    }
+    Some(parts.join(" "))
+}
+
 /// Build the walker for `root`, applying any `--exclude` globs.
 fn walker(root: &Path) -> WalkBuilder {
     let mut wb = WalkBuilder::new(root);
@@ -264,6 +294,9 @@ const NON_SOURCE_EXTS: &[&str] = &[
     // data / config / text
     "json", "jsonl", "csv", "tsv", "parquet", "db", "sqlite", "lock", "log", "txt", "toml", "yaml",
     "yml", "ini", "cfg", "env", "gbnf", "gitignore", "gitattributes",
+    // backups / artifacts / keys: present in a tree, but not language blind spots
+    "bak", "backup", "archive", "orig", "rej", "tmp", "swp", "pub", "pem", "key",
+    "pin", "patch", "manifest", "tpl", "lockb",
 ];
 
 /// Count unmodeled source files by extension under `root`, honoring the same

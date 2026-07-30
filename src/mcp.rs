@@ -73,6 +73,12 @@ fn tool(name: &str, desc: &str, props: Value, required: &[&str]) -> Value {
     })
 }
 
+/// Budget applied when an MCP caller does not set `max_tokens`.
+///
+/// Generous enough to be useful, small enough that a zero-argument call cannot
+/// dump 130k tokens into an agent's context.
+const DEFAULT_MCP_BUDGET: usize = 25_000;
+
 fn path_prop() -> Value {
     json!({ "type": "string", "description": "Path to the repo (default \".\")" })
 }
@@ -93,7 +99,7 @@ fn tools() -> Vec<Value> {
             json!({
                 "path": path_prop(),
                 "view": {"type": "string", "enum": ["skeleton", "interface", "full"], "description": "Detail level (default skeleton)"},
-                "max_tokens": budget_prop("Hard cap on output size. Strongly recommended: without it a large repo returns a very large map."),
+                "max_tokens": budget_prop("Hard cap on output size (default 25000). Reduces detail, then keeps the most central modules."),
             }),
             &[],
         ),
@@ -105,7 +111,7 @@ fn tools() -> Vec<Value> {
                 "path": path_prop(),
                 "module": {"type": "string", "description": "Module name or suffix"},
                 "view": {"type": "string", "enum": ["skeleton", "interface", "full"], "description": "Detail level (default full)"},
-                "max_tokens": budget_prop("Hard cap on output size. Reduces detail, then drops the least-central neighbors; the target module is always kept."),
+                "max_tokens": budget_prop("Hard cap on output size (default 25000). Reduces detail, then drops the least-central neighbors; the target module is always kept."),
             }),
             &["module"],
         ),
@@ -171,8 +177,19 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
         Some("full") => View::Full,
         _ => d,
     };
-    // Only honor a budget the caller actually set — absent means "exact view".
-    let budget = args.get("max_tokens").and_then(Value::as_u64).map(|v| v as usize);
+    // An MCP result lands straight in the caller's context with no shell to pipe
+    // it through, and a tool an LLM can invoke with zero arguments must be safe
+    // by default — so absent means DEFAULT_MCP_BUDGET, not unbudgeted.
+    let raw_budget = args.get("max_tokens");
+    let budget = match raw_budget {
+        None | Some(Value::Null) => Some(DEFAULT_MCP_BUDGET),
+        Some(v) => match v.as_u64() {
+            Some(n) if n > 0 => Some(n as usize),
+            // A malformed budget silently meaning "unbudgeted" is the worst
+            // possible reading of a cap.
+            _ => return ("max_tokens must be a positive integer".into(), true),
+        },
+    };
 
     match name {
         "map" => {
@@ -181,7 +198,26 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
             // in the caller's context with no chance to pipe it anywhere.
             let v = view_arg(View::Skeleton);
             match budget {
-                Some(b) => (crate::render_budgeted(&g, v, crate::Format::Md, b).text, false),
+                Some(b) => {
+                    let r = crate::render_budgeted(&g, v, crate::Format::Md, b);
+                    // The CLI reports the view chosen and whether it fit on
+                    // stderr; over MCP there is no stderr, so it goes in band or
+                    // it is lost.
+                    let mut text = r.text;
+                    if !r.fit {
+                        text.push_str(&format!(
+                            "\n[ctx] BUDGET NOT MET: emitted view '{}' still exceeds {b} tokens.\n",
+                            r.view.name()
+                        ));
+                    } else if r.view != v || r.omitted > 0 {
+                        text.push_str(&format!(
+                            "\n[ctx] fitted to {b} tokens: '{}' view, {} module(s) omitted.\n",
+                            r.view.name(),
+                            r.omitted
+                        ));
+                    }
+                    (text, false)
+                }
                 None => {
                     let mut g = g;
                     view::apply(&mut g, v);
