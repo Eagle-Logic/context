@@ -184,8 +184,9 @@ enum Cmd {
         /// Changed modules are always kept.
         #[arg(long)]
         max_tokens: Option<usize>,
-        /// With --api: exit non-zero if any public item was removed or had its
-        /// signature changed. Additions are not breaking. For CI gates.
+        /// With --api: exit non-zero if a public item was REMOVED. Signature
+        /// changes are reported but do not fail, since ctx cannot tell an added
+        /// optional parameter from an incompatible one. For CI gates.
         #[arg(long)]
         strict: bool,
         #[arg(long, value_enum, default_value_t = Format::Md)]
@@ -589,14 +590,20 @@ fn main() -> Result<()> {
             let base = extract::build_graph(&wt.join(&rel));
             git::remove_worktree(&repo, &wt);
             let base = base?;
-            let (report, breaking) =
+            let (report, removed_n, changed_n) =
                 query::api_report(&base, &current, label, matches!(format, Format::Json));
             print!("{report}");
-            if strict && breaking > 0 {
+            if strict && removed_n > 0 {
                 eprintln!(
-                    "ctx: {breaking} breaking public-API change(s) vs {label} — failing (--strict)"
+                    "ctx: {removed_n} public item(s) REMOVED vs {label} — failing (--strict)"
                 );
                 std::process::exit(1);
+            }
+            if strict && changed_n > 0 {
+                eprintln!(
+                    "ctx: {changed_n} signature change(s) vs {label} — reported, not failing \
+                     (ctx cannot distinguish an added optional parameter from an incompatible one)"
+                );
             }
         }
         Cmd::Changed {
@@ -784,11 +791,14 @@ fn run_diff(
         let out = query::api_report(&base, &head, &a, json);
         cleanup(&repo, wt_a);
         cleanup(&repo, wt_b);
-        let (report, breaking) = out;
+        let (report, removed_n, changed_n) = out;
         print!("{report}");
-        if strict && breaking > 0 {
-            eprintln!("ctx: {breaking} breaking public-API change(s) in {a} — failing (--strict)");
+        if strict && removed_n > 0 {
+            eprintln!("ctx: {removed_n} public item(s) REMOVED in {a} — failing (--strict)");
             std::process::exit(1);
+        }
+        if strict && changed_n > 0 {
+            eprintln!("ctx: {changed_n} signature change(s) in {a} — reported, not failing");
         }
         return Ok(());
     }

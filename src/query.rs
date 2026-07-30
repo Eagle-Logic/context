@@ -1124,17 +1124,23 @@ fn fmt_callers(names: &[String]) -> String {
 /// signature-changed public items are (potentially) breaking; each is listed
 /// with the callers it affects (removed → who used it in `base`; changed →
 /// who uses it in `current`).
-/// Public-API diff. Returns the rendered report and the number of **breaking**
-/// changes (removed plus signature-changed items); additions are not breaking.
+/// Public-API diff. Returns the rendered report, the count of **removed** items,
+/// and the count of **signature-changed** items.
 ///
-/// The count is returned rather than inferred from the text so a CI gate can fail
-/// on it without parsing prose.
+/// The two are separate because only one of them is unambiguous. A removal always
+/// breaks callers. A signature change might be adding an optional parameter or a
+/// struct field — routine and compatible — and ctx has no type system, so it
+/// cannot tell that from changing a parameter's type. Collapsing both into one
+/// "breaking" number makes a CI gate fail on ordinary additive commits, and a
+/// gate that cries wolf gets switched off, which is worse than no gate.
+///
+/// Counts are returned rather than left for callers to parse out of the prose.
 pub fn api_report(
     base: &Graph,
     current: &Graph,
     label: &str,
     json_out: bool,
-) -> (String, usize) {
+) -> (String, usize, usize) {
     let bs = public_surface(base);
     let cs = public_surface(current);
 
@@ -1150,7 +1156,6 @@ pub fn api_report(
     let added: Vec<(&String, &Surface)> = cs.iter().filter(|(q, _)| !bs.contains_key(*q)).collect();
 
     if json_out {
-        let breaking = removed.len() + changed.len();
         return (serde_json::to_string_pretty(&json!({
             "since": label,
             "removed": removed.iter().map(|(q, b)| json!({"name": q, "kind": b.kind, "signature": b.signature, "callers": caller_names(base, &b.match_q)})).collect::<Vec<_>>(),
@@ -1158,11 +1163,11 @@ pub fn api_report(
             "added": added.iter().map(|(q, c)| json!({"name": q, "kind": c.kind, "signature": c.signature})).collect::<Vec<_>>(),
         }))
         .unwrap_or_default()
-            + "\n", breaking);
+            + "\n", removed.len(), changed.len());
     }
 
     if removed.is_empty() && changed.is_empty() && added.is_empty() {
-        return (format!("no public API changes vs {label}\n"), 0);
+        return (format!("no public API changes vs {label}\n"), 0, 0);
     }
 
     let mut out = format!("# API changes vs {label}\n");
@@ -1196,7 +1201,7 @@ pub fn api_report(
             out.push_str(&format!("- {q}  [{}]  {}\n", c.kind, c.signature));
         }
     }
-    (out, removed.len() + changed.len())
+    (out, removed.len(), changed.len())
 }
 
 #[cfg(test)]
@@ -1676,14 +1681,16 @@ mod tests {
             "src/api.rs",
             "pub fn stable() {}\npub fn morph(a: i32, b: i32) {}\npub fn fresh() {}\n",
         )]);
-        let (out, breaking) = api_report(&base.0, &cur.0, "HEAD", false);
+        let (out, removed_n, changed_n) = api_report(&base.0, &cur.0, "HEAD", false);
         assert!(out.contains("## Removed") && out.contains("api::gone"), "{out}");
         assert!(out.contains("## Changed") && out.contains("api::morph"), "{out}");
         assert!(out.contains("## Added") && out.contains("api::fresh"), "{out}");
         assert!(!out.contains("stable"), "unchanged item must not appear:\n{out}");
-        // One removal + one signature change; the addition is NOT breaking, and a
-        // CI gate keys on this number rather than parsing the prose above.
-        assert_eq!(breaking, 2, "breaking count drives --strict");
+        // Counted separately on purpose: a removal always breaks callers, while a
+        // signature change may be an added optional parameter. Only the first is
+        // safe to gate CI on.
+        assert_eq!(removed_n, 1, "removals drive --strict");
+        assert_eq!(changed_n, 1, "signature changes are reported, not gated");
         let _ = fs::remove_dir_all(base.1);
         let _ = fs::remove_dir_all(cur.1);
     }
