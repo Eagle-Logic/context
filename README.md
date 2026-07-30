@@ -45,6 +45,7 @@ ctx core ~/projects/myrepo --churn
 
 # Breaking-change check: public API removed/changed since a ref + who breaks
 ctx changed --api ~/projects/myrepo --since main
+ctx changed --api --strict --since main    # exit non-zero on a removal — for CI
 
 # Coverage / blind-spot report: how much resolved, where to distrust
 ctx doctor ~/projects/myrepo
@@ -78,12 +79,34 @@ graph, so the modules everything else leans on float to the top. It's the
 "where's the heart of this codebase" answer for an unfamiliar repo, computed
 deterministically rather than guessed.
 
-`changed --api` is a pre-merge safety gate: it builds the public API surface
-both at a base ref (in a throwaway detached worktree) and in the working
-tree, then reports the public items that were **removed** or whose
-**signature changed** — each with the callers it breaks — plus additions as
-non-breaking. Turns "did I break the API?" into a one-command check for CI or
-a pre-push hook.
+`changed --api` is a pre-merge safety gate: it builds the public API surface both
+at a base ref (in a throwaway detached worktree) and in the working tree, then
+reports the public items that were **removed** or whose **signature changed** —
+each with the callers it breaks — plus additions as non-breaking.
+
+`--strict` turns it into a CI gate, and fails **only on removals**. That asymmetry
+is deliberate. A removal is unambiguous: nothing can call what is gone. A
+signature change might be an added optional parameter or a new struct field —
+routine, compatible work — and ctx is structural, with no type resolution, so it
+cannot tell that from a changed parameter type. Failing on both was tried and
+would have blocked ordinary additive commits on the first real repo it met; a gate
+that cries wolf gets switched off, which is worse than no gate. So signature
+changes are reported, and under `--strict` say explicitly that they were reported
+and not failed.
+
+Treat it as a tripwire that surfaces an unintended removal in review, not as a
+semver authority — a language-specific tool with a type system (`cargo-semver-checks`,
+`apidiff`, `japicmp`) is stricter within its language. The trade ctx makes is
+breadth: one gate across Rust, Python and TypeScript in a polyglot repo.
+
+```yaml
+# .github/workflows/ci.yml — PR-only; fetch-depth 0, the default shallow clone
+# has no merge base.
+- uses: actions/checkout@v7
+  with: { fetch-depth: 0 }
+- run: cargo install --git https://github.com/Eagle-Logic/context --locked
+- run: ctx changed --api --strict --since "origin/${{ github.base_ref }}"
+```
 
 `context` is the agent-native command: one call returns the definition, the
 type definitions referenced in its signature, its callees, and its callers —
@@ -157,7 +180,7 @@ scan. Vendored trees, archived docs and dead code are usually tracked, so
 `.gitignore` will not exclude them: `--exclude 'docs/archive/**'`. And because a
 docs tree can dominate a *code* map — 78% of one 720-module repo's skeleton view —
 `--lang code` restricts the scan to Rust/Python/TypeScript, cutting that map from
-~126k to ~27k tokens.
+~169k to ~35k tokens.
 
 Module names are unique. They derive from paths, so `src/lib.rs` and `src/main.rs`
 both want to be `crate`, and a `native/README.md` collides with the
@@ -240,13 +263,16 @@ each level adds a whole category, so token spend buys precision, not noise:
 
 | view | contents | 720-module polyglot repo | same, `--lang code` |
 |---|---|---|---|
-| `skeleton` | modules, deps, re-exports, type names | 504 KB (~126k tok) | 105 KB (~26k tok) |
-| `interface` | + public signatures, struct fields, enum variants | 827 KB (~207k tok) | — |
-| `full` (default) | + private items and call edges | 1.03 MB (~258k tok) | — |
+| `skeleton` (default) | modules, deps, re-exports, type names | 508 KB (~169k tok) | 105 KB (~35k tok) |
+| `interface` | + public signatures, struct fields, enum variants | 839 KB (~279k tok) | — |
+| `full` | + private items and call edges | 1.05 MB (~349k tok) | — |
 
 Those are the *unbudgeted* sizes, and at that scale none of them belong in a
-context window: pass `--max-tokens` (a hard cap) or `--lang code` (77% of that
-repo's map is Markdown). On a small repo (16 modules) `full` is ~10k tokens, cheap
+context window: pass `--max-tokens` (a hard cap) or `--lang code` (79% of that
+repo's skeleton map is Markdown). Token figures are `bytes / 3`, which is
+deliberately conservative — `bytes / 4` is the familiar rule of thumb but measured
+against a real tokenizer it under-counts this tool's output by 5-23%, and a cap
+that overshoots is not a cap. On a small repo (16 modules) `full` is ~10k tokens, cheap
 enough for the first turn of a session. Sizes scale with the repo, not with the
 view alone — measure before reading. Rust visibility is `pub`-based; Python uses the
 underscore convention (dunders like `__init__` count as public); TypeScript
