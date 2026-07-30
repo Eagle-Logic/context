@@ -283,12 +283,24 @@ one at negligible token cost:
 
 ## Claude Code integration
 
-`ctx snippet` prints a ready-made "Codebase Discovery Tools" block — append it
-to the target repo's `CLAUDE.md` (`ctx snippet >> CLAUDE.md`). It teaches the
-agent a lookup protocol: orient with `ctx core` or a budgeted
-`ctx map --max-tokens`, pull `ctx subtree <module>` before touching a module,
-follow call edges instead of grepping, and only read raw source for
-implementation bodies.
+`ctx snippet` prints the discovery block to paste into a repo's `CLAUDE.md`
+(`ctx snippet >> CLAUDE.md`). It is the one artifact ctx emits that gets *copied*
+somewhere else, so it is the one that can go stale — a generic block telling every
+agent to "load the topology" is fine at 20 modules and catastrophic at 720, and it
+sits wrong in a repo long after the tool has learned better.
+
+So the block **measures the repo it is generated for**: module count, real map
+cost, prose share, and the internal call-resolution rate, with the advice derived
+from those numbers rather than asserted. A repo whose map costs 348k tokens is
+told never to run one unbudgeted and handed the `--lang code` flag; a repo whose
+map is 258 tokens is told to just read it. It is also **delimited** by
+`<!-- ctx:begin -->` / `<!-- ctx:end -->`, so regenerating replaces it in place
+instead of appending a second, contradictory copy.
+
+It stays short — a CLAUDE.md block is resident in every session forever, so
+anything reachable from `ctx <cmd> --help` on demand is left out. What remains is
+what an agent cannot derive: this repo's scale, and where ctx's own output is not
+trustworthy (1.5 KB, down from 4.3 KB).
 
 **Don't commit the map.** A `CODEBASE_MAP.md` is a derived artifact — a pure
 function of the source tree, generated in well under a second — so it belongs in

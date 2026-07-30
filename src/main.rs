@@ -255,67 +255,137 @@ enum Cmd {
     },
     /// Run as an MCP server over stdio (exposes the read-only commands as tools)
     Mcp,
-    /// Print the recommended CLAUDE.md discovery-protocol block
-    Snippet,
+    /// Print the CLAUDE.md discovery block, measured for this repo
+    Snippet {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
 }
 
-const SNIPPET: &str = r#"## Codebase Discovery Tools
+/// Build the CLAUDE.md discovery block for a specific repo.
+///
+/// This is the one artifact ctx emits that gets *copied* somewhere else, so it is
+/// the one that can go stale. The previous block was generic prose telling every
+/// agent to "run `ctx map --view skeleton` to load the topology" — advice that is
+/// fine at 20 modules and catastrophic at 720, and which sat wrong in a repo's
+/// CLAUDE.md long after the tool had learned better.
+///
+/// Two changes make staleness self-correcting rather than inevitable:
+///
+/// 1. **It measures.** Module count, prose share, real map cost and the
+///    call-resolution rate are read off THIS repo, so the guidance is derived
+///    rather than asserted, and the numbers tell an agent what to trust.
+/// 2. **It is delimited.** The block is fenced by markers so regenerating
+///    replaces it in place instead of appending a second, contradictory copy.
+///
+/// It is also short. A CLAUDE.md block is resident in every session forever, so
+/// anything an agent can get from `--help` on demand does not belong here — only
+/// what it cannot derive: this repo's scale, and where ctx's output is not
+/// trustworthy.
+fn snippet_for(g: &Graph) -> String {
+    let modules = g.modules.len();
 
-`ctx` is a deterministic static-analysis CLI for this repo (Rust, Python, TypeScript, Markdown). Use it to
-orient yourself instead of grepping raw source; only read raw files when you need
-implementation bodies.
+    let render_at = |v: View| -> usize {
+        let mut gg = g.clone();
+        view::apply(&mut gg, v);
+        est_tokens(&render::markdown(&gg))
+    };
+    let skeleton_tok = render_at(View::Skeleton);
+    let full_tok = render_at(View::Full);
 
-- `ctx map --max-tokens <N>` — a map guaranteed to fit N tokens: reduces detail first, then
-  prunes the least-central modules, stating what it omitted. On a large repo an unbudgeted
-  map can be 100k+ tokens, so pass a budget whenever you are just orienting
-- `ctx map --view skeleton` — bird's-eye architecture: modules, deps, type names (cheapest
-  view, but still proportional to repo size — combine with `--max-tokens`)
-- `ctx map --view interface` — + public signatures, struct fields, enum variants (API surface)
-- `ctx map` — + private items and per-function call edges (`→ callee`) for tracing execution
-  (a trailing `~` on an edge means it was inferred from an opaque receiver, not an import/path —
-  trust it less)
-- `ctx modules` — one line per module with dependency edges
-- `ctx subtree <module> [--view ...]` — one module plus its immediate upstream dependencies
-  and downstream dependents
-- `ctx def <name>` — where a symbol is defined: module, kind, line, and signature (jump-to-def
-  without knowing the module; accepts bare `Foo` or qualified `Type::method`)
-- `ctx callers <name>` — every function that calls the given function/method (resolved reverse
-  call edges — the blast radius before changing a signature). It never claims completeness:
-  the result is a floor. It prints `INCOMPLETE` when the name has several definitions, and
-  `NOT INDEXED` when the name is a suppressed ubiquitous one (`get`/`open`/`push`/...), where
-  an empty result means nothing at all. An unflagged result means no KNOWN reason to distrust
-  it, not a guarantee — run the `rg` command it prints before changing a signature
-- `ctx context <name>` — everything needed to edit a symbol in one shot: its definition, the
-  types in its signature, what it calls, and what calls it (token-budgeted via `--max-tokens`)
-- `ctx changed [--since <ref>]` — impact map of your diff: the changed modules plus their
-  dependencies and the callers they may break (defaults to the working tree vs HEAD)
-- `ctx changed --api [--since <ref>]` — public API changes in your diff: removed or
-  signature-changed public items and who breaks (a pre-merge breaking-change check)
-- `ctx diff <A>..<B>` — structural diff between two git refs (B defaults to the working
-  tree): changed modules + who they break; add `--api` for breaking changes across the range
-- `ctx parity <source> <port>...` — cross-language structural check: is a port a faithful
-  copy of its source? Flags members missing from the port, arity drift, and dropped internal
-  calls (deterministic, structure-only — e.g. a Python module vs its Rust port; add
-  `--aliases py-rust` to bridge systematic renames like `__init__` → `new`)
-- `ctx core` — the modules that matter most, ranked by dependency centrality (where to look
-  first in an unfamiliar codebase; add `--churn` to weight by how often they change)
-- `ctx doctor` — coverage report: what fraction of the call graph resolved and which modules/
-  edges to distrust (run once to calibrate how much to lean on ctx for this repo)
-- `--exclude '<glob>'` / `--lang code` (global, repeatable) — skip vendored or archived trees, or
-  drop prose from a code map. On a large repo `--lang code` cut the skeleton view from ~126k to
-  ~27k tokens
-- add `--format json` to `map`, `subtree`, `def`, `callers`, `context`, `core` and `doctor` for
-  machine-readable output (`modules` is text-only)
+    // Measured on the SKELETON view, because that is the view the advice is
+    // about. At full view code carries bodies and call edges and dwarfs prose,
+    // which understates how much of an *orientation* map is documentation.
+    let mut skel = g.clone();
+    view::apply(&mut skel, View::Skeleton);
+    let prose_bytes: usize = skel
+        .modules
+        .iter()
+        .filter(|m| m.lang == model::Lang::Markdown)
+        .map(|m| {
+            let mut s = String::new();
+            render::module_md(m, &mut s);
+            s.len()
+        })
+        .sum();
+    let all_bytes: usize = skel
+        .modules
+        .iter()
+        .map(|m| {
+            let mut s = String::new();
+            render::module_md(m, &mut s);
+            s.len()
+        })
+        .sum();
+    let prose_pct = if all_bytes == 0 {
+        0
+    } else {
+        prose_bytes * 100 / all_bytes
+    };
 
-Protocol: to orient, run `ctx core` (cheap at any repo size) — or
-`ctx map --view skeleton --max-tokens 10000` for a topology guaranteed to fit 10k tokens. Never
-load an unbudgeted map just to orient; on a large repo that is 100k+ tokens. When you're about to
-work on a specific symbol, run `ctx context <name>` — it bundles the definition, signature types,
-callees, and callers in one call, so you rarely need to open the file until you're editing its
-body. For broader orientation use `ctx subtree <module>`; before changing a signature run
-`ctx callers <name>` to see the blast radius. Line anchors (`[L42]`) give exact positions for
-surgical reads.
-"#;
+    let (sites, resolved): (usize, usize) = g
+        .modules
+        .iter()
+        .fold((0, 0), |(s, r), m| (s + m.diag.call_sites, r + m.diag.resolved));
+    let resolve_pct = if sites == 0 { 0 } else { resolved * 100 / sites };
+
+    let mut out = String::from("<!-- ctx:begin — regenerate with `ctx snippet` -->\n");
+    out.push_str("## Codebase Discovery\n\n");
+    out.push_str(
+        "`ctx` is a deterministic structural index (Rust/Python/TS/Markdown). Use it to locate \
+         and orient; read raw files for implementation bodies. `ctx <cmd> --help` for detail.\n\n",
+    );
+
+    out.push_str(&format!(
+        "**This repo:** {modules} modules · unbudgeted map ~{full_tok} tok (skeleton \
+         ~{skeleton_tok}) · {prose_pct}% of the map is prose · {resolve_pct}% of call sites \
+         resolve internally.\n\n"
+    ));
+
+    out.push_str("Start here:\n\n");
+    out.push_str("- `ctx core` — the modules that matter most. Cheap at any size; first call.\n");
+    out.push_str(
+        "- `ctx context <symbol>` / `ctx def` / `ctx callers` — targeted lookups, cheap. Most \
+         work needs only these.\n",
+    );
+    // Gate on the cost of what an agent would actually run — the default map —
+    // not on the cheapest view. Calling an 18k-token map "affordable" because its
+    // skeleton fits is the same category of wrong advice this block replaced.
+    if full_tok > 15_000 {
+        out.push_str(&format!(
+            "- `ctx map --max-tokens 10000{}` — whole-topology view. **Never run an unbudgeted \
+             map here** (~{full_tok} tok); `--max-tokens` is a hard cap.\n",
+            if prose_pct >= 25 { " --lang code" } else { "" }
+        ));
+    } else {
+        out.push_str(&format!(
+            "- `ctx map` — the whole map is ~{full_tok} tok here, small enough to read \
+             directly. Pass `--max-tokens` if it grows.\n"
+        ));
+    }
+    out.push_str("- `ctx changed --api` before pushing — public items removed or changed, and who breaks.\n\n");
+
+    out.push_str(
+        "**Trust:** `ctx callers` is a floor, never a complete answer. It prints `INCOMPLETE` \
+         when a name has several definitions and `NOT INDEXED` for suppressed common names \
+         (`get`, `open`, `push`, …) where it indexes nothing at all. No warning means no *known* \
+         reason to distrust it, not a guarantee — run the `rg` it prints before changing a \
+         signature. A trailing `~` on an edge means it was inferred from an opaque receiver.\n",
+    );
+    // Only warn when there is a real measurement to warn about: a repo with no
+    // call sites scores 0% and would otherwise be told its call graph is
+    // untrustworthy, which is noise, not calibration.
+    if sites >= 50 && resolve_pct < 30 {
+        out.push_str(&format!(
+            "Only {resolve_pct}% of call sites resolve internally here, so calibrate with \
+             `ctx doctor` before leaning on call edges.\n"
+        ));
+    }
+    out.push_str("\n`CODEBASE_MAP.md` is generated, not committed: gitignore it and rebuild on demand.\n");
+    out.push_str("<!-- ctx:end -->\n");
+    out
+}
+
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -611,7 +681,10 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Mcp => mcp::run()?,
-        Cmd::Snippet => print!("{SNIPPET}"),
+        Cmd::Snippet { path } => {
+            let g = extract::build_graph(&path)?;
+            print!("{}", snippet_for(&g));
+        }
     }
     Ok(())
 }
@@ -1263,7 +1336,7 @@ fn render_pruned(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_range, render_budgeted, Format, View};
+    use super::{parse_range, render_budgeted, snippet_for, Format, View};
     use crate::extract::build_graph;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1377,6 +1450,58 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(a.text, b.text, "same graph and budget must render identically");
         assert_eq!(a.omitted, b.omitted);
+    }
+
+    #[test]
+    fn snippet_is_measured_and_scales_its_advice() {
+        // Small repo: reading the whole map is fine, and the block must not
+        // manufacture a low-resolution warning out of a repo with no call sites.
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ctx_snip_{}_{}", std::process::id(), id));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.py"), "class One:\n    pass\n").unwrap();
+        let g = build_graph(&dir).unwrap();
+        let small = snippet_for(&g);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(small.contains("<!-- ctx:begin"), "must be delimited for in-place regen");
+        assert!(small.contains("<!-- ctx:end -->"));
+        assert!(small.contains("1 modules") || small.contains("1 module"));
+        assert!(
+            small.contains("small enough to read directly"),
+            "a tiny repo should not be told to budget: {small}"
+        );
+        assert!(
+            !small.contains("calibrate with"),
+            "no call sites means no resolution verdict to give: {small}"
+        );
+        assert!(
+            small.contains("INCOMPLETE") && small.contains("NOT INDEXED"),
+            "the callers caveat is safety-critical and must always be present"
+        );
+    }
+
+    #[test]
+    fn snippet_warns_when_an_unbudgeted_map_is_expensive() {
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ctx_snipbig_{}_{}", std::process::id(), id));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..40 {
+            let body: String = (0..25)
+                .map(|j| format!("class ClassWithAQuiteLongName_{i}_{j}:\n    pass\n\n"))
+                .collect();
+            fs::write(dir.join(format!("m_{i}.py")), body).unwrap();
+        }
+        let g = build_graph(&dir).unwrap();
+        let big = snippet_for(&g);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            big.contains("Never run an unbudgeted map here"),
+            "an expensive map must be called out: {big}"
+        );
+        assert!(big.contains("--max-tokens"), "{big}");
     }
 
     #[test]
