@@ -4,6 +4,7 @@ mod mcp;
 mod model;
 mod parity;
 mod query;
+mod refactor;
 mod render;
 mod view;
 
@@ -223,6 +224,28 @@ enum Cmd {
         /// `__init__` → `new`). Alias matches are reported, never silent.
         #[arg(long, value_enum)]
         aliases: Option<AliasSet>,
+        #[arg(long, value_enum, default_value_t = Format::Md)]
+        format: Format,
+    },
+    /// Plan a module move: every import site that must be rewritten
+    MovePlan {
+        /// Module to move, e.g. "native::gate"
+        from: String,
+        /// Destination module path, e.g. "native::routing::gate"
+        to: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, value_enum, default_value_t = Format::Md)]
+        format: Format,
+    },
+    /// Check a completed move: module landed, old name gone, nothing orphaned
+    MoveVerify {
+        /// The module path that was moved away from
+        from: String,
+        /// The destination it should now live at
+        to: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
     },
@@ -546,6 +569,31 @@ fn main() -> Result<()> {
             let (out, missing) = parity::report(&src, &tgt, &amap, matches!(format, Format::Json));
             print!("{out}");
             if strict && missing > 0 {
+                std::process::exit(1);
+            }
+        }
+        Cmd::MovePlan {
+            from,
+            to,
+            path,
+            format,
+        } => {
+            let g = extract::build_graph(&path)?;
+            print!(
+                "{}",
+                refactor::move_plan(&g, &from, &to, matches!(format, Format::Json))
+            );
+        }
+        Cmd::MoveVerify {
+            from,
+            to,
+            path,
+            format,
+        } => {
+            let g = extract::build_graph(&path)?;
+            let (out, ok) = refactor::move_verify(&g, &from, &to, matches!(format, Format::Json));
+            print!("{out}");
+            if !ok {
                 std::process::exit(1);
             }
         }

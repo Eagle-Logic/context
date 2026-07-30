@@ -166,6 +166,29 @@ used to make one module unreachable and silently drop its reverse edges. Code no
 keeps the bare name, prose is renamed to `name@stem`, and every rename is reported
 on stderr.
 
+`move-plan <from> <to>` is an **oracle, not an actuator**: it emits every site a
+module relocation must touch, and `move-verify` checks the result. ctx never
+writes source files. An agent can already make edits cheaply and precisely; what
+it cannot do is know it found every site or prove nothing was orphaned — so the
+scarce thing is ground truth, not typing, and staying read-only keeps ctx free of
+partial application and undo semantics.
+
+```sh
+ctx move-plan native::gate native::routing::gate   # file move + every import rewrite
+# ... agent applies the edits ...
+ctx move-verify native::gate native::routing::gate # exits non-zero if anything is orphaned
+```
+
+Scope is bounded by what ctx can prove. Moves ride on import and link resolution
+— path arithmetic, deterministic, non-heuristic — which is ctx's strongest signal,
+so the site list is exact for the languages it parses. Dependents reached only by
+receiver inference have no literal string to rewrite and are listed separately as
+*unverified*, never mixed in with real sites. Rust `mod` declarations are not
+imports, so the plan names them as a required manual step rather than omitting
+them silently. Renaming a *method* is deliberately not offered: it would ride on
+receiver inference, which resolves a minority of call sites, and a plan built on
+that would silently miss some.
+
 `parity <source> <port>...` answers "is this port a faithful structural copy?"
 across languages. Because the `Item` model is language-neutral, a source
 module and its port are two renderings of one skeleton; parity flattens each

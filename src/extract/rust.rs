@@ -588,8 +588,6 @@ mod tests {
         assert!(!s.ends_with('…'), "a bare ellipsis reads as a complete list");
     }
 
-    use super::*;
-
     fn items(src: &str) -> Vec<Item> {
         extract(src).unwrap().items
     }

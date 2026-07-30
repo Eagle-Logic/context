@@ -201,6 +201,7 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
             name,
             resolve_name: String::new(),
             heuristic_deps: Vec::new(),
+            import_sites: Vec::new(),
             file: rel.display().to_string(),
             lang,
             deps: Vec::new(),
@@ -445,6 +446,7 @@ fn resolve_deps(modules: &mut [Module], root: &Path) {
         Vec<String>,
         Vec<Vec<Call>>,
         Vec<String>,
+        Vec<(String, String)>,
         Diagnostics,
     );
     let results: Vec<ModuleResult> = {
@@ -460,9 +462,11 @@ fn resolve_deps(modules: &mut [Module], root: &Path) {
             .map(|m| {
                 let mut deps = BTreeSet::new();
                 let mut ext = BTreeSet::new();
+                let mut sites: Vec<(String, String)> = Vec::new();
                 for imp in &m.raw_imports {
                     match resolve_from(imp, m, &ctx) {
                         Resolved::Internal(n) if n != m.name => {
+                            sites.push((imp.clone(), n.clone()));
                             deps.insert(n);
                         }
                         Resolved::External(n) => {
@@ -486,16 +490,17 @@ fn resolve_deps(modules: &mut [Module], root: &Path) {
                     .filter(|d| d != &m.name && !deps.contains(d))
                     .collect();
                 deps.extend(call_deps.into_iter().filter(|d| d != &m.name));
-                (deps, ext, reex, calls_per_item, soft, diag)
+                (deps, ext, reex, calls_per_item, soft, sites, diag)
             })
             .collect()
     };
 
-    for (m, (deps, ext, reex, calls, soft, diag)) in modules.iter_mut().zip(results) {
+    for (m, (deps, ext, reex, calls, soft, sites, diag)) in modules.iter_mut().zip(results) {
         m.deps = deps.into_iter().collect();
         m.extern_deps = ext.into_iter().collect();
         m.reexports = reex;
         m.heuristic_deps = soft;
+        m.import_sites = sites;
         m.diag = diag;
         let mut it = calls.into_iter();
         apply_calls(&mut m.items, &mut it);

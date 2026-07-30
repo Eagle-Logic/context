@@ -28,6 +28,11 @@ pub struct Module {
     /// holds at module level too, not just per call site.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub heuristic_deps: Vec<String>,
+    /// (import text as written, module it resolved to) for every internal
+    /// import. Resolution discards this mapping, but it is exactly what a
+    /// rename/move plan needs: the literal string to rewrite, per site.
+    #[serde(skip)]
+    pub import_sites: Vec<(String, String)>,
     /// Symbols this module re-exports (Rust `pub use`, Python `__init__`
     /// imports), resolved to their source path where possible.
     #[serde(skip_serializing_if = "Vec::is_empty")]
