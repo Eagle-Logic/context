@@ -10,8 +10,9 @@ implementation body, and emits a compact, deterministic topology map:
 
 - **Nodes** — modules, structs/enums/traits/impls, classes, functions
   (signature + file + line).
-- **Edges** — resolved internal import edges (`deps:`) and external
-  crates/packages (`extern:`).
+- **Edges** — resolved internal import edges (`deps:`), external
+  crates/packages (`extern:`), and per-function call edges you can walk
+  transitively (`ctx trace`, `ctx path`).
 
 No embeddings, no fuzzy retrieval. The map is a pure function of the source
 tree: same code in, same map out.
@@ -51,6 +52,13 @@ ctx def 'Type::method' ~/projects/myrepo   # qualified to disambiguate
 # Who calls this? (resolved reverse call edges — the blast radius)
 ctx callers basename ~/projects/myrepo
 
+# How does execution get here? (transitive call tree, not one hop)
+ctx trace decode_step ~/projects/myrepo --depth 4
+ctx trace decode_step ~/projects/myrepo --reverse    # everything that reaches it
+
+# The shortest call path between two symbols, hop by hop
+ctx path main flush_kv_cache ~/projects/myrepo
+
 # Everything needed to edit a symbol, in one call (def + types + callees + callers)
 ctx context streamChat ~/projects/myrepo --max-tokens 4000
 
@@ -61,8 +69,9 @@ ctx core ~/projects/myrepo --churn
 # Breaking-change check: public API removed/changed since a ref + who breaks
 ctx changed --api ~/projects/myrepo --since main
 
-# Coverage / blind-spot report: how much resolved, where to distrust
+# Coverage report: internal call-graph recall + exactly what went unpinned
 ctx doctor ~/projects/myrepo
+ctx doctor ~/projects/myrepo --explain   # full per-name census
 
 # Impact map of your current diff: changed modules + deps + callers
 ctx changed ~/projects/myrepo              # working tree vs HEAD
@@ -104,13 +113,32 @@ type definitions referenced in its signature, its callees, and its callers —
 trimmed to `--max-tokens` — so an agent can gather the full editing context
 for a symbol without a map→def→callers→subtree dance.
 
+`trace` and `path` are the execution-tracing commands. `callers` answers "who
+calls this" for exactly one hop; `trace` walks the call graph transitively —
+forward (what runs underneath a symbol) or `--reverse` (everything that reaches
+it) — cutting cycles and repeated subtrees with a marker instead of expanding
+forever. `path <from> <to>` gives the shortest route between two symbols, so
+"how does a request get from `main` to here" is one command rather than a
+grep chain. Both mark each hop's confidence (`~` receiver-inferred, `*` one
+branch of a dispatch fan-out) and report call edges that leave the resolved
+graph, so a trace never quietly implies more certainty than it has.
+
 `doctor` is a coverage/blind-spot report — deliberately honest about what `ctx`
-does *not* model. It splits every call site into internal edges resolved
-(with the heuristic `~` share), ubiquitous std/builtin calls (never edged by
-design), and external/unpinned calls, then lists the low-confidence modules
-(high `~` ratio) and the source files it can't parse at all (`.cpp`, `.go`,
-…). Run it once on a new repo to calibrate how much to trust the map — and to
-know exactly when to fall back to grep.
+does *not* model. Its headline is **internal recall**: resolved edges over the
+call sites that could have been internal at all. A call into `std` or a
+third-party crate is excluded from the denominator, because no internal edge
+could exist for it however good the resolver gets — classification is by
+evidence (is this name defined anywhere under the root?), not by a hardcoded
+list. The report then names **every callee it could not pin**, with counts, so
+"87% recall" comes with the exact grep list for the other 13%. `--explain`
+adds the full per-name census including what was ruled external. Run it once
+on a new repo to calibrate how much to trust the map.
+
+`callers` and `context` each end with a completeness line for the specific
+symbol asked about: whether any call site bearing that name went unresolved,
+and if so where. An agent should not have to run `doctor` to learn that the one
+symbol it cares about is among the misses — or, more usefully, that it isn't,
+and the confirming grep can be skipped.
 
 `changed` turns a diff into an impact map: it runs `git diff` (working tree
 vs HEAD, or vs `--since <ref>`, including untracked files), maps the changed
@@ -155,13 +183,15 @@ match is reported in its own **Aligned via alias** section (`__init__ → new
 (via init → new)`), never silently folded — so the fuzz you opted into is
 always visible.
 
-`def` and `callers` accept a bare name (`to_config`) or a qualified name
-(`SteerOverride::to_config`, `pkg.mod.fn`); a bare name lists every match so
-overloads are disambiguated by module + signature. `callers` is the inverse of
-the per-function `→ callee` edges in `map`/`subtree`: it reports only *resolved*
-call sites, so it is precise where a text grep floods on a common method name —
-though it inherits the resolver's heuristics (a receiver `.m()` call is
-attributed to the enclosing impl when the type is unknown).
+`def`, `callers`, `context`, `trace`, and `path` all accept a bare name
+(`to_config`) or a qualified name (`SteerOverride::to_config`, `pkg.mod.fn`);
+a bare name lists every match so overloads are disambiguated by module +
+signature. `callers` is the inverse of the per-function `→ callee` edges in
+`map`/`subtree`: it reports only *resolved* call sites, so it is precise where
+a text grep floods on a common method name. `trace` and `path` walk those same
+edges transitively. All three close with a completeness line stating whether
+any call site bearing that name went unresolved, so the answer's limits travel
+with the answer.
 
 `subtree` accepts a full module name (`core::inference`, `pkg.utils.validation`)
 or any trailing suffix (`inference`).
@@ -198,7 +228,14 @@ deps: encode
   - fn step(&mut self, action: Action) -> Percept  [L56]
 - impl Agent  [L192]
   - pub fn observe(&mut self, action: Option<Action>, p: &Percept)  [L204] → Agent::register_type, dist, encode::cosine
+  - pub fn drive(&mut self, env: &mut dyn Environment)  [L221] → world::Grid::step*, sim::Replay::step*
 ```
+
+Two markers qualify an edge. A trailing `~` means the target was inferred from
+a receiver whose type is not written in the source — trust it less. A trailing
+`*` means the edge is one branch of a dynamic-dispatch fan-out (`dyn Trait`,
+`impl Trait`, a bounded generic, a TS `interface`, a Python base class): every
+implementation that could run is listed, and exactly one of them does.
 
 A 71-file Rust repo renders to ~65 KB (~16k tokens) in under half a second —
 the entire architecture fits in one context window with room to spare.
@@ -252,8 +289,9 @@ outside the scanned subtree. Prose→code resolution is not yet modelled.
 
 `ctx mcp` runs a minimal MCP server over stdio (newline-delimited JSON-RPC,
 no dependencies) exposing the read-only commands as typed tools — `map`,
-`modules`, `subtree`, `def`, `callers`, `context`, `core`, `doctor` — so an
-agent calls them structured, without shelling out or a permission prompt.
+`modules`, `subtree`, `def`, `callers`, `context`, `trace`, `path`, `core`,
+`doctor` — so an agent calls them structured, without shelling out or a
+permission prompt.
 Register it once with Claude Code:
 
 ```sh
@@ -295,21 +333,38 @@ per call (~100 ms), so results are always current.
   `crate`/`super`/dots, re-export chase), then rendered on the function's
   line (`→ callee, ...`) and folded into module `deps:` — which also catches
   fully-qualified calls (`crate::foo::bar()`) that have no `use`. Receiver
-  method calls (`.steer()`, `obj.method()`) resolve to the enclosing
-  impl/class first, else through a global method index **only when the name
-  is unique codebase-wide and not a ubiquitous std method** (`push`, `get`,
-  `items`, ...). Ambiguous or unresolvable calls are dropped, never guessed.
-- **Edge confidence**: an edge backed by a resolved import, path, or
-  `self`/`Self` receiver is trusted. An edge attributed from an *opaque*
-  receiver (`expr.method()`, where the type is unknown) — whether matched to
-  the enclosing impl or a unique method name — is a heuristic guess and is
-  marked with a trailing `~` in `map`/`subtree`/`callers` (and `heuristic:
-  true` in JSON). This surfaces exactly the calls a type-blind resolver can
-  get wrong, so a `~`-free edge can be relied on and a `~` edge invites a
-  glance at the source.
-- **Not captured (yet)**: trait-impl resolution (calls through `dyn Trait` /
-  generic bounds stay unresolved unless the method name is unique), calls
-  inside nested functions are attributed to the enclosing item.
+  method calls resolve in confidence order: a `self`/`this` receiver against
+  the enclosing impl/class; a receiver whose type is **written in the source**
+  (parameter annotation, `let`/`const` binding, constructor call, or declared
+  field/property type) against that type; and only then, for a receiver with
+  no type at all, through a global method index **when the name is unique
+  codebase-wide and not a ubiquitous std method** (`push`, `get`, `items`, …).
+  Ambiguous or unresolvable calls are dropped, never guessed.
+- **Dynamic dispatch**: a call through a trait object, `impl Trait`, a bounded
+  generic, `<T as Trait>::f`, a TypeScript `interface`/`implements`, or a
+  Python base class fans out to **every implementation that defines the
+  method**, each edge marked `*`. Exactly one branch runs at a time, so this
+  is an over-approximation — but a visible over-approximation beats a dropped
+  edge when the question is "what could run here". The declaring abstraction
+  is a target only when nothing overrides the method, i.e. when its default
+  body is what actually executes. Fan-outs wider than 12 collapse to the
+  abstraction with an `[N impls]` annotation.
+- **Nested callables**: functions declared inside a function body, `let`-bound
+  closures, and types declared inside a body are all lifted to child items.
+  Their calls are attributed to them rather than smeared onto the enclosing
+  function, and calls *to* them resolve lexically (`outer::helper`).
+- **Edge confidence**: an edge backed by a resolved import, path, `self`/`Self`
+  receiver, or a declared receiver type is trusted. An edge attributed from an
+  *opaque* receiver (`expr.method()`, where nothing in the source says the
+  type) is a heuristic guess, marked with a trailing `~` in
+  `map`/`subtree`/`callers`/`trace` (and `heuristic: true` in JSON). A
+  dispatch branch is marked `*` (`dispatch: true` in JSON). This surfaces
+  exactly the calls a type-blind resolver can get wrong, so an unmarked edge
+  can be relied on and a marked one invites a glance at the source.
+- **Not captured (yet)**: receivers whose type comes from an expression ctx
+  does not evaluate — `for` bindings, iterator chains, and results of calls
+  that are not associated constructors — still fall back to the unique-name
+  heuristic. `doctor` names every such miss rather than hiding it.
 
 Adding a language = one extractor file producing a `FileFacts` (items,
 imports, re-export bindings, defined names) plus the tree-sitter grammar
@@ -327,12 +382,17 @@ reason:
 
 - **Determinism.** The map is a pure function of the source tree. No clocks, no
   hash-order iteration, no network.
-- **No guessing.** An edge is either proven, marked heuristic with `~`, or
-  dropped. `ctx doctor` exists so the map can be honest about its blind spots —
-  a change that raises coverage by guessing is a regression.
+- **No guessing.** An edge is proven, marked heuristic with `~`, marked as a
+  dispatch branch with `*`, or absent. A dropped edge is reported by name in
+  `ctx doctor`, never silently swallowed — the honest bit is not that coverage
+  is high, it is that the gaps are enumerable. A change that raises coverage by
+  guessing, or that reclassifies a miss as "external" without evidence that the
+  name is defined nowhere in the tree, is a regression.
 
 `ctx` is used against its own source, so `ctx doctor .` and `ctx diff main` are
-a reasonable first review of any patch.
+a reasonable first review of any patch. Watch internal recall and the miss
+census rather than the raw edge count: more edges at the cost of more `~` is
+not an improvement.
 
 ## License
 

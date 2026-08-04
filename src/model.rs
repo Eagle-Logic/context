@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
@@ -48,19 +48,37 @@ pub struct Module {
 }
 
 /// How completely a module's call sites resolved — the raw material for the
-/// coverage report. `dropped = call_sites - resolved`.
+/// coverage report.
+///
+/// Every call site lands in exactly one of three buckets, so
+/// `call_sites == resolved + external + unresolved`. The split between
+/// `external` and `unresolved` is the whole point: `external` is *provably*
+/// not an internal edge (the callee name is defined nowhere under this root),
+/// while `unresolved` is a genuine miss — a name that does exist here but that
+/// ctx could not pin to a definition. Internal recall is
+/// `resolved / (resolved + unresolved)`; the old "share of all call sites"
+/// figure is dominated by std/extern traffic and understates the graph badly.
 #[derive(Default, Clone)]
 pub struct Diagnostics {
-    /// Call sites seen (post-extract, so `<T as Trait>::f` and other
-    /// extract-time drops are not counted here).
+    /// Call sites seen (post-extract).
     pub call_sites: usize,
-    /// Call sites that produced an edge.
+    /// Call sites that produced at least one edge.
     pub resolved: usize,
     /// Of the resolved, how many are heuristic (receiver-inferred).
     pub heuristic: usize,
-    /// Ubiquitous std/builtin method names (`push`, `iter`, `map`, …) that are
-    /// intentionally never edged — not a blind spot.
-    pub std_builtin: usize,
+    /// Of the resolved, how many fanned out over trait/interface impls.
+    pub dispatch: usize,
+    /// Provably external: the callee name is defined nowhere under this root,
+    /// so no internal edge could exist. Never a blind spot.
+    pub external: usize,
+    /// The real misses: the callee name IS defined somewhere under this root,
+    /// but ctx could not pin which definition.
+    pub unresolved: usize,
+    /// Census of the callee names behind `external`, for `doctor --explain`.
+    pub extern_names: BTreeMap<String, usize>,
+    /// Census of the callee names behind `unresolved`, for `doctor --explain`
+    /// and for the completeness warning on `callers`/`context`.
+    pub unresolved_names: BTreeMap<String, usize>,
     /// Markdown only: (line, target) of links that resolve to no existing
     /// file or heading — i.e. genuinely broken links.
     pub broken_links: Vec<(usize, String)>,
@@ -130,6 +148,15 @@ pub struct Item {
     /// Call sites as written in source; consumed during resolution.
     #[serde(skip)]
     pub raw_calls: Vec<RawCall>,
+    /// The abstraction this container implements: the trait of a Rust
+    /// `impl Trait for Type`, a TypeScript `implements`/`extends` clause, or a
+    /// Python base class. Drives dispatch fan-out.
+    #[serde(skip)]
+    pub implements: Vec<String>,
+    /// Declared field/property types by field name (struct fields, class
+    /// properties). Lets `self.field.method()` resolve.
+    #[serde(skip)]
+    pub field_types: BTreeMap<String, String>,
 }
 
 /// One resolved outgoing call edge.
@@ -141,6 +168,12 @@ pub struct Call {
     /// method-name lookup) rather than a resolved import/path/definition.
     #[serde(skip_serializing_if = "is_false")]
     pub heuristic: bool,
+    /// True when the edge is one branch of a dynamic-dispatch fan-out: the
+    /// call goes through a trait object / interface / bounded generic, and
+    /// this is one of the implementations it may land in. Over-approximate by
+    /// construction — exactly one sibling `dispatch` edge runs at a time.
+    #[serde(skip_serializing_if = "is_false")]
+    pub dispatch: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -149,13 +182,23 @@ fn is_false(b: &bool) -> bool {
 
 /// How a callee was referenced — governs how confidently a receiver method
 /// call can be attributed to a container.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Receiver {
     /// A free function or fully-pathed call: `foo()`, `a::b::foo()`.
     Free,
     /// An explicit self/Self receiver (`self.f()`, `Self::f()`): the
     /// enclosing impl/class is the correct container.
     SelfType,
+    /// `self.field.method()` — the receiver is a field of the enclosing type,
+    /// resolved against that type's declared field types.
+    SelfField(String),
+    /// A receiver whose concrete type is known from a local binding, a
+    /// parameter annotation, or a field declaration: `let e: Engine`, then
+    /// `e.step()`. The attribution is backed by a type written in the source.
+    Typed(String),
+    /// A receiver that is a trait object, `impl Trait`, a bounded generic, or
+    /// an interface-typed value: the call dispatches over every implementation.
+    Dyn(String),
     /// An opaque receiver (`expr.f()`): the type is unknown, so any
     /// attribution is a heuristic guess.
     Unknown,

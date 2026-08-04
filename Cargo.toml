@@ -1,6 +1,6 @@
 [package]
 name = "context"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Deterministic AST skeleton maps of a codebase for agent context injection"

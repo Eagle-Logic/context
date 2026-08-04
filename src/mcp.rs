@@ -109,9 +109,21 @@ fn tools() -> Vec<Value> {
             &[],
         ),
         tool(
+            "trace",
+            "Transitive call tree from a symbol: what actually runs underneath it. Set reverse=true for the inbound tree (what reaches it).",
+            json!({ "path": path_prop(), "name": name_prop, "depth": {"type": "integer", "description": "Call hops to expand (default 3)"}, "reverse": {"type": "boolean", "description": "Walk callers instead of callees"} }),
+            &["name"],
+        ),
+        tool(
+            "path",
+            "Shortest call path between two symbols — how execution gets from one to the other.",
+            json!({ "path": path_prop(), "from": {"type": "string", "description": "Starting function/method"}, "to": {"type": "string", "description": "Destination function/method"} }),
+            &["from", "to"],
+        ),
+        tool(
             "doctor",
-            "Coverage report: how much of the call graph resolved and what ctx cannot model.",
-            json!({ "path": path_prop() }),
+            "Coverage report: internal call-graph recall, the callee names ctx could not pin, and what it cannot model. Set explain=true for the full per-name census.",
+            json!({ "path": path_prop(), "explain": {"type": "boolean", "description": "Print the full per-name census"} }),
             &[],
         ),
     ]
@@ -139,6 +151,7 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
     };
     let sarg = |k: &str| args.get(k).and_then(Value::as_str);
     let uarg = |k: &str, d: u64| args.get(k).and_then(Value::as_u64).unwrap_or(d) as usize;
+    let barg = |k: &str| args.get(k).and_then(Value::as_bool).unwrap_or(false);
 
     match name {
         "map" => {
@@ -169,9 +182,23 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
             None => ("missing required argument 'name'".into(), true),
         },
         "core" => (query::core(&g, uarg("limit", 30), None, false), false),
+        "trace" => match sarg("name") {
+            Some(n) => (
+                query::trace(&g, n, uarg("depth", 3), barg("reverse"), false),
+                false,
+            ),
+            None => ("missing required argument 'name'".into(), true),
+        },
+        "path" => match (sarg("from"), sarg("to")) {
+            (Some(f), Some(t)) => (query::path(&g, f, t, false), false),
+            _ => ("missing required argument 'from' or 'to'".into(), true),
+        },
         "doctor" => {
             let unsupported = extract::unsupported_census(Path::new(path));
-            (query::coverage_report(&g, &unsupported, false), false)
+            (
+                query::coverage_report(&g, &unsupported, barg("explain"), false),
+                false,
+            )
         }
         other => (format!("unknown tool: {other}"), true),
     }
@@ -197,7 +224,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        for expected in ["map", "def", "callers", "context", "core", "doctor"] {
+        for expected in ["map", "def", "callers", "context", "core", "doctor", "trace", "path"] {
             assert!(names.contains(&expected), "missing tool {expected}: {names:?}");
         }
     }

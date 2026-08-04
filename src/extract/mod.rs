@@ -259,7 +259,7 @@ fn resolve_deps(modules: &mut [Module], root: &Path) {
             by_name,
             root,
         };
-        let method_index = build_method_index(ctx.modules);
+        let uni = build_universe(ctx.modules);
         ctx.modules
             .iter()
             .map(|m| {
@@ -282,7 +282,7 @@ fn resolve_deps(modules: &mut [Module], root: &Path) {
                     .filter(|b| b.public)
                     .map(|b| display_reexport(b, m, &ctx))
                     .collect();
-                let (calls_per_item, call_deps, diag) = compute_calls(m, &ctx, &method_index);
+                let (calls_per_item, call_deps, diag) = compute_calls(m, &ctx, &uni);
                 deps.extend(call_deps.into_iter().filter(|d| d != &m.name));
                 (deps, ext, reex, calls_per_item, diag)
             })
@@ -547,9 +547,10 @@ fn provides(mi: usize, sym: &str, ctx: &Ctx, depth: usize) -> bool {
     false
 }
 
-/// Receiver-based method calls are resolved via a global method index only
-/// when the name is unique codebase-wide AND not a ubiquitous std method —
-/// otherwise a single local `fn push` would swallow every `vec.push()`.
+/// Names that must never be attributed to a same-named local definition: a
+/// single local `fn push` would otherwise swallow every `vec.push()`. This
+/// list suppresses *edges* only — it plays no part in classifying a call site
+/// as external, which is decided by evidence (see `Universe::all_names`).
 const STD_METHODS: &[&str] = &[
     "new", "default", "clone", "into", "from", "as_ref", "as_mut", "as_str", "to_string",
     "to_owned", "to_vec", "into_iter", "iter", "iter_mut", "next", "collect", "map", "filter",
@@ -566,33 +567,117 @@ const STD_METHODS: &[&str] = &[
     "ln", "cos", "sin", "tan", "get_or_insert_with", "retain", "drain", "chunks", "windows",
 ];
 
+/// Free-call names that always belong to the language, not to the repo:
+/// enum constructors and macro-ish builtins. Like `STD_METHODS` these are
+/// classified external on a resolution failure, so the miss census stays
+/// readable — an `Err(..)` is never a call into your code.
+const STD_FREE: &[&str] = &[
+    "Ok", "Err", "Some", "None", "format", "vec", "print", "println", "eprint", "eprintln",
+    "panic", "assert", "assert_eq", "assert_ne", "debug_assert", "matches", "todo",
+    "unimplemented", "unreachable", "dbg", "int", "str", "list", "dict", "set", "tuple",
+    "bool", "float", "range", "super", "isinstance", "hasattr", "getattr", "setattr",
+    "String", "Vec", "Box", "Rc", "Arc",
+];
+
 /// method name -> set of (module, container type/class) defining it.
 type MethodIndex = HashMap<String, BTreeSet<(String, String)>>;
 
-fn build_method_index(modules: &[Module]) -> MethodIndex {
-    fn rec(items: &[Item], module: &str, idx: &mut MethodIndex) {
+/// A dynamic-dispatch call fans out over implementations. Past this many the
+/// edge list stops being information and starts being noise, so it collapses
+/// to the abstraction itself.
+const DISPATCH_FANOUT: usize = 12;
+
+/// Whole-tree symbol evidence, built once and shared by every module's
+/// resolution pass.
+struct Universe {
+    /// method name -> the (module, container) pairs defining it.
+    methods: MethodIndex,
+    /// Every name defined anywhere under this root — module-level symbols,
+    /// types, methods, nested functions. A callee name absent from this set
+    /// is *provably* external: no internal edge could exist, whatever ctx
+    /// does. This is what separates "not our code" from "we missed it".
+    all_names: BTreeSet<String>,
+    /// Every segment appearing in a module name, so a leading path segment can
+    /// be recognized as an internal module reference.
+    module_segs: BTreeSet<String>,
+    /// trait / interface / base-class name -> the (module, type) pairs
+    /// implementing it. The raw material for dispatch fan-out.
+    implementors: HashMap<String, BTreeSet<(String, String)>>,
+    /// type name -> its declared field/property types, so `self.field.m()`
+    /// can be resolved against the field's type.
+    fields: HashMap<String, BTreeMap<String, String>>,
+}
+
+fn build_universe(modules: &[Module]) -> Universe {
+    fn rec(
+        items: &[Item],
+        module: &str,
+        methods: &mut MethodIndex,
+        all: &mut BTreeSet<String>,
+        implementors: &mut HashMap<String, BTreeSet<(String, String)>>,
+        fields: &mut HashMap<String, BTreeMap<String, String>>,
+    ) {
         for it in items {
-            if matches!(it.kind.as_str(), "impl" | "trait" | "class") {
+            if let Some(n) = &it.name {
+                all.insert(n.clone());
+                if !it.field_types.is_empty() {
+                    fields
+                        .entry(n.clone())
+                        .or_default()
+                        .extend(it.field_types.clone());
+                }
+            }
+            if matches!(it.kind.as_str(), "impl" | "trait" | "class" | "interface") {
                 if let Some(cname) = &it.name {
                     for ch in &it.children {
                         if matches!(ch.kind.as_str(), "fn" | "def") {
                             if let Some(n) = &ch.name {
-                                idx.entry(n.clone())
+                                methods
+                                    .entry(n.clone())
                                     .or_default()
                                     .insert((module.to_string(), cname.clone()));
                             }
                         }
                     }
+                    for t in &it.implements {
+                        implementors
+                            .entry(t.clone())
+                            .or_default()
+                            .insert((module.to_string(), cname.clone()));
+                    }
+                    // A trait/interface is its own fallback implementor, so a
+                    // default method body is reachable when no impl overrides it.
+                    if matches!(it.kind.as_str(), "trait" | "interface") {
+                        implementors
+                            .entry(cname.clone())
+                            .or_default()
+                            .insert((module.to_string(), cname.clone()));
+                    }
                 }
             }
-            rec(&it.children, module, idx);
+            rec(&it.children, module, methods, all, implementors, fields);
         }
     }
-    let mut idx = MethodIndex::new();
+    let mut u = Universe {
+        methods: MethodIndex::new(),
+        all_names: BTreeSet::new(),
+        module_segs: BTreeSet::new(),
+        implementors: HashMap::new(),
+        fields: HashMap::new(),
+    };
     for m in modules {
-        rec(&m.items, &m.name, &mut idx);
+        u.all_names.extend(m.defined_names.iter().cloned());
+        u.module_segs.extend(m.name_segs());
+        rec(
+            &m.items,
+            &m.name,
+            &mut u.methods,
+            &mut u.all_names,
+            &mut u.implementors,
+            &mut u.fields,
+        );
     }
-    idx
+    u
 }
 
 fn container_has_method(m: &Module, container: &str, name: &str) -> bool {
@@ -610,33 +695,68 @@ fn container_has_method(m: &Module, container: &str, name: &str) -> bool {
     rec(&m.items, container, name)
 }
 
-/// Resolve one call site to (display string, dep module). Same-module edges
-/// display without the module prefix and carry no dep. Unresolvable or
-/// ambiguous calls return None — never guessed.
-/// The outcome of resolving one call site — richer than an Option so the
-/// coverage report can separate std/builtin calls from genuine misses.
-enum Resolution {
-    Edge {
-        display: String,
-        dep: Option<String>,
-        heuristic: bool,
-    },
-    /// A ubiquitous std/builtin method — intentionally not edged.
-    StdBuiltin,
-    /// Could not be resolved to an internal edge (ambiguous, external, or
-    /// unknown receiver).
-    Drop,
+/// One outgoing edge produced by a call site. Same-module edges display
+/// without the module prefix and carry no dep.
+struct EdgeOut {
+    display: String,
+    dep: Option<String>,
+    heuristic: bool,
+    dispatch: bool,
 }
 
-/// Wrap `finish_call`'s Option into a Resolution.
-fn finished(fm: &str, fr: &[String], m: &Module, ctx: &Ctx) -> Resolution {
+impl EdgeOut {
+    fn plain(display: String, dep: Option<String>) -> Self {
+        EdgeOut { display, dep, heuristic: false, dispatch: false }
+    }
+    fn guess(display: String, dep: Option<String>) -> Self {
+        EdgeOut { display, dep, heuristic: true, dispatch: false }
+    }
+}
+
+/// The outcome of resolving one call site. The two non-edge outcomes are kept
+/// apart deliberately: `External` is proof that no internal edge exists,
+/// `Unresolved` is an admission that one might and ctx could not find it.
+/// Collapsing them is what made the old coverage number unreadable.
+enum Resolution {
+    /// One or more edges. More than one means dynamic dispatch fan-out.
+    Edges(Vec<EdgeOut>),
+    /// The callee name is defined nowhere under this root: std, a builtin, or
+    /// an external crate/package. Never a blind spot.
+    External(String),
+    /// The callee name IS defined under this root, but ctx could not pin which
+    /// definition. A genuine miss — the number worth driving down.
+    Unresolved(String),
+}
+
+impl Resolution {
+    fn one(e: EdgeOut) -> Self {
+        Resolution::Edges(vec![e])
+    }
+}
+
+/// Classify a call site ctx could not edge, using whole-tree evidence rather
+/// than a hardcoded list: if the name is defined nowhere here, the miss is
+/// provably external.
+fn miss(name: &str, uni: &Universe) -> Resolution {
+    // A ubiquitous std name that failed to resolve is std, not a miss —
+    // whatever internal symbol happens to share the spelling. Classifying
+    // these as misses buries the real ones under `.push()` and `Err(..)`.
+    if STD_METHODS.contains(&name) || STD_FREE.contains(&name) {
+        return Resolution::External(name.to_string());
+    }
+    if uni.all_names.contains(name) {
+        Resolution::Unresolved(name.to_string())
+    } else {
+        Resolution::External(name.to_string())
+    }
+}
+
+/// Wrap `finish_call`'s Option into a Resolution, classifying a failure by the
+/// symbol the path was trying to reach.
+fn finished(fm: &str, fr: &[String], m: &Module, ctx: &Ctx, uni: &Universe) -> Resolution {
     match finish_call(fm, fr, m, ctx) {
-        Some((display, dep, heuristic)) => Resolution::Edge {
-            display,
-            dep,
-            heuristic,
-        },
-        None => Resolution::Drop,
+        Some((display, dep)) => Resolution::one(EdgeOut::plain(display, dep)),
+        None => miss(fr.last().map(String::as_str).unwrap_or(""), uni),
     }
 }
 
@@ -645,7 +765,8 @@ fn resolve_call(
     container: Option<&str>,
     m: &Module,
     ctx: &Ctx,
-    method_index: &MethodIndex,
+    uni: &Universe,
+    locals: &BTreeMap<String, String>,
 ) -> Resolution {
     let s = sep(m.lang);
 
@@ -654,86 +775,151 @@ fn resolve_call(
         return resolve_md_link(&rc.path, m, ctx);
     }
 
-    match rc.recv {
+    match &rc.recv {
         // `self.f()` / `Self::f()`: the enclosing container is the correct
         // owner, so an enclosing-impl hit is trustworthy.
         Receiver::SelfType => {
-            return method_edge(&rc.path, container, m, ctx, method_index, false)
+            return method_edge(&rc.path, container, m, ctx, uni, false);
         }
+        // `self.field.f()`: look the field's declared type up on the
+        // enclosing type, then resolve as if it were written out.
+        Receiver::SelfField(field) => {
+            return match container.and_then(|c| uni.fields.get(c)).and_then(|f| f.get(field)) {
+                Some(ty) => match field_receiver(ty, uni) {
+                    Receiver::Typed(t) => typed_edge(&rc.path, &t, m, ctx, uni),
+                    Receiver::Dyn(t) => dispatch_edge(&rc.path, &t, m, uni),
+                    _ => method_edge(&rc.path, container, m, ctx, uni, true),
+                },
+                None => method_edge(&rc.path, container, m, ctx, uni, true),
+            };
+        }
+        // The receiver's type is written in the source (parameter annotation,
+        // `let` binding, or field declaration) — resolve against that type.
+        Receiver::Typed(t) => return typed_edge(&rc.path, t, m, ctx, uni),
+        // The receiver is a trait object / interface / bounded generic: the
+        // call reaches every implementation.
+        Receiver::Dyn(t) => return dispatch_edge(&rc.path, t, m, uni),
         // `expr.f()`: receiver type unknown — any attribution is a guess.
         Receiver::Unknown => {
-            return method_edge(&rc.path, container, m, ctx, method_index, true)
+            return method_edge(&rc.path, container, m, ctx, uni, true);
         }
         Receiver::Free => {}
     }
 
     let segs: Vec<&str> = rc.path.split(s).map(str::trim).filter(|x| !x.is_empty()).collect();
     match segs.len() {
-        0 => Resolution::Drop,
+        0 => Resolution::External(String::new()),
         1 => {
             let name = segs[0];
             if m.defined_names.contains(name) {
-                return Resolution::Edge {
-                    display: name.to_string(),
-                    dep: None,
-                    heuristic: false,
-                };
+                return Resolution::one(EdgeOut::plain(name.to_string(), None));
+            }
+            // A function nested in the enclosing function body: lexically
+            // scoped, so this is the only thing the name can mean.
+            if let Some(display) = locals.get(name) {
+                return Resolution::one(EdgeOut::plain(display.clone(), None));
             }
             // `use crate::core::build; build()` / `from x import f; f()`
             let Some(b) = m.raw_reexports.iter().find(|b| b.name == name) else {
-                return Resolution::Drop;
+                return miss(name, uni);
             };
             let Some((n2, r2)) = resolve_path(&b.path, m, ctx) else {
-                return Resolution::Drop;
+                return miss(name, uni);
             };
             let (fm, fr) = chase(&n2, &r2, ctx, CHASE_DEPTH);
-            finished(&fm, &fr, m, ctx)
+            finished(&fm, &fr, m, ctx, uni)
         }
         _ => {
+            let last = *segs.last().unwrap();
             // Type-qualified local call: Engine::new() with Engine defined here.
             if m.defined_names.contains(segs[0]) {
-                return Resolution::Edge {
-                    display: segs.join(s),
-                    dep: None,
-                    heuristic: false,
-                };
+                return Resolution::one(EdgeOut::plain(segs.join(s), None));
             }
             // First segment bound by use/import: helpers::go(), np-style aliases.
             if let Some(b) = m.raw_reexports.iter().find(|b| b.name == segs[0]) {
                 let full = format!("{}{s}{}", b.path, segs[1..].join(s));
                 let Some((n2, r2)) = resolve_path(&full, m, ctx) else {
-                    return Resolution::Drop;
+                    return miss(last, uni);
                 };
                 let (fm, fr) = chase(&n2, &r2, ctx, CHASE_DEPTH);
-                return finished(&fm, &fr, m, ctx);
+                return finished(&fm, &fr, m, ctx, uni);
             }
             // Direct path: crate::core::build(), pkg.utils.helper().
             if let Some((n2, r2)) = resolve_path(&rc.path, m, ctx) {
                 let (fm, fr) = chase(&n2, &r2, ctx, CHASE_DEPTH);
-                return finished(&fm, &fr, m, ctx);
+                return finished(&fm, &fr, m, ctx, uni);
             }
             // Python `obj.method()`: the receiver is opaque, but the trailing
             // name may still resolve like a method call (heuristic).
             if m.lang == Lang::Python {
-                if let Some(last) = segs.last() {
-                    return method_edge(last, container, m, ctx, method_index, true);
-                }
+                return method_edge(last, container, m, ctx, uni, true);
             }
-            Resolution::Drop
+            // A qualified path whose root is neither a local symbol, an
+            // imported binding, nor an internal module is another crate's.
+            if is_external_root(segs[0], m, uni) {
+                return Resolution::External(segs[0].to_string());
+            }
+            miss(last, uni)
         }
     }
 }
 
+/// Reduce a declared field type to a receiver kind. Field types are stored as
+/// written (`Box<dyn Sampler>`, `&'a Engine`), so the wrappers come off here.
+fn field_receiver(ty: &str, uni: &Universe) -> Receiver {
+    let t = ty
+        .trim()
+        .trim_start_matches('&')
+        .trim()
+        .trim_start_matches("mut ")
+        .trim();
+    if let Some(rest) = t.strip_prefix("dyn ") {
+        return Receiver::Dyn(base_type(rest));
+    }
+    let base = base_type(t);
+    const TRANSPARENT: &[&str] = &[
+        "Box", "Arc", "Rc", "RefCell", "Cell", "Mutex", "RwLock", "Cow", "Option",
+    ];
+    if TRANSPARENT.contains(&base.as_str()) {
+        if let (Some(i), Some(j)) = (t.find('<'), t.rfind('>')) {
+            return field_receiver(&t[i + 1..j], uni);
+        }
+    }
+    if uni.implementors.contains_key(&base) {
+        return Receiver::Dyn(base);
+    }
+    Receiver::Typed(base)
+}
+
+/// The bare type name: generics stripped, path segments dropped.
+fn base_type(t: &str) -> String {
+    let t = t.split('<').next().unwrap_or(t).trim();
+    t.rsplit("::").next().unwrap_or(t).trim().to_string()
+}
+
+/// Is the leading segment of a qualified call path provably not ours? A root
+/// that names no internal symbol, no imported binding, and no module segment
+/// belongs to an external crate/package.
+fn is_external_root(root: &str, m: &Module, uni: &Universe) -> bool {
+    // Explicitly internal roots, whatever else they look like.
+    if matches!(root, "crate" | "self" | "super") || root.starts_with('.') {
+        return false;
+    }
+    !uni.all_names.contains(root)
+        && !uni.module_segs.contains(root)
+        && !m.raw_reexports.iter().any(|b| b.name == root)
+}
+
 /// Resolve a markdown link to a doc/heading edge, or flag it broken. An
-/// external URL or a link to a non-doc asset is treated like a std/builtin
-/// call (correctly not an internal edge); a relative doc link whose file or
-/// heading doesn't exist becomes a Drop — i.e. a broken link.
+/// external URL or a link to a non-doc asset is provably external (correctly
+/// not an internal edge); a relative doc link whose file or heading doesn't
+/// exist is Unresolved — i.e. a broken link.
 fn resolve_md_link(link: &str, m: &Module, ctx: &Ctx) -> Resolution {
     if let Some(inner) = link.strip_prefix("[[").and_then(|s| s.strip_suffix("]]")) {
         return resolve_md_wiki(inner, m, ctx);
     }
     if is_external_url(link) {
-        return Resolution::StdBuiltin;
+        return Resolution::External(link.to_string());
     }
     let (file_part, frag) = match link.split_once('#') {
         Some((f, g)) => (f, Some(g)),
@@ -743,7 +929,7 @@ fn resolve_md_link(link: &str, m: &Module, ctx: &Ctx) -> Resolution {
     if file_part.is_empty() {
         return match frag {
             Some(g) => md_anchor_edge(&m.name, g, m, ctx),
-            None => Resolution::Drop,
+            None => Resolution::Unresolved(link.to_string()),
         };
     }
     let (stem, is_doc) = strip_md_ext(file_part.trim_end_matches('/'));
@@ -758,9 +944,9 @@ fn resolve_md_link(link: &str, m: &Module, ctx: &Ctx) -> Resolution {
         // (`.png`, `.rs`) are never doc nodes.
         _ => {
             if is_doc && !md_target_on_disk(ctx.root, &m.file, file_part) {
-                Resolution::Drop
+                Resolution::Unresolved(link.to_string())
             } else {
-                Resolution::StdBuiltin
+                Resolution::External(link.to_string())
             }
         }
     }
@@ -800,48 +986,33 @@ fn resolve_md_wiki(inner: &str, m: &Module, ctx: &Ctx) -> Resolution {
             None => md_module_edge(&mm.name, m),
             Some(g) => md_anchor_edge(&mm.name, g, m, ctx),
         },
-        None => Resolution::Drop,
+        None => Resolution::Unresolved(inner.to_string()),
     }
 }
 
 /// Edge to a whole document (a link with no `#fragment`).
 fn md_module_edge(name: &str, m: &Module) -> Resolution {
-    if name == m.name {
-        Resolution::Edge {
-            display: name.to_string(),
-            dep: None,
-            heuristic: false,
-        }
-    } else {
-        Resolution::Edge {
-            display: name.to_string(),
-            dep: Some(name.to_string()),
-            heuristic: false,
-        }
-    }
+    let dep = (name != m.name).then(|| name.to_string());
+    Resolution::one(EdgeOut::plain(name.to_string(), dep))
 }
 
 /// Edge to a specific heading; broken (Drop) if that heading slug is absent.
 fn md_anchor_edge(name: &str, frag: &str, m: &Module, ctx: &Ctx) -> Resolution {
     let s = markdown::slug(frag);
     let Some(&ni) = ctx.by_name.get(name) else {
-        return Resolution::Drop;
+        return Resolution::Unresolved(format!("{name}#{frag}"));
     };
     if !ctx.modules[ni].defined_names.contains(&s) {
-        return Resolution::Drop; // file exists, heading doesn't
+        // file exists, heading doesn't
+        return Resolution::Unresolved(format!("{name}#{frag}"));
     }
     if name == m.name {
-        Resolution::Edge {
-            display: s,
-            dep: None,
-            heuristic: false,
-        }
+        Resolution::one(EdgeOut::plain(s, None))
     } else {
-        Resolution::Edge {
-            display: format!("{name}.{s}"),
-            dep: Some(name.to_string()),
-            heuristic: false,
-        }
+        Resolution::one(EdgeOut::plain(
+            format!("{name}.{s}"),
+            Some(name.to_string()),
+        ))
     }
 }
 
@@ -871,57 +1042,163 @@ fn method_edge(
     container: Option<&str>,
     m: &Module,
     ctx: &Ctx,
-    method_index: &MethodIndex,
+    uni: &Universe,
     receiver_unknown: bool,
 ) -> Resolution {
     let s = sep(m.lang);
     if let Some(c) = container {
         if container_has_method(m, c, name) {
             // Reliable for a self receiver; a guess for an opaque one.
-            return Resolution::Edge {
-                display: format!("{c}{s}{name}"),
-                dep: None,
-                heuristic: receiver_unknown,
-            };
+            let display = format!("{c}{s}{name}");
+            return Resolution::one(if receiver_unknown {
+                EdgeOut::guess(display, None)
+            } else {
+                EdgeOut::plain(display, None)
+            });
         }
     }
+    // A ubiquitous std name on a receiver ctx could not type: overwhelmingly
+    // `vec.push()`, not a local `fn push`. Reporting these as misses would
+    // bury the real ones under hundreds of `.collect()` calls. A receiver with
+    // a known type never reaches here — `typed_edge` resolves it first, which
+    // is the escape hatch for a genuine local `push`.
     if STD_METHODS.contains(&name) {
-        return Resolution::StdBuiltin;
+        return Resolution::External(name.to_string());
     }
-    let Some(owners) = method_index.get(name) else {
-        return Resolution::Drop;
+    let Some(owners) = uni.methods.get(name) else {
+        return miss(name, uni);
     };
     if owners.len() != 1 {
-        return Resolution::Drop;
+        return miss(name, uni);
     }
     // Resolved purely because the method name is unique codebase-wide — a
     // heuristic, since the receiver type was never confirmed.
     let (om, oc) = owners.iter().next().unwrap();
-    let Some(&omi) = ctx.by_name.get(om) else {
-        return Resolution::Drop;
-    };
-    let os = sep(ctx.modules[omi].lang);
-    if om == &m.name {
-        Resolution::Edge {
-            display: format!("{oc}{os}{name}"),
-            dep: None,
-            heuristic: true,
-        }
-    } else {
-        Resolution::Edge {
-            display: format!("{om}{os}{oc}{os}{name}"),
-            dep: Some(om.clone()),
-            heuristic: true,
-        }
+    match owner_edge(om, oc, name, m, ctx) {
+        Some((display, dep)) => Resolution::one(EdgeOut::guess(display, dep)),
+        None => miss(name, uni),
     }
 }
 
-fn finish_call(
-    fm: &str,
-    fr: &[String],
+/// Build the display/dep pair for an edge onto method `name` of container
+/// `oc` defined in module `om`, as seen from module `m`.
+fn owner_edge(
+    om: &str,
+    oc: &str,
+    name: &str,
     m: &Module,
     ctx: &Ctx,
-) -> Option<(String, Option<String>, bool)> {
+) -> Option<(String, Option<String>)> {
+    let &omi = ctx.by_name.get(om)?;
+    let os = sep(ctx.modules[omi].lang);
+    if om == m.name {
+        Some((format!("{oc}{os}{name}"), None))
+    } else {
+        Some((format!("{om}{os}{oc}{os}{name}"), Some(om.to_string())))
+    }
+}
+
+/// `x.f()` where `x`'s type is written in the source. Unlike the unique-name
+/// heuristic this consults the declared type, so a method name shared by a
+/// dozen types still lands on the right one.
+fn typed_edge(name: &str, ty: &str, m: &Module, ctx: &Ctx, uni: &Universe) -> Resolution {
+    // The receiver's type is not defined under this root, so neither is the
+    // method: `let m: BTreeMap<_,_>` then `m.entry(..)` is provably external,
+    // even though some unrelated internal symbol may share the name.
+    if !uni.all_names.contains(ty) {
+        return Resolution::External(format!("{ty}::{name}"));
+    }
+    // The declared type is an abstraction others implement or subclass — a
+    // Python base class, a TypeScript interface, a Rust trait named directly.
+    // Which body runs depends on the value, so fan out rather than pinning the
+    // base's own definition and calling it proven.
+    let subtyped = uni
+        .implementors
+        .get(ty)
+        .is_some_and(|s| s.iter().any(|(_, t)| t != ty));
+    if subtyped {
+        return dispatch_edge(name, ty, m, uni);
+    }
+    let Some(owners) = uni.methods.get(name) else {
+        return miss(name, uni);
+    };
+    let matching: Vec<&(String, String)> = owners.iter().filter(|(_, c)| c == ty).collect();
+    // Prefer an owner in this module when the type name is not unique.
+    let pick = matching
+        .iter()
+        .find(|(om, _)| om == &m.name)
+        .or_else(|| matching.first());
+    let Some((om, oc)) = pick else {
+        return miss(name, uni);
+    };
+    match owner_edge(om, oc, name, m, ctx) {
+        // The receiver type is declared in source, so this is not a guess —
+        // unless several distinct types share the name, which is.
+        Some((display, dep)) => Resolution::one(EdgeOut {
+            display,
+            dep,
+            heuristic: matching.len() > 1,
+            dispatch: false,
+        }),
+        None => miss(name, uni),
+    }
+}
+
+/// A call through a trait object, `impl Trait`, a bounded generic, or an
+/// interface-typed value. Exactly one implementation runs, but which one is
+/// not knowable statically — so ctx emits the whole possible set, marked as
+/// dispatch. An over-approximation you can see beats a dropped edge.
+fn dispatch_edge(name: &str, abstraction: &str, m: &Module, uni: &Universe) -> Resolution {
+    if !uni.all_names.contains(abstraction) {
+        return Resolution::External(format!("{abstraction}::{name}"));
+    }
+    let Some(impls) = uni.implementors.get(abstraction) else {
+        return miss(name, uni);
+    };
+    let Some(owners) = uni.methods.get(name) else {
+        return miss(name, uni);
+    };
+    let os = sep(m.lang);
+    let edge_to = |om: &String, ty: &String| {
+        let (display, dep) = if om == &m.name {
+            (format!("{ty}{os}{name}"), None)
+        } else {
+            (format!("{om}{os}{ty}{os}{name}"), Some(om.clone()))
+        };
+        EdgeOut { display, dep, heuristic: false, dispatch: true }
+    };
+    // Concrete implementations first. The declaring trait/interface is only a
+    // target when nothing overrides the method — i.e. it is a default body,
+    // the thing that actually runs, rather than a bare signature.
+    let mut edges: Vec<EdgeOut> = impls
+        .iter()
+        .filter(|(om, ty)| ty != abstraction && owners.contains(&(om.clone(), ty.clone())))
+        .map(|(om, ty)| edge_to(om, ty))
+        .collect();
+    if edges.is_empty() {
+        edges = impls
+            .iter()
+            .filter(|(om, ty)| ty == abstraction && owners.contains(&(om.clone(), ty.clone())))
+            .map(|(om, ty)| edge_to(om, ty))
+            .collect();
+    }
+    if edges.is_empty() {
+        return miss(name, uni);
+    }
+    if edges.len() > DISPATCH_FANOUT {
+        // Too many branches to be readable: name the abstraction instead, and
+        // say how wide the fan-out is so nobody mistakes it for a single call.
+        return Resolution::one(EdgeOut {
+            display: format!("{abstraction}{os}{name} [{} impls]", edges.len()),
+            dep: None,
+            heuristic: false,
+            dispatch: true,
+        });
+    }
+    Resolution::Edges(edges)
+}
+
+fn finish_call(fm: &str, fr: &[String], m: &Module, ctx: &Ctx) -> Option<(String, Option<String>)> {
     if fr.is_empty() {
         return None;
     }
@@ -932,9 +1209,9 @@ fn finish_call(
     // Backed by a resolved import/path landing on a defined symbol: trusted.
     let s = sep(target.lang);
     if fm == m.name {
-        Some((fr.join(s), None, false))
+        Some((fr.join(s), None))
     } else {
-        Some((format!("{fm}{s}{}", fr.join(s)), Some(fm.to_string()), false))
+        Some((format!("{fm}{s}{}", fr.join(s)), Some(fm.to_string())))
     }
 }
 
@@ -944,71 +1221,132 @@ fn finish_call(
 fn compute_calls(
     m: &Module,
     ctx: &Ctx,
-    method_index: &MethodIndex,
+    uni: &Universe,
 ) -> (Vec<Vec<Call>>, BTreeSet<String>, Diagnostics) {
-    #[allow(clippy::too_many_arguments)]
-    fn rec(
-        items: &[Item],
-        container: Option<&str>,
-        m: &Module,
-        ctx: &Ctx,
-        method_index: &MethodIndex,
-        per_item: &mut Vec<Vec<Call>>,
-        deps: &mut BTreeSet<String>,
-        diag: &mut Diagnostics,
-    ) {
-        for it in items {
-            // Dedup by target; if the same edge resolves both ways, the
-            // trusted (non-heuristic) resolution wins.
-            let mut calls: BTreeMap<String, bool> = BTreeMap::new();
-            for rc in &it.raw_calls {
-                diag.call_sites += 1;
-                match resolve_call(rc, container, m, ctx, method_index) {
-                    Resolution::Edge {
-                        display,
-                        dep,
-                        heuristic,
-                    } => {
-                        diag.resolved += 1;
-                        if heuristic {
-                            diag.heuristic += 1;
+    struct Walk<'a> {
+        m: &'a Module,
+        ctx: &'a Ctx<'a>,
+        uni: &'a Universe,
+        per_item: Vec<Vec<Call>>,
+        deps: BTreeSet<String>,
+        diag: Diagnostics,
+    }
+
+    impl Walk<'_> {
+        fn rec(
+            &mut self,
+            items: &[Item],
+            container: Option<&str>,
+            locals: &BTreeMap<String, String>,
+            fn_path: Option<&str>,
+        ) {
+            for it in items {
+                // Functions nested in this one are in scope for its body (and
+                // for each other), and are the only thing their bare name can
+                // refer to.
+                let scope = extend_locals(locals, it, fn_path, self.m);
+                // Dedup by target; if the same edge resolves both ways, the
+                // trusted (non-heuristic) resolution wins.
+                let mut calls: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+                for rc in &it.raw_calls {
+                    self.diag.call_sites += 1;
+                    match resolve_call(rc, container, self.m, self.ctx, self.uni, &scope) {
+                        Resolution::Edges(edges) => {
+                            self.diag.resolved += 1;
+                            if edges.iter().any(|e| e.heuristic) {
+                                self.diag.heuristic += 1;
+                            }
+                            if edges.iter().any(|e| e.dispatch) {
+                                self.diag.dispatch += 1;
+                            }
+                            for e in edges {
+                                calls
+                                    .entry(e.display)
+                                    .and_modify(|v| {
+                                        v.0 = v.0 && e.heuristic;
+                                        v.1 = v.1 && e.dispatch;
+                                    })
+                                    .or_insert((e.heuristic, e.dispatch));
+                                if let Some(d) = e.dep {
+                                    self.deps.insert(d);
+                                }
+                            }
                         }
-                        calls
-                            .entry(display)
-                            .and_modify(|h| *h = *h && heuristic)
-                            .or_insert(heuristic);
-                        if let Some(d) = dep {
-                            deps.insert(d);
+                        Resolution::External(name) => {
+                            self.diag.external += 1;
+                            *self.diag.extern_names.entry(name).or_default() += 1;
                         }
-                    }
-                    Resolution::StdBuiltin => diag.std_builtin += 1,
-                    Resolution::Drop => {
-                        // For markdown, a drop is a genuine broken link.
-                        if m.lang == Lang::Markdown {
-                            diag.broken_links.push((it.line, rc.path.clone()));
+                        Resolution::Unresolved(name) => {
+                            self.diag.unresolved += 1;
+                            *self.diag.unresolved_names.entry(name).or_default() += 1;
+                            // For markdown, an unresolved link is a dead link.
+                            if self.m.lang == Lang::Markdown {
+                                self.diag.broken_links.push((it.line, rc.path.clone()));
+                            }
                         }
                     }
                 }
+                self.per_item.push(
+                    calls
+                        .into_iter()
+                        .map(|(to, (heuristic, dispatch))| Call { to, heuristic, dispatch })
+                        .collect(),
+                );
+                let next = if matches!(it.kind.as_str(), "impl" | "trait" | "class" | "interface") {
+                    it.name.as_deref()
+                } else {
+                    container
+                };
+                let inner_fn = if matches!(it.kind.as_str(), "fn" | "def") {
+                    it.name.as_deref().or(fn_path)
+                } else {
+                    fn_path
+                };
+                self.rec(&it.children, next, &scope, inner_fn);
             }
-            per_item.push(
-                calls
-                    .into_iter()
-                    .map(|(to, heuristic)| Call { to, heuristic })
-                    .collect(),
-            );
-            let next = if matches!(it.kind.as_str(), "impl" | "trait" | "class") {
-                it.name.as_deref()
-            } else {
-                container
-            };
-            rec(&it.children, next, m, ctx, method_index, per_item, deps, diag);
         }
     }
-    let mut per_item = Vec::new();
-    let mut deps = BTreeSet::new();
-    let mut diag = Diagnostics::default();
-    rec(&m.items, None, m, ctx, method_index, &mut per_item, &mut deps, &mut diag);
-    (per_item, deps, diag)
+
+    let mut w = Walk {
+        m,
+        ctx,
+        uni,
+        per_item: Vec::new(),
+        deps: BTreeSet::new(),
+        diag: Diagnostics::default(),
+    };
+    w.rec(&m.items, None, &BTreeMap::new(), None);
+    (w.per_item, w.deps, w.diag)
+}
+
+/// The lexical scope of function-local helpers visible inside `it`: whatever
+/// was already in scope, plus `it`'s own nested functions, keyed by bare name
+/// and mapped to a qualified display (`outer::helper`) so the edge is
+/// distinguishable from a module-level function of the same name.
+fn extend_locals(
+    locals: &BTreeMap<String, String>,
+    it: &Item,
+    fn_path: Option<&str>,
+    m: &Module,
+) -> BTreeMap<String, String> {
+    if !matches!(it.kind.as_str(), "fn" | "def") {
+        return locals.clone();
+    }
+    let s = sep(m.lang);
+    let owner = it.name.as_deref().or(fn_path);
+    let mut out = locals.clone();
+    for ch in &it.children {
+        if !matches!(ch.kind.as_str(), "fn" | "def") {
+            continue;
+        }
+        let Some(n) = &ch.name else { continue };
+        let display = match owner {
+            Some(o) => format!("{o}{s}{n}"),
+            None => n.clone(),
+        };
+        out.insert(n.clone(), display);
+    }
+    out
 }
 
 fn apply_calls(items: &mut [Item], resolved: &mut std::vec::IntoIter<Vec<Call>>) {

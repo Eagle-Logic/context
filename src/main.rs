@@ -122,10 +122,41 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
     },
+    /// Forward call tree from a symbol — what actually runs underneath it
+    /// (add --reverse for the inbound tree: what reaches it)
+    Trace {
+        /// Function/method name, bare or qualified (Type::method)
+        name: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// How many call hops to expand
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+        /// Walk callers instead of callees
+        #[arg(long)]
+        reverse: bool,
+        #[arg(long, value_enum, default_value_t = Format::Md)]
+        format: Format,
+    },
+    /// Shortest call path between two symbols — how execution gets from A to B
+    Path {
+        /// Starting function/method
+        from: String,
+        /// Destination function/method
+        to: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, value_enum, default_value_t = Format::Md)]
+        format: Format,
+    },
     /// Coverage report: how much of the call graph resolved, and blind spots
     Doctor {
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Print the full per-name census behind the numbers: every callee
+        /// ctx could not pin, and every name it classified as external
+        #[arg(long)]
+        explain: bool,
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
     },
@@ -193,8 +224,9 @@ implementation bodies.
 - `ctx map --view skeleton` — bird's-eye architecture: modules, deps, type names (cheapest)
 - `ctx map --view interface` — + public signatures, struct fields, enum variants (API surface)
 - `ctx map` — + private items and per-function call edges (`→ callee`) for tracing execution
-  (a trailing `~` on an edge means it was inferred from an opaque receiver, not an import/path —
-  trust it less)
+  (a trailing `~` means the edge was inferred from an opaque receiver rather than an import,
+  path, or declared type — trust it less; a trailing `*` means one branch of a dynamic-dispatch
+  fan-out through a trait object / interface / bounded generic, where exactly one branch runs)
 - `ctx modules` — one line per module with dependency edges
 - `ctx subtree <module> [--view ...]` — one module plus its immediate upstream dependencies
   and downstream dependents
@@ -204,6 +236,11 @@ implementation bodies.
   call edges — the blast radius before you change a signature; more precise than grep)
 - `ctx context <name>` — everything needed to edit a symbol in one shot: its definition, the
   types in its signature, what it calls, and what calls it (token-budgeted via `--max-tokens`)
+- `ctx trace <name> [--depth N] [--reverse]` — the transitive call tree from a symbol: what
+  actually runs underneath it, or with `--reverse` everything that reaches it (this is the
+  execution-tracing command; `callers` is only one hop)
+- `ctx path <from> <to>` — the shortest call path between two symbols: how execution gets from
+  one to the other, hop by hop
 - `ctx changed [--since <ref>]` — impact map of your diff: the changed modules plus their
   dependencies and the callers they may break (defaults to the working tree vs HEAD)
 - `ctx changed --api [--since <ref>]` — public API changes in your diff: removed or
@@ -216,16 +253,22 @@ implementation bodies.
   `--aliases py-rust` to bridge systematic renames like `__init__` → `new`)
 - `ctx core` — the modules that matter most, ranked by dependency centrality (where to look
   first in an unfamiliar codebase; add `--churn` to weight by how often they change)
-- `ctx doctor` — coverage report: what fraction of the call graph resolved and which modules/
-  edges to distrust (run once to calibrate how much to lean on ctx for this repo)
+- `ctx doctor` — coverage report: internal call-graph **recall** (resolved edges over call
+  sites that could be internal at all — std and third-party calls are excluded because no
+  internal edge could exist for them), plus the exact callee names ctx could not pin. Run once
+  to calibrate; add `--explain` for the full per-name census
 - add `--format json` to any of the above for machine-readable output
 
 Protocol: before modifying or analyzing code, run `ctx map --view skeleton` to load the
 topology. When you're about to work on a specific symbol, run `ctx context <name>` — it bundles
 the definition, signature types, callees, and callers in one call, so you rarely need to open the
 file until you're editing its body. For broader orientation use `ctx subtree <module>`; before
-changing a signature run `ctx callers <name>` to see the blast radius. Line anchors (`[L42]`)
-give exact positions for surgical reads.
+changing a signature run `ctx callers <name>` to see the blast radius, and to follow control
+flow use `ctx trace <name>` or `ctx path <from> <to>` rather than grepping. `callers` and
+`context` end with a completeness line saying whether any call site bearing that name went
+unresolved — when it says the answer is complete, it is, and you can skip the confirming grep;
+`ctx trace` instead annotates each node with `[+N outside graph]` where a branch left the
+resolved edges. Line anchors (`[L42]`) give exact positions for surgical reads.
 "#;
 
 fn main() -> Result<()> {
@@ -374,12 +417,37 @@ fn main() -> Result<()> {
                 query::core(&g, limit, churn_map.as_ref(), matches!(format, Format::Json))
             );
         }
-        Cmd::Doctor { path, format } => {
+        Cmd::Trace {
+            name,
+            path,
+            depth,
+            reverse,
+            format,
+        } => {
+            let g = extract::build_graph(&path)?;
+            print!(
+                "{}",
+                query::trace(&g, &name, depth, reverse, matches!(format, Format::Json))
+            );
+        }
+        Cmd::Path {
+            from,
+            to,
+            path,
+            format,
+        } => {
+            let g = extract::build_graph(&path)?;
+            print!(
+                "{}",
+                query::path(&g, &from, &to, matches!(format, Format::Json))
+            );
+        }
+        Cmd::Doctor { path, explain, format } => {
             let g = extract::build_graph(&path)?;
             let unsupported = extract::unsupported_census(&path);
             print!(
                 "{}",
-                query::coverage_report(&g, &unsupported, matches!(format, Format::Json))
+                query::coverage_report(&g, &unsupported, explain, matches!(format, Format::Json))
             );
         }
         Cmd::Changed {
