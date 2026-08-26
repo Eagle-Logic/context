@@ -48,20 +48,20 @@ jobs:
       - run: cargo clippy --all-targets --locked
 
   msrv:
-    name: msrv (1.85)
+    name: msrv (1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # Keep in sync with `rust-version` in Cargo.toml. README promises 1.85+,
+      # Keep in sync with `rust-version` in Cargo.toml. README promises 1.88+,
       # and nothing else checks that promise.
       #
-      # The version is an INPUT, not the action ref. Pinned as `@1.85` it looks
+      # The version is an INPUT, not the action ref. Pinned as `@1.88` it looks
       # to Dependabot like an action version, and it duly "upgraded" it to
       # @1.100 — a Rust release that does not exist, so the job 404'd instead of
       # checking anything.
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85"
+          toolchain: "1.88"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --locked
 
