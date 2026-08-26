@@ -1,0 +1,43 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+#
+# `shell`/`powershell` are the primary install routes: unlike a browser-downloaded
+# archive, they do not set macOS's com.apple.quarantine attribute, so an unsigned
+# binary still runs. See the Gatekeeper note in README.md.
+installers = ["shell", "powershell", "homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = [
+    "x86_64-unknown-linux-gnu",
+    # Static. Runs in distroless/scratch containers, where the gnu build's
+    # glibc dependency is not available.
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+# Publish the Homebrew formula to the tap, so `brew install eagle-logic/tap/ctx`
+# works. Requires the Eagle-Logic/homebrew-tap repo plus a HOMEBREW_TAP_TOKEN
+# secret with write access to it.
+tap = "Eagle-Logic/homebrew-tap"
+# Name the formula after the BINARY, not the crate, so the install line is
+# `brew install eagle-logic/tap/ctx` — what someone who heard "ctx" will type.
+formula = "ctx"
+publish-jobs = ["homebrew"]
+# Where the shell/powershell installers put the binary
+install-path = "CARGO_HOME"
+# Publish jobs run on tag push; the GitHub Release is created by the workflow
+install-updater = false
+
+# The tree-sitter grammars are C, compiled by the `cc` crate, so a musl target
+# needs a musl C toolchain on the runner — a pure-Rust crate would not.
+[dist.dependencies.apt]
+musl-tools = '*'

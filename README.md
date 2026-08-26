@@ -1,6 +1,10 @@
-# context (`ctx`)
+# ctx
 
+[![Crates.io](https://img.shields.io/crates/v/code-context.svg)](https://crates.io/crates/code-context)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+*The binary is `ctx`. The crate is [`code-context`](https://crates.io/crates/code-context)
+(`ctx` was taken on crates.io in 2017).*
 
 **A queryable code graph for coding agents.** Not a map you paste at boot — a
 set of queries an agent runs mid-task: *who calls this, how does execution get
@@ -198,21 +202,40 @@ here. [More on why](#maps-when-you-want-them).
 
 ## Install
 
-Requires a Rust toolchain (1.85+).
+**No Rust toolchain required** — prebuilt binaries for macOS, Linux and Windows:
 
 ```sh
-cargo install code-context
+# macOS / Linux
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Eagle-Logic/context/releases/latest/download/code-context-installer.sh | sh
 
-# or from git
-cargo install --git https://github.com/Eagle-Logic/context
+# Windows (PowerShell)
+irm https://github.com/Eagle-Logic/context/releases/latest/download/code-context-installer.ps1 | iex
+```
 
-# or from a clone
+```sh
+# Homebrew
+brew install eagle-logic/tap/ctx
+```
+
+With a Rust toolchain (1.85+):
+
+```sh
+cargo install code-context        # the binary it installs is `ctx`
+
+# or from source
 git clone https://github.com/Eagle-Logic/context
 cd context && cargo install --path .
 ```
 
-The crate is `code-context`; the binary it installs is `ctx`. Single binary, no
-runtime dependencies — the tree-sitter grammars are compiled in.
+Single binary, no runtime dependencies — the tree-sitter grammars are compiled
+in. Prebuilt for `x86_64`/`aarch64` macOS, `x86_64` Linux (gnu **and** static
+musl, so it drops into a distroless or scratch container), and `x86_64` Windows.
+
+> **macOS:** use the installer script or Homebrew above. The release archives are
+> **not code-signed**, so a `.tar.xz` downloaded through a browser gets
+> quarantined by Gatekeeper and refuses to run until you clear it
+> (`xattr -d com.apple.quarantine ./ctx`). The `curl | sh` path doesn't set the
+> quarantine attribute and is unaffected.
 
 ## The queries
 

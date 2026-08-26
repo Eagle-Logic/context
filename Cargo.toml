@@ -1,13 +1,14 @@
 [package]
 name = "code-context"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Queryable code graph for coding agents: call graphs, blast radius, API breakage, cross-language parity"
+description = "ctx — a queryable code graph for coding agents: call graphs, blast radius, API breakage, cross-language port parity"
 license = "MIT"
 repository = "https://github.com/Eagle-Logic/context"
+homepage = "https://github.com/Eagle-Logic/context"
 readme = "README.md"
-keywords = ["call-graph", "code-analysis", "agent", "llm", "tree-sitter"]
+keywords = ["ctx", "call-graph", "agent", "llm", "tree-sitter"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
@@ -27,3 +28,8 @@ tree-sitter-typescript = "0.23"
 
 [profile.release]
 lto = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
