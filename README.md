@@ -28,6 +28,9 @@ tree — this blast radius is complete to the limit of what ctx parses.
 
 That last line is the whole idea. The answer travels with its own limits.
 
+**→ [EXAMPLES.md](EXAMPLES.md)** — nine commands run against this repo, verbatim
+output, including the parts where `ctx` reports its own limits.
+
 ## Four things you won't find elsewhere
 
 ### 1. Every edge tells you how much to trust it
@@ -305,7 +308,8 @@ ctx snippet >> CLAUDE.md
 ```
 
 Every command except `parity` takes a repo path as its last positional argument,
-defaulting to `.`; `parity` takes a source and one or more targets instead.
+defaulting to `.`; `parity` takes a source and one or more targets instead. See
+[EXAMPLES.md](EXAMPLES.md) for each of these run against a real repo, with output.
 
 ### Scoping the scan
 
