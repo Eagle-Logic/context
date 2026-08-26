@@ -92,7 +92,9 @@ pub fn extract(src: &str) -> Result<FileFacts> {
             let mut item = Item {
                 kind: "section".to_string(),
                 signature: text.clone(),
-                line: 0, // set below via line count
+                line: 0,             // set below via line count
+                end_line: 0,         // set below, once the next heading is known
+                hash: String::new(), // set below, once the span is known
                 doc: None,
                 calls: Vec::new(),
                 children: Vec::new(),
@@ -126,6 +128,7 @@ pub fn extract(src: &str) -> Result<FileFacts> {
 
     // Assign real 1-based line numbers by re-scanning for each heading in order.
     assign_lines(src, &mut flat);
+    assign_spans(src, &mut flat);
 
     facts.items = nest(flat);
     Ok(facts)
@@ -170,6 +173,32 @@ fn assign_lines(src: &str, flat: &mut [Heading]) {
             idx += 1;
         }
         prev = Some(raw);
+    }
+}
+
+/// Give each heading the span of its section and a hash of that span.
+///
+/// A section runs from its heading to just before the next heading at the same
+/// level or shallower — the same rule a reader uses. Anything deeper is a
+/// subsection and stays inside. The last heading runs to end of file.
+fn assign_spans(src: &str, flat: &mut [Heading]) {
+    let lines: Vec<&str> = src.lines().collect();
+    let last = lines.len().max(1);
+    for i in 0..flat.len() {
+        let level = flat[i].level;
+        let end = flat[i + 1..]
+            .iter()
+            .find(|h| h.level <= level)
+            .map(|h| h.item.line.saturating_sub(1))
+            .unwrap_or(last)
+            .max(flat[i].item.line);
+        flat[i].item.end_line = end;
+        let from = flat[i].item.line.saturating_sub(1);
+        let text = lines
+            .get(from..end.min(lines.len()))
+            .map(|s| s.join("\n"))
+            .unwrap_or_default();
+        flat[i].item.hash = crate::model::content_hash(&text);
     }
 }
 

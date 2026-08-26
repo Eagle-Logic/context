@@ -148,11 +148,35 @@ impl Lang {
     }
 }
 
+/// Short content hash used for [`Item::hash`].
+///
+/// Truncated to 12 hex chars: long enough that a collision inside one file is
+/// not a practical concern, short enough to sit on a result line without
+/// crowding out the thing the reader came for.
+pub fn content_hash(text: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    format!("{:012x}", h.finish() & 0xffff_ffff_ffff)
+}
+
 #[derive(Serialize, Clone)]
 pub struct Item {
     pub kind: String,
     pub signature: String,
     pub line: usize,
+    /// Last line of the definition, inclusive. With `line` this is a span, so
+    /// an agent can read exactly the item instead of guessing how far to go —
+    /// which is the difference between reading a function and reading the file
+    /// it happens to sit in.
+    pub end_line: usize,
+    /// Short content hash of the item's full source span, body included.
+    ///
+    /// Two uses, both about not re-reading: an agent that already has this
+    /// item can tell it is unchanged without opening the file, and two
+    /// identical spans (a duplicated helper, a generated impl) are visibly the
+    /// same without comparing text.
+    pub hash: String,
     /// First line of the item's doc comment (Rust `///`) or docstring
     /// (Python), if present. A cheap semantic label for the signature.
     #[serde(skip_serializing_if = "Option::is_none")]

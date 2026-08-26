@@ -45,7 +45,7 @@ branch of a dynamic-dispatch fan-out is marked `*`. And `ctx doctor` names
 
 ```
 ## Internal recall — the number to trust
-  1023/1065 = 96.1%   of call sites that could be internal, ctx pinned this many.
+  1058/1100 = 96.2%   of call sites that could be internal, ctx pinned this many.
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
@@ -463,6 +463,30 @@ signature, run the `rg` command ctx prints. This matters because `callers` is th
 pre-signature-change safety check, and "no callers" reads as "safe to change".
 
 `context`, `trace`, and `path` close with the same measured completeness line.
+
+### Spans and content hashes
+
+`def`, `callers` and `context` report a **span and a content hash**, not just a
+start line:
+
+```
+extract::Universe   [struct]   src/extract/mod.rs:1066-1083  #85eadbaee90b
+```
+
+The end line is the useful half. With only a start line an agent opens the file
+and guesses where to stop, which is how reading a 20-line struct turns into
+reading the 1,900-line module it happens to live in. The span says exactly what
+to read.
+
+The hash covers the item's full source span, body included, and is
+**position-independent** — inserting a comment above a function does not change
+its hash. Two uses, both about *not* re-reading: an agent holding a span can
+tell it is unchanged without opening the file, and two identical spans are
+visibly identical without comparing text.
+
+A one-line item reports `:12`, not `:12-12`. Both appear in `--format json` as
+`end_line` and `hash` alongside the existing `line`, so the addition is
+non-breaking for machine consumers.
 
 ### Naming
 

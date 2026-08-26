@@ -832,6 +832,8 @@ fn item(
         kind: kind.to_string(),
         signature,
         line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+        hash: crate::model::content_hash(&src[node.start_byte()..node.end_byte()]),
         doc: doc_comment(node, src),
         calls: Vec::new(),
         children,
