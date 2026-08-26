@@ -112,13 +112,15 @@ fn lang_selected(lang: Lang) -> bool {
     langs.is_empty() || langs.contains(&lang)
 }
 
-pub fn build_graph(root: &Path) -> Result<Graph> {
-    let root = root
-        .canonicalize()
-        .with_context(|| format!("cannot resolve path {}", root.display()))?;
-
+/// The source files under `root` that the graph is built from, sorted.
+///
+/// Split out so a cache can fingerprint exactly the set that gets parsed. A
+/// staleness check that walked even slightly differently would be a
+/// correctness bug — it would miss the file it did not look at — so there is
+/// deliberately one definition of "what counts as a source file here".
+pub fn source_files(root: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
-    for entry in walker(&root).build() {
+    for entry in walker(root).build() {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
@@ -150,6 +152,42 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
         }
     }
     files.sort();
+    files
+}
+
+/// A fingerprint of the source tree: path, mtime and length of every file the
+/// graph would be built from.
+///
+/// Cheap next to parsing — a stat per file, no reads — which is what makes a
+/// cache worthwhile: re-walking to check is far less work than re-parsing.
+///
+/// Covers modification, addition and deletion. A file whose mtime and length
+/// are both unchanged is treated as unchanged; that is the same assumption
+/// every build system makes, and the alternative is hashing contents, which
+/// costs the reads the cache exists to avoid.
+pub fn source_fingerprint(root: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for f in source_files(root) {
+        f.hash(&mut h);
+        if let Ok(m) = fs::metadata(&f) {
+            m.len().hash(&mut h);
+            if let Ok(t) = m.modified() {
+                if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                    d.as_nanos().hash(&mut h);
+                }
+            }
+        }
+    }
+    h.finish()
+}
+
+pub fn build_graph(root: &Path) -> Result<Graph> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("cannot resolve path {}", root.display()))?;
+
+    let files = source_files(&root);
 
     let mut modules = Vec::new();
     for path in &files {
@@ -1887,5 +1925,74 @@ mod tests {
         assert_eq!(slash_path(&p), "pkg/sub/gate.py");
         assert_eq!(slash_path(Path::new("gate.py")), "gate.py");
         assert_eq!(slash_path(Path::new("")), "");
+    }
+
+    /// A fingerprint that misses an edit is worse than no cache at all: it
+    /// makes ctx confidently wrong about current source.
+    #[test]
+    fn the_fingerprint_moves_when_the_tree_does() {
+        let dir = std::env::temp_dir().join(format!("ctx_fp_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        let f = dir.join("src/a.rs");
+        fs::write(&f, "fn a() {}\n").unwrap();
+
+        let base = source_fingerprint(&dir);
+        assert_eq!(
+            base,
+            source_fingerprint(&dir),
+            "must be stable when nothing changes"
+        );
+
+        // Content change. Length differs here, so this holds regardless of
+        // filesystem mtime granularity.
+        fs::write(&f, "fn a() {}\nfn b() {}\n").unwrap();
+        let edited = source_fingerprint(&dir);
+        assert_ne!(base, edited, "an edit must change the fingerprint");
+
+        // Addition.
+        fs::write(dir.join("src/c.rs"), "fn c() {}\n").unwrap();
+        let added = source_fingerprint(&dir);
+        assert_ne!(edited, added, "a new file must change the fingerprint");
+
+        // Deletion.
+        fs::remove_file(dir.join("src/c.rs")).unwrap();
+        assert!(
+            added != source_fingerprint(&dir),
+            "a deletion must change it"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The fingerprint must cover exactly what gets parsed. If it walked a
+    /// different set, the cache would miss changes in the difference.
+    #[test]
+    fn the_fingerprint_covers_exactly_the_parsed_file_set() {
+        let dir = std::env::temp_dir().join(format!("ctx_fpset_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
+        // Not a source file ctx models, and inside a skipped directory.
+        fs::write(dir.join("src/notes.txt"), "hello").unwrap();
+        fs::create_dir_all(dir.join("target")).unwrap();
+        fs::write(dir.join("target/b.rs"), "fn b() {}\n").unwrap();
+
+        let files = source_files(&dir);
+        assert_eq!(files.len(), 1, "only src/a.rs should count: {files:?}");
+        assert!(files[0].ends_with("a.rs"));
+
+        // Touching an ignored file must NOT invalidate — otherwise the cache
+        // would never hit on a repo with a build directory.
+        let before = source_fingerprint(&dir);
+        fs::write(dir.join("target/b.rs"), "fn b() { /* changed */ }\n").unwrap();
+        fs::write(dir.join("src/notes.txt"), "changed").unwrap();
+        assert_eq!(
+            before,
+            source_fingerprint(&dir),
+            "ignored files must not invalidate"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
