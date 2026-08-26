@@ -541,6 +541,25 @@ Each tool takes a `path` argument (default `.`); `def`/`callers`/`context` also
 take `name`, and `subtree` takes `module`. The server builds the graph per call
 (~100 ms), so results are always current.
 
+**Two limits apply over MCP that don't apply on the CLI**, because an MCP result
+lands straight in a model's context with no shell to pipe it through and no
+person to see the cost before it's paid:
+
+- **Every tool whose output scales with repo size is budgeted** — `map`,
+  `subtree`, `modules`, `callers`, `doctor`, `context` — defaulting to 25,000
+  tokens (4,000 for `context`). `map` and `subtree` degrade instead of cutting:
+  less detail, then fewer modules. The flat reports cut on a line boundary and
+  say so in band. Pass `max_tokens` to raise it. `map` also defaults to the
+  `skeleton` view rather than the CLI's `full`.
+- **The server only reads its own root**, which defaults to the working
+  directory it was started in. A `path` that resolves outside it — absolute,
+  `../..`, or through a symlink — is refused with a message naming the root.
+  Use `ctx mcp --root <dir>` to point it elsewhere deliberately.
+
+Both are default-deny with an explicit opt-out. A model has no legitimate reason
+to leave the project it was pointed at, and it cannot see the cost of doing so
+until the tokens are already spent.
+
 ### Claude Code
 
 `ctx snippet` prints a "Codebase Discovery" block **measured for this repo** —

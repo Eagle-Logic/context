@@ -3,15 +3,64 @@
 //! framework — a `read_line` loop and a dispatch table.
 
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use crate::view::View;
 use crate::{extract, query, render, view};
 
-pub fn run() -> Result<()> {
+/// The directory this server may read.
+///
+/// An MCP tool is invoked by a model, not a person. A model has no legitimate
+/// reason to leave the project it was pointed at, and it cannot see the cost of
+/// wandering until the tokens are already spent — so containment is
+/// default-deny with an explicit opt-out, not a documented caveat.
+///
+/// Set once at startup and never from a request, so no argument can widen it.
+static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Resolve a caller-supplied `path` against [`ROOT`], refusing anything that
+/// escapes it.
+///
+/// Both sides are canonicalized first, so `..` traversal and symlinks out of
+/// the tree are caught rather than merely discouraged.
+fn resolve_in_root(path: &str) -> std::result::Result<PathBuf, String> {
+    // Falls back to the working directory, which is what `run` would have set
+    // anyway — so a direct `dispatch` call (tests, embedding) is contained too
+    // rather than silently unrestricted.
+    let root = ROOT.get_or_init(|| {
+        std::env::current_dir()
+            .and_then(|d| d.canonicalize())
+            .unwrap_or_default()
+    });
+    let joined = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        root.join(path)
+    };
+    let real = joined
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve path {path:?}: {e}"))?;
+    if !real.starts_with(root) {
+        return Err(format!(
+            "refused: {path:?} resolves to {} which is outside this server's root ({}). \
+             The MCP server only reads the project it was started in. Start it with \
+             `ctx mcp --root <dir>` to point it somewhere else.",
+            real.display(),
+            root.display()
+        ));
+    }
+    Ok(real)
+}
+
+pub fn run(root: Option<PathBuf>) -> Result<()> {
+    let root = root.unwrap_or(std::env::current_dir()?);
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("cannot resolve MCP root {}", root.display()))?;
+    ROOT.set(root).ok();
     let stdin = io::stdin();
     let mut handle = stdin.lock();
     let mut out = io::stdout();
@@ -79,6 +128,32 @@ fn tool(name: &str, desc: &str, props: Value, required: &[&str]) -> Value {
 /// dump 130k tokens into an agent's context.
 const DEFAULT_MCP_BUDGET: usize = 25_000;
 
+/// Hold `text` to `budget` tokens, cutting on a line boundary and saying so.
+///
+/// `map` and `subtree` degrade gracefully — they drop detail, then whole
+/// modules — so they never truncate. The flat reports have no such ladder, so
+/// the honest option is to cut and be loud about it: a silent cut would be a
+/// report that lies by omission, which is the one thing this tool must not do.
+fn clamp(text: String, budget: Option<usize>, what: &str) -> String {
+    let Some(budget) = budget else { return text };
+    if crate::est_tokens(&text) <= budget {
+        return text;
+    }
+    let cap = budget * crate::BYTES_PER_TOKEN;
+    let cut = text[..cap.min(text.len())]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let kept = &text[..cut];
+    let dropped_lines = text[cut..].lines().count();
+    format!(
+        "{kept}\n[ctx] TRUNCATED at {budget} tokens: {dropped_lines} more line(s) withheld \
+         (~{} tokens total). This is a cut, not the whole answer. Raise max_tokens, or \
+         narrow the query — `{what}` on a subdirectory, or a more specific name.\n",
+        crate::est_tokens(&text)
+    )
+}
+
 fn path_prop() -> Value {
     json!({ "type": "string", "description": "Path to the repo (default \".\")" })
 }
@@ -103,7 +178,15 @@ fn tools() -> Vec<Value> {
             }),
             &[],
         ),
-        tool("modules", "One line per module with dependency edges.", json!({ "path": path_prop() }), &[]),
+        tool(
+            "modules",
+            "One line per module with dependency edges. Scales with repo size; pass max_tokens to raise the default cap.",
+            json!({
+                "path": path_prop(),
+                "max_tokens": budget_prop("Hard cap on output size (default 25000). Truncates on a line boundary and says so."),
+            }),
+            &[],
+        ),
         tool(
             "subtree",
             "A module plus its immediate upstream dependencies and downstream dependents.",
@@ -124,7 +207,11 @@ fn tools() -> Vec<Value> {
         tool(
             "callers",
             "Every function that calls the given function/method (resolved reverse call edges).",
-            json!({ "path": path_prop(), "name": name_prop }),
+            json!({
+                "path": path_prop(),
+                "name": name_prop,
+                "max_tokens": budget_prop("Hard cap on output size (default 25000). Truncates on a line boundary and says so."),
+            }),
             &["name"],
         ),
         tool(
@@ -154,7 +241,11 @@ fn tools() -> Vec<Value> {
         tool(
             "doctor",
             "Coverage report: internal call-graph recall, the callee names ctx could not pin, and what it cannot model. Set explain=true for the full per-name census.",
-            json!({ "path": path_prop(), "explain": {"type": "boolean", "description": "Print the full per-name census"} }),
+            json!({
+                "path": path_prop(),
+                "explain": {"type": "boolean", "description": "Print the full per-name census"},
+                "max_tokens": budget_prop("Hard cap on output size (default 25000). Truncates on a line boundary and says so."),
+            }),
             &[],
         ),
     ]
@@ -175,10 +266,15 @@ fn tools_call(req: &Value) -> Value {
 }
 
 fn dispatch(name: &str, args: &Value) -> (String, bool) {
-    let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-    let g = match extract::build_graph(Path::new(path)) {
+    let requested = args.get("path").and_then(Value::as_str).unwrap_or(".");
+    let root_path = match resolve_in_root(requested) {
+        Ok(p) => p,
+        Err(msg) => return (msg, true),
+    };
+    let path = root_path.as_path();
+    let g = match extract::build_graph(path) {
         Ok(g) => g,
-        Err(e) => return (format!("error building graph for {path}: {e}"), true),
+        Err(e) => return (format!("error building graph for {requested}: {e}"), true),
     };
     let sarg = |k: &str| args.get(k).and_then(Value::as_str);
     let uarg = |k: &str, d: u64| args.get(k).and_then(Value::as_u64).unwrap_or(d) as usize;
@@ -238,7 +334,7 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
                 }
             }
         }
-        "modules" => (render::module_list(&g), false),
+        "modules" => (clamp(render::module_list(&g), budget, "ctx modules"), false),
         "subtree" => match sarg("module") {
             // Same code path as the CLI, so the two cannot drift again.
             Some(m) => {
@@ -254,7 +350,10 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
             None => ("missing required argument 'name'".into(), true),
         },
         "callers" => match sarg("name") {
-            Some(n) => (query::callers(&g, n, false), false),
+            Some(n) => (
+                clamp(query::callers(&g, n, false), budget, "ctx callers"),
+                false,
+            ),
             None => ("missing required argument 'name'".into(), true),
         },
         "context" => match sarg("name") {
@@ -277,9 +376,13 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
             _ => ("missing required argument 'from' or 'to'".into(), true),
         },
         "doctor" => {
-            let unsupported = extract::unsupported_census(Path::new(path));
+            let unsupported = extract::unsupported_census(path);
             (
-                query::coverage_report(&g, &unsupported, barg("explain"), false),
+                clamp(
+                    query::coverage_report(&g, &unsupported, barg("explain"), false),
+                    budget,
+                    "ctx doctor",
+                ),
                 false,
             )
         }
@@ -329,5 +432,86 @@ mod tests {
         // still returns a value; the id-gating lives in run(). Here we just
         // confirm an unknown method yields None.
         assert!(handle_method("notifications/initialized", &json!({})).is_none());
+    }
+
+    #[test]
+    fn path_outside_the_root_is_refused_with_a_reason() {
+        // /tmp is outside the crate directory the test process runs in.
+        let (text, is_error) = dispatch("modules", &json!({"path": "/tmp"}));
+        assert!(is_error, "escaping the root must be an error, got: {text}");
+        // The refusal has to say WHY and how to override it, or the caller —
+        // a model — just retries the same thing.
+        assert!(text.contains("refused"), "{text}");
+        assert!(text.contains("outside this server's root"), "{text}");
+        assert!(text.contains("--root"), "must name the override: {text}");
+    }
+
+    #[test]
+    fn dot_dot_traversal_cannot_escape_the_root() {
+        let (text, is_error) = dispatch("modules", &json!({"path": "../.."}));
+        assert!(is_error, "`../..` must not escape the root, got: {text}");
+        assert!(text.contains("refused"), "{text}");
+    }
+
+    #[test]
+    fn a_path_inside_the_root_still_works() {
+        let (text, is_error) = dispatch("modules", &json!({"path": "src"}));
+        assert!(!is_error, "an in-root path must be allowed: {text}");
+        assert!(text.contains("modules:"), "{text}");
+    }
+
+    #[test]
+    fn uncapped_tools_now_respect_a_budget_and_say_when_they_cut() {
+        // A budget this small must bite on any real repo.
+        let (text, is_error) = dispatch("modules", &json!({"path": ".", "max_tokens": 20}));
+        assert!(!is_error, "{text}");
+        assert!(
+            text.contains("[ctx] TRUNCATED"),
+            "must announce the cut: {text}"
+        );
+        assert!(
+            text.contains("This is a cut, not the whole answer"),
+            "a truncated report must not read as complete: {text}"
+        );
+        assert!(
+            crate::est_tokens(&text) < 400,
+            "cut should be near the budget: {text}"
+        );
+    }
+
+    #[test]
+    fn callers_and_doctor_are_budgeted_too() {
+        for tool in ["callers", "doctor"] {
+            let mut args = json!({"path": ".", "max_tokens": 20});
+            if tool == "callers" {
+                args["name"] = json!("new");
+            }
+            let (text, is_error) = dispatch(tool, &args);
+            assert!(!is_error, "{tool}: {text}");
+            assert!(
+                text.contains("[ctx] TRUNCATED"),
+                "{tool} must be budgeted: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_tool_that_can_grow_advertises_max_tokens() {
+        // Regression: `modules` shipped uncapped and returned ~2.3M tokens when
+        // pointed at a filesystem root. Anything whose output scales with repo
+        // size must expose the knob.
+        for t in tools() {
+            let name = t["name"].as_str().unwrap();
+            if !matches!(
+                name,
+                "modules" | "callers" | "doctor" | "map" | "subtree" | "context"
+            ) {
+                continue;
+            }
+            assert!(
+                t["inputSchema"]["properties"].get("max_tokens").is_some(),
+                "{name} must advertise max_tokens"
+            );
+        }
     }
 }

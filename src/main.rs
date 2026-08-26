@@ -293,7 +293,14 @@ enum Cmd {
         format: Format,
     },
     /// Run as an MCP server over stdio (exposes the read-only commands as tools)
-    Mcp,
+    Mcp {
+        /// Directory the server is allowed to read. Every `path` argument
+        /// resolves against it, and one that escapes it is refused. Defaults
+        /// to the working directory — a model has no legitimate reason to
+        /// leave the project it was pointed at.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Print the CLAUDE.md discovery block, measured for this repo
     Snippet {
         #[arg(default_value = ".")]
@@ -783,7 +790,7 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Cmd::Mcp => mcp::run()?,
+        Cmd::Mcp { root } => mcp::run(root)?,
         Cmd::Snippet { path } => {
             let g = extract::build_graph(&path)?;
             print!("{}", snippet_for(&g));
@@ -1319,10 +1326,10 @@ fn not_found_message(g: &Graph, query: &str) -> String {
 /// on this tool's own output it under-counts by 5-23% — code and Markdown are
 /// denser than prose English. A cap that overshoots is not a cap, so budgets use
 /// a conservative divisor: better to under-fill than to blow the window.
-const BYTES_PER_TOKEN: usize = 3;
+pub const BYTES_PER_TOKEN: usize = 3;
 
 /// Estimated tokens for rendered output.
-fn est_tokens(text: &str) -> usize {
+pub fn est_tokens(text: &str) -> usize {
     text.len() / BYTES_PER_TOKEN
 }
 
