@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref — a force-push mid-CI shouldn't
+# leave a stale run burning minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # ctx does path arithmetic on module names, so Windows path separators
+        # are a real risk, not a formality. macOS covers the aarch64 build.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets --locked
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked
+
+  msrv:
+    name: msrv (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Keep in sync with `rust-version` in Cargo.toml. README promises 1.85+,
+      # and nothing else checks that promise.
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --locked
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Dogfooding. ctx is a static-analysis tool; running it against its own
+  # source is the cheapest real integration test there is, and it is the exact
+  # workflow the README recommends to users.
+  dogfood:
+    name: dogfood (ctx on ctx)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # changed --api builds the base ref in a worktree, so it needs
+          # history — the default shallow clone has no merge base.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+
+      - name: ctx doctor — coverage must not silently collapse
+        run: |
+          ./target/debug/ctx doctor . | tee doctor.txt
+          recall=$(sed -n 's#.*  \([0-9]*\)/\([0-9]*\) = \([0-9]*\)\.[0-9]*%.*#\3#p' doctor.txt | head -1)
+          echo "internal recall: ${recall}%"
+          # A floor, not a target. Catches a resolver regression that drops
+          # edges wholesale; deliberately loose so ordinary churn does not
+          # trip it. Raise it when the real number moves up and holds.
+          if [ "${recall:-0}" -lt 90 ]; then
+            echo "::error::internal recall ${recall}% fell below the 90% floor"
+            exit 1
+          fi
+
+      - name: ctx doctor — no broken links in the docs
+        run: |
+          if ./target/debug/ctx doctor . | grep -q "Broken links"; then
+            ./target/debug/ctx doctor . | sed -n '/Broken links/,/^$/p'
+            echo "::error::doctor reports broken markdown links"
+            exit 1
+          fi
+
+      - name: ctx changed --api --strict — public API removals vs the base
+        if: github.event_name == 'pull_request'
+        run: |
+          ./target/debug/ctx changed --api --strict \
+            --since "origin/${{ github.base_ref }}"

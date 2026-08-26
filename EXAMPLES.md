@@ -3,7 +3,7 @@
 Every command below was run against **this repository** with `ctx 0.18.0`, and
 every block is verbatim output — nothing edited for effect.
 
-The repo under analysis: **14 Rust files, 1 Markdown file, 15 modules, 4,668
+The repo under analysis: **14 Rust files, 2 Markdown files, 16 modules, 4,670
 call sites.** Small enough to read in a sitting, which makes it a fair place to
 check whether the answers are actually right.
 
@@ -28,10 +28,10 @@ $ ctx callers coverage_report
 5 caller(s) of 'coverage_report':
 
 mcp::dispatch  (src/mcp.rs:177)  → query::coverage_report
-query::tests::coverage_separates_internal_external_and_blind_spots  (src/query.rs:2620)  → coverage_report
-query::tests::doctor_names_what_it_could_not_pin  (src/query.rs:2044)  → coverage_report
-query::tests::doctor_recall_excludes_provably_external_calls  (src/query.rs:2019)  → coverage_report
-query::tests::markdown_links_resolve_headings_and_flag_broken  (src/query.rs:2596)  → coverage_report
+query::tests::coverage_separates_internal_external_and_blind_spots  (src/query.rs:2856)  → coverage_report
+query::tests::doctor_names_what_it_could_not_pin  (src/query.rs:2194)  → coverage_report
+query::tests::doctor_recall_excludes_provably_external_calls  (src/query.rs:2169)  → coverage_report
+query::tests::markdown_links_resolve_headings_and_flag_broken  (src/query.rs:2829)  → coverage_report
 
 completeness: no call site named `coverage_report` went unresolved anywhere in this tree —
 this blast radius is complete to the limit of what ctx parses.
@@ -57,7 +57,7 @@ crate::main  [src/main.rs:439]
     → mcp::handle_method  [src/mcp.rs:54]
       → mcp::tools_call  [src/mcp.rs:163]
         → mcp::dispatch  [src/mcp.rs:177]
-          → query::coverage_report  [src/query.rs:1420]
+          → query::coverage_report  [src/query.rs:1548]
 ```
 
 ---
@@ -73,9 +73,32 @@ $ ctx trace build_graph --depth 2
 ~ heuristic edge (verify) · * one branch of a dispatch fan-out
 
 extract::build_graph  [src/extract/mod.rs:115]  [+1 outside graph]
-├─ extract::disambiguate_module_names  [src/extract/mod.rs:247]
+├─ extract::disambiguate_module_names  [src/extract/mod.rs:248]
 ├─ extract::lang_selected  [src/extract/mod.rs:110]
 │  └─ extract::filter  [src/extract/mod.rs:53]
+├─ extract::markdown::extract  [src/extract/markdown.rs:45]  [+1 outside graph]
+│  ├─ extract::markdown::atx_heading  [src/extract/markdown.rs:198]
+│  ├─ extract::markdown::slug  [src/extract/markdown.rs:13]
+│  └─ extract::markdown::strip_inline  [src/extract/markdown.rs:429]
+├─ extract::module_name  [src/extract/mod.rs:435]
+│  └─ model::Lang::sep  [src/model.rs:143]
+├─ extract::python::extract  [src/extract/python.rs:8]  [+1 outside graph]
+│  ├─ extract::python::module_level_item  [src/extract/python.rs:34]  (depth limit)
+│  └─ extract::python::visit  [src/extract/python.rs:70]  (depth limit)
+├─ extract::resolve_deps  [src/extract/mod.rs:495]
+│  ├─ extract::apply_calls  [src/extract/mod.rs:1832]  (depth limit)
+│  ├─ extract::build_universe  [src/extract/mod.rs:1029]  (depth limit)
+│  ├─ extract::compute_calls  [src/extract/mod.rs:1685]  (depth limit)
+│  ├─ extract::display_reexport  [src/extract/mod.rs:1839]  (depth limit)
+│  ├─ model::Module::resolve_segs~  [src/model.rs:250]  (depth limit)
+│  └─ extract::resolve_from  [src/extract/mod.rs:702]  (depth limit)
+├─ extract::rust::extract  [src/extract/rust.rs:8]  [+1 outside graph]
+│  └─ extract::rust::visit  [src/extract/rust.rs:24]  (depth limit)
+├─ extract::typescript::extract  [src/extract/typescript.rs:11]  [+1 outside graph]
+│  ├─ extract::typescript::module_level_item  [src/extract/typescript.rs:42]  (depth limit)
+│  └─ extract::typescript::visit  [src/extract/typescript.rs:81]  (depth limit)
+└─ extract::walker  [src/extract/mod.rs:88]
+   └─ extract::filter  [src/extract/mod.rs:53]
 ├─ extract::markdown::extract  [src/extract/markdown.rs:45]  [+1 outside graph]
 │  ├─ extract::markdown::atx_heading  [src/extract/markdown.rs:198]
 │  ├─ extract::markdown::collect_link_defs  [src/extract/markdown.rs:374]  (depth limit)
@@ -107,24 +130,23 @@ Three annotations carry the honesty:
 
 A pre-merge gate that names the callers a change breaks. This run is against
 real history from the session that shipped 0.18.0 — it caught a removal the
-author had made four commits earlier:
+author had made a few commits earlier:
 
 ```
-$ ctx changed --api --since HEAD~4
-# API changes vs HEAD~4
-2 removed, 8 changed, 20 added.
+$ ctx changed --api --since 4224d9c
+# API changes vs 4224d9c
+2 removed, 3 changed, 12 added.
 
 ## Removed — breaking
-- model::Module::name_segs  [fn]  (src/model.rs:173)
+- model::Module::name_segs  [fn]  (src/model.rs:228)
     was: pub fn name_segs(&self) -> Vec<String>
-    callers (2): extract::candidates, extract::resolve_deps
-- query::subtree  [fn]  (src/query.rs:550)
+    callers (3): extract::build_universe, extract::candidates, extract::resolve_deps
+- query::subtree  [fn]  (src/query.rs:1070)
     was: pub fn subtree(g: &Graph, module: &str, json_out: bool) -> String
     callers (1): mcp::dispatch
 
 ## Changed signature — potentially breaking
-- model::Call  [struct]  (src/model.rs:190)
-    was: pub struct Call { pub to: String, pub heuristic: bool }
+- model::Module  [struct]  (src/model.rs:13)
 ```
 
 `--strict` makes it a CI gate. It fails on **removals only** — a signature
@@ -206,14 +228,18 @@ The differentiator. Every tool guesses; this one tells you where.
 $ ctx doctor
 # ctx coverage report — /home/steve/projects/context
 
-Modules: 15  (markdown 1, rust 14)
+Modules: 16  (markdown 2, rust 14)
 
 ## Internal recall — the number to trust
-  1001/1040 = 96.2%   of call sites that could be internal, ctx pinned this many.
+  1003/1042 = 96.3%   of call sites that could be internal, ctx pinned this many.
+
+A call site is "could be internal" when the callee name is defined somewhere
+under this root. Calls into std or a third-party crate are excluded, because no
+internal edge could exist for them however good the resolver gets.
 
 ## Every call site, bucketed
-call sites:            4668
-  internal edges:      1001   [15 heuristic (~), 0 dispatch fan-out (*)]
+call sites:            4670
+  internal edges:      1003   [15 heuristic (~), 0 dispatch fan-out (*)]
   external (provable): 3628   (77.7%)  callee defined nowhere here — std/extern
   unresolved internal: 39     (0.8%)  the real misses — see below
 
@@ -237,24 +263,22 @@ grep these; every other edge in the map is one ctx could prove.
   query                               1 unresolved   (module recall 99%)
 
 ## Low-confidence zones (edges to distrust — grep to confirm)
-  parity                           18% heuristic (11/61 edges)
+  internal edges:      1003   [15 heuristic (~), 0 dispatch fan-out (*)]
 ```
 
-96.2% recall comes with **the exact grep list for the other 3.8%** — seven
+96.3% recall comes with **the exact grep list for the other 3.7%** — seven
 names, with counts and the modules they live in.
 
-The denominator is honest too. 3,628 of 4,668 call sites go into `std` or a
+The denominator is honest too. 3,628 of 4,670 call sites go into `std` or a
 third-party crate, where no internal edge could ever exist, so they're excluded
 rather than quietly inflating the percentage. That classification is by evidence
 — *is this name defined anywhere under the root?* — not a hardcoded list.
 
 The honest bit isn't that coverage is high. It's that the gaps are enumerable.
 
-> Captured before this file was committed. `ctx` treats Markdown as part of the
-> graph, so adding `EXAMPLES.md` moves the header to `Modules: 16 (markdown 2,
-> rust 14)`. The recall figures are unchanged — prose contributes links, not
-> call sites. Left as captured rather than retouched, since "verbatim" is the
-> whole point.
+> `ctx` treats Markdown as part of the graph, which is why this file counts
+> toward the 16 modules above — a document about the tool is a node in the
+> graph the tool builds.
 
 ---
 
@@ -269,18 +293,23 @@ $ ctx core --limit 8
 Ranked by dependency centrality (PageRank); higher = more depended-upon.
 
   score    in  out  module
-  0.3241    11    0  model  [18 items]
-  0.1701    10    1  extract  [67 items]
-  0.0735     4    2  render  [8 items]
-  0.0573     3    3  view  [11 items]
-  0.0550     2    4  query  [120 items]
-  0.0320     0    4  crate  [46 items]
-  0.0320     0    2  extract::markdown  [31 items]
-  0.0320     0    2  extract::python  [26 items]
+  0.3060    11    0  model  [18 items]
+  0.1606    10    1  extract  [67 items]
+  0.0694     4    2  render  [8 items]
+  0.0559     1    0  EXAMPLES  [11 items]
+  0.0541     3    3  view  [11 items]
+  0.0519     2    4  query  [120 items]
+  0.0302     0    4  crate  [46 items]
+  0.0302     0    2  extract::markdown  [31 items]
 ```
 
 `model` on top with 11 inbound and 0 outbound is the right answer: it's the
 shared data model every other module depends on and which depends on nothing.
+
+`EXAMPLES` ranking fourth is this file. Markdown is part of the graph, so the
+README's link to it is a real edge — which is also why `ctx doctor` above counts
+16 modules and not 14. A document about the tool is a node in the graph the tool
+builds.
 
 ---
 
@@ -292,9 +321,8 @@ Jump-to-def without knowing the file, across languages.
 $ ctx def Universe
 1 definition(s) of 'Universe':
 
-extract::Universe   [struct]   src/extract/mod.rs:803
-    struct Universe { methods: MethodIndex, all_names: BTreeSet<String>, ... }
-      — Whole-tree symbol evidence, built once and shared by every module's
+extract::Universe   [struct]   src/extract/mod.rs:1010
+    struct Universe { methods: MethodIndex, all_names: BTreeSet<String>, module_segs: BTreeSet<String>, implementors: HashMap<String, BTreeSet<(String, String)>>, fields: HashMap<String, BTreeMap<String, String>> }  — Whole-tree symbol evidence, built once and shared by every module's
 ```
 
 The trailing `—` is the first line of the doc comment, so a signature listing
