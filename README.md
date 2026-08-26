@@ -301,7 +301,7 @@ irm https://github.com/Eagle-Logic/context/releases/latest/download/code-context
 brew install eagle-logic/tap/ctx
 ```
 
-With a Rust toolchain (1.85+):
+With a Rust toolchain (1.88+):
 
 ```sh
 cargo install code-context        # the binary it installs is `ctx`
