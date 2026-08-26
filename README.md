@@ -108,11 +108,10 @@ parity: 5/6 source aligned · 1 missing · 1 arity · 0 call · 0 moved
 
 A dropped method, a dropped parameter, and the `__init__`→`new` rename, in one
 command. `--strict` exits non-zero on any missing member. I'm not aware of
-another tool that does this.
+another tool that does this. It might be more or less useful depending on your
+specific languages and abstractions. 
 
 ## "How is this different from aider's repo map?"
-
-Fair question, and it deserves a straight answer.
 
 Aider's repo map — and the MCP servers that repackage it, like RepoMapper —
 compresses a repository into a **ranked blob** that gets injected at the start
@@ -133,9 +132,9 @@ Against it, `ctx` trades semantic precision for two things:
 | startup | ~100 ms graph build, per query | server warm-up, project indexing |
 | determinism | pure function of the source tree | depends on server state, versions, build artifacts |
 | uncertainty | marked per edge (`~`, `*`) + a miss census | resolved or absent, silently |
-| coverage | 4 languages, one graph across all of them | as many as you install servers for |
+| coverage | 4 languages (today), one graph across all of them | as many as you install servers for |
 
-If you need type-perfect resolution inside one language, use an LSP. If you
+If you need type-perfect resolution inside one language, use a LSP. If you
 want the same graph across a polyglot repo with nothing to install and answers
 that state their own confidence, that's this.
 
