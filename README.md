@@ -207,6 +207,13 @@ here. [More on why](#maps-when-you-want-them).
 
 Often you should. Here is the measurement, including where grep wins.
 
+> **Counting tokens.** Every figure in this README is ctx's own estimate —
+> `len/3`, the same one `--max-tokens` and `--metrics` use. Recompute with a
+> real tokenizer and you will get different absolutes; the ratios are what the
+> argument rests on, and they come from one estimator on both sides. `len/3` is
+> also conservative for source code, which tokenizes closer to 3.5–4 characters
+> per token, so if anything the grep figures below understate the gap.
+
 The grep below is the one a competent agent would actually write — call syntax,
 language-filtered, skipping the same directories ctx skips — not a bare
 `grep -rn name`:
@@ -217,9 +224,15 @@ grep -rn --include='*.py' --include='*.rs' --include='*.ts' \
   '\bload(' .
 ```
 
-**On a small repo, grep wins.** This repository, 14 source files, "who calls
-`coverage_report`": grep 194 tokens, `ctx callers` 215. Jump-to-definition is
-worse for ctx — grep 14 tokens against 124. At this size the graph is overhead
+**On a small repo, grep wins.** This repository, 14 source files:
+
+```sh
+grep -rn --include='*.rs' --exclude-dir=target '\bcoverage_report(' src/
+```
+
+194 tokens against `ctx callers coverage_report`'s 215. Jump-to-definition is
+worse for ctx — `grep -rn --include='*.rs' --exclude-dir=target 'struct Universe'
+src/` is 14 tokens against `ctx def`'s 124. At this size the graph is overhead
 and you should use grep.
 
 **On a large repo it inverts.** A 14,073-file tree:
@@ -230,9 +243,12 @@ and you should use grep.
 | `run` | **441** | 11,017 | 242 | 8 |
 | `boot` | **1,693** | 4,744 | 98 | 31 |
 
-8× to 25× fewer tokens, because grep's cost scales with how common the *string*
-is and ctx's scales with how many *call edges* actually exist. `run` appears on
-242 matching lines and is genuinely called from 8 places.
+**3× to 25× fewer tokens.** grep's cost scales with how common the *string* is;
+ctx's scales with how many *call edges* actually exist. `boot` is the weak case
+at 2.8× — worth knowing, because a tool that only ever reports its best ratio is
+advertising rather than measuring. `run` is the strong one: 242 matching lines,
+genuinely called from 8 places, and grep's output for it would not fit in most
+context windows.
 
 **But the size difference is not really the point** — the two answer different
 questions. Same task, same repo:
@@ -641,7 +657,10 @@ sees.
 
 It exists because "query instead of loading a map" was an argument until someone
 counted. Measured on a 14,073-file repo, the claim is narrower and sharper than
-"queries are cheaper than maps":
+"queries are cheaper than maps".
+
+Counts are ctx's own `len/3` estimate throughout — see the note under
+["Why not just grep?"](#why-not-just-grep).
 
 **A boot-time map is a 42× more expensive way to orient than `ctx core`, and it
 does not answer the questions you then have to ask anyway.**
@@ -651,7 +670,7 @@ Both are orientation steps — "what is this codebase, where do I start":
 | orientation step | tokens |
 |---|---|
 | `ctx core` | **596** |
-| `ctx map` (budgeted; unbudgeted it is 306,383) | **24,992** |
+| `ctx map` (budgeted; unbudgeted the same map is 408,511) | **24,992** |
 
 The second half matters more than the ratio. After loading that map, the same
 session still ran `def`, `context`, `callers` and `trace` on the symbol it was
