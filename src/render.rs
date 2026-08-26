@@ -29,7 +29,9 @@ pub fn markdown(g: &Graph) -> String {
     ));
     // A filtered map is a partial map; saying so costs one line.
     if let Some(f) = crate::extract::filter_note() {
-        out.push_str(&format!("scope: FILTERED ({f}) — modules outside it are absent\n"));
+        out.push_str(&format!(
+            "scope: FILTERED ({f}) — modules outside it are absent\n"
+        ));
     }
     out.push('\n');
     for m in &g.modules {
@@ -72,11 +74,7 @@ fn item_md(i: &Item, depth: usize, out: &mut String) {
     out.push_str(&"  ".repeat(depth));
     out.push_str(&format!("- {}  [L{}]", i.signature, i.line));
     if !i.calls.is_empty() {
-        let edges: Vec<String> = i
-            .calls
-            .iter()
-            .map(edge_str)
-            .collect();
+        let edges: Vec<String> = i.calls.iter().map(edge_str).collect();
         out.push_str(&format!(" → {}", edges.join(", ")));
     }
     if let Some(d) = &i.doc {

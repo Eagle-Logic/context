@@ -94,7 +94,11 @@ pub fn def(g: &Graph, query: &str, json_out: bool) -> String {
     let Some(&last) = q.last() else {
         return "empty query\n".to_string();
     };
-    let parent = if q.len() >= 2 { Some(q[q.len() - 2]) } else { None };
+    let parent = if q.len() >= 2 {
+        Some(q[q.len() - 2])
+    } else {
+        None
+    };
 
     let mut hits = Vec::new();
     for m in &g.modules {
@@ -222,10 +226,11 @@ fn definition_count(g: &Graph, q: &[&str]) -> usize {
     hits.len()
 }
 
-
 /// Kinds of every definition of this name (type-like or not).
 fn definition_kinds(g: &Graph, q: &[&str]) -> Vec<String> {
-    let Some(&last) = q.last() else { return Vec::new() };
+    let Some(&last) = q.last() else {
+        return Vec::new();
+    };
     let mut hits = Vec::new();
     for m in &g.modules {
         collect_defs(&m.items, m, None, last, None, &mut hits);
@@ -388,9 +393,7 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
         if !found.is_empty() {
             out.push_str(&format!("\nplus {} resolved call edge(s).\n", found.len()));
         }
-        out.push_str(
-            "\nSignature references only: uses inside function BODIES are not indexed.\n",
-        );
+        out.push_str("\nSignature references only: uses inside function BODIES are not indexed.\n");
         return out + &recall_note;
     }
 
@@ -405,7 +408,8 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
             "no callers found for '{query}'\n\
              (only resolved call edges are indexed; ambiguous calls and \
              ubiquitous std-named methods are intentionally dropped)\n{type_note}{recall_note}"
-        ) + &completeness_note(g, last, "result");    }
+        ) + &completeness_note(g, last, "result");
+    }
     let mut out = format!("{} caller(s) of '{}':\n\n", found.len(), query);
     for c in &found {
         let edges: Vec<String> = c.edges.iter().map(edge_str).collect();
@@ -522,7 +526,10 @@ fn collect_nodes<'a>(
         // Containers and enclosing functions both qualify what is nested in
         // them, so a nested helper reads as `outer::helper`.
         match (
-            matches!(it.kind.as_str(), "impl" | "trait" | "class" | "interface" | "mod" | "fn" | "def"),
+            matches!(
+                it.kind.as_str(),
+                "impl" | "trait" | "class" | "interface" | "mod" | "fn" | "def"
+            ),
             &named,
         ) {
             (true, Some(n)) => {
@@ -608,7 +615,11 @@ pub fn call_graph(g: &Graph) -> CallGraph {
 
 impl CallGraph {
     fn arcs(&self, i: usize, reverse: bool) -> &[(usize, Confidence)] {
-        if reverse { &self.incoming[i] } else { &self.out[i] }
+        if reverse {
+            &self.incoming[i]
+        } else {
+            &self.out[i]
+        }
     }
 
     /// Nodes whose qualified name ends with the query's segments.
@@ -663,7 +674,12 @@ fn walk_tree(cg: &CallGraph, root: usize, depth: usize, reverse: bool) -> Vec<Tr
         expanded: &mut BTreeSet<usize>,
         out: &mut Vec<TraceLine>,
     ) {
-        let Step { node: i, conf, depth: d, last } = st;
+        let Step {
+            node: i,
+            conf,
+            depth: d,
+            last,
+        } = st;
         let kids = cg.arcs(i, reverse);
         let seen = expanded.contains(&i);
         let stop = if seen && !kids.is_empty() {
@@ -717,9 +733,17 @@ fn render_tree(cg: &CallGraph, lines: &[TraceLine], out: &mut String) {
         let mut prefix = String::new();
         for d in 0..l.depth {
             if d + 1 == l.depth {
-                prefix.push_str(if l.last_of_parent { "└─ " } else { "├─ " });
+                prefix.push_str(if l.last_of_parent {
+                    "└─ "
+                } else {
+                    "├─ "
+                });
             } else {
-                prefix.push_str(if open.get(d).copied().unwrap_or(false) { "│  " } else { "   " });
+                prefix.push_str(if open.get(d).copied().unwrap_or(false) {
+                    "│  "
+                } else {
+                    "   "
+                });
             }
         }
         if l.depth > 0 {
@@ -792,7 +816,11 @@ pub fn trace(g: &Graph, query: &str, depth: usize, reverse: bool, json_out: bool
             + "\n";
     }
 
-    let dir = if reverse { "callers of" } else { "call tree from" };
+    let dir = if reverse {
+        "callers of"
+    } else {
+        "call tree from"
+    };
     let mut out = format!("# {dir} '{query}'  (depth {depth})\n");
     out.push_str("~ heuristic edge (verify) · * one branch of a dispatch fan-out\n\n");
     for &r in roots.iter().take(3) {
@@ -801,7 +829,10 @@ pub fn trace(g: &Graph, query: &str, depth: usize, reverse: bool, json_out: bool
         out.push('\n');
     }
     if roots.len() > 3 {
-        out.push_str(&format!("({} more definitions matched '{query}')\n", roots.len() - 3));
+        out.push_str(&format!(
+            "({} more definitions matched '{query}')\n",
+            roots.len() - 3
+        ));
     }
     out
 }
@@ -898,9 +929,16 @@ pub fn path(g: &Graph, from: &str, to: &str, json_out: bool) -> String {
     out.push_str("~ heuristic edge (verify) · * one branch of a dispatch fan-out\n\n");
     for (k, (i, c)) in route.iter().enumerate() {
         let n = &cg.nodes[*i];
-        let arrow = if k == 0 { String::new() } else { format!("{}→ ", "  ".repeat(k)) };
+        let arrow = if k == 0 {
+            String::new()
+        } else {
+            format!("{}→ ", "  ".repeat(k))
+        };
         let mark = if k == 0 { "" } else { c.mark() };
-        out.push_str(&format!("{arrow}{}{}  [{}:{}]\n", n.qualname, mark, n.file, n.line));
+        out.push_str(&format!(
+            "{arrow}{}{}  [{}:{}]\n",
+            n.qualname, mark, n.file, n.line
+        ));
     }
     out
 }
@@ -909,13 +947,74 @@ pub fn path(g: &Graph, from: &str, to: &str, json_out: bool) -> String {
 
 /// Type/keyword names never worth resolving as a signature reference.
 const NOISE: &[&str] = &[
-    "self", "Self", "str", "String", "bool", "char", "usize", "isize", "u8", "u16", "u32", "u64",
-    "u128", "i8", "i16", "i32", "i64", "i128", "f32", "f64", "Vec", "Option", "Result", "Box",
-    "Rc", "Arc", "HashMap", "BTreeMap", "HashSet", "BTreeSet", "string", "number", "boolean",
-    "void", "unknown", "any", "Promise", "Record", "Array", "object", "null", "undefined",
-    "never", "export", "function", "const", "class", "interface", "type", "enum", "pub", "fn",
-    "async", "await", "impl", "def", "struct", "trait", "mut", "dyn", "where", "return", "true",
-    "false", "None", "Some", "Ok", "Err",
+    "self",
+    "Self",
+    "str",
+    "String",
+    "bool",
+    "char",
+    "usize",
+    "isize",
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "u128",
+    "i8",
+    "i16",
+    "i32",
+    "i64",
+    "i128",
+    "f32",
+    "f64",
+    "Vec",
+    "Option",
+    "Result",
+    "Box",
+    "Rc",
+    "Arc",
+    "HashMap",
+    "BTreeMap",
+    "HashSet",
+    "BTreeSet",
+    "string",
+    "number",
+    "boolean",
+    "void",
+    "unknown",
+    "any",
+    "Promise",
+    "Record",
+    "Array",
+    "object",
+    "null",
+    "undefined",
+    "never",
+    "export",
+    "function",
+    "const",
+    "class",
+    "interface",
+    "type",
+    "enum",
+    "pub",
+    "fn",
+    "async",
+    "await",
+    "impl",
+    "def",
+    "struct",
+    "trait",
+    "mut",
+    "dyn",
+    "where",
+    "return",
+    "true",
+    "false",
+    "None",
+    "Some",
+    "Ok",
+    "Err",
 ];
 
 struct DefLite {
@@ -1112,7 +1211,11 @@ pub fn context(g: &Graph, query: &str, max_tokens: usize, json_out: bool) -> Str
     let Some(&last) = q.last() else {
         return "empty query\n".to_string();
     };
-    let parent = if q.len() >= 2 { Some(q[q.len() - 2]) } else { None };
+    let parent = if q.len() >= 2 {
+        Some(q[q.len() - 2])
+    } else {
+        None
+    };
     let targets = find_targets(g, last, parent);
     if targets.is_empty() {
         return format!("no definition found for '{query}'\n");
@@ -1169,8 +1272,15 @@ pub fn context(g: &Graph, query: &str, max_tokens: usize, json_out: bool) -> Str
     }
     for (qual, container, it, m) in targets.iter().take(3) {
         out.push_str(&format!("\n# Context: {qual}\n\n"));
-        out.push_str(&format!("## Definition\n{qual}   [{}]   {}:{}\n", it.kind, m.file, it.line));
-        let doc = it.doc.as_deref().map(|d| format!("  — {d}")).unwrap_or_default();
+        out.push_str(&format!(
+            "## Definition\n{qual}   [{}]   {}:{}\n",
+            it.kind, m.file, it.line
+        ));
+        let doc = it
+            .doc
+            .as_deref()
+            .map(|d| format!("  — {d}"))
+            .unwrap_or_default();
         out.push_str(&format!("    {}{}\n", it.signature, doc));
 
         // Signature types.
@@ -1178,15 +1288,27 @@ pub fn context(g: &Graph, query: &str, max_tokens: usize, json_out: bool) -> Str
         if !types.is_empty() {
             out.push_str("\n## Signature types\n");
             for d in types {
-                let doc = d.doc.as_deref().map(|s| format!("  — {s}")).unwrap_or_default();
-                out.push_str(&format!("- {} [{}]  {}:{}{}\n", d.qualname, d.kind, d.file, d.line, doc));
+                let doc = d
+                    .doc
+                    .as_deref()
+                    .map(|s| format!("  — {s}"))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "- {} [{}]  {}:{}{}\n",
+                    d.qualname, d.kind, d.file, d.line, doc
+                ));
             }
         }
 
         // Callees.
         if !it.calls.is_empty() {
             out.push_str(&format!("\n## Calls ({})\n", it.calls.len()));
-            append_capped(&mut out, it.calls.iter().map(|c| format!("- {}", edge_str(c))), 30, budget);
+            append_capped(
+                &mut out,
+                it.calls.iter().map(|c| format!("- {}", edge_str(c))),
+                30,
+                budget,
+            );
         }
 
         // Callers (blast radius).
@@ -1199,7 +1321,9 @@ pub fn context(g: &Graph, query: &str, max_tokens: usize, json_out: bool) -> Str
             out.push_str(&format!("\n## Callers ({})\n", callers.len()));
             append_capped(
                 &mut out,
-                callers.iter().map(|c| format!("- {}  ({}:{})", c.qualname, c.file, c.line)),
+                callers
+                    .iter()
+                    .map(|c| format!("- {}  ({}:{})", c.qualname, c.file, c.line)),
                 30,
                 budget,
             );
@@ -1332,7 +1456,11 @@ pub fn core(
         .iter()
         .map(|m| churn.and_then(|c| c.get(&m.name)).copied().unwrap_or(0))
         .collect();
-    let max_rank = rank.iter().cloned().fold(0.0_f64, f64::max).max(f64::MIN_POSITIVE);
+    let max_rank = rank
+        .iter()
+        .cloned()
+        .fold(0.0_f64, f64::max)
+        .max(f64::MIN_POSITIVE);
     let max_churn = *churn_of.iter().max().unwrap_or(&0);
     let hotspot: Vec<f64> = (0..n)
         .map(|i| {
@@ -1429,7 +1557,13 @@ pub fn coverage_report(
         t.add(&m.diag);
         *by_lang.entry(m.lang.name()).or_default() += 1;
     }
-    let pct = |n: usize, d: usize| if d == 0 { 0.0 } else { 100.0 * n as f64 / d as f64 };
+    let pct = |n: usize, d: usize| {
+        if d == 0 {
+            0.0
+        } else {
+            100.0 * n as f64 / d as f64
+        }
+    };
     let internal = t.resolved + t.unresolved;
 
     // Low-confidence zones: high heuristic ratio (min 10 resolved), and the
@@ -1445,11 +1579,7 @@ pub fn coverage_report(
             .unwrap()
             .then(b.diag.heuristic.cmp(&a.diag.heuristic))
     });
-    let mut miss_zones: Vec<&Module> = g
-        .modules
-        .iter()
-        .filter(|m| m.diag.unresolved > 0)
-        .collect();
+    let mut miss_zones: Vec<&Module> = g.modules.iter().filter(|m| m.diag.unresolved > 0).collect();
     miss_zones.sort_by_key(|m| std::cmp::Reverse(m.diag.unresolved));
 
     // The names behind the misses — the actionable half of the report.
@@ -1464,8 +1594,7 @@ pub fn coverage_report(
         }
     }
     let ranked = |c: &BTreeMap<&str, usize>| {
-        let mut v: Vec<(String, usize)> =
-            c.iter().map(|(k, v)| ((*k).to_string(), *v)).collect();
+        let mut v: Vec<(String, usize)> = c.iter().map(|(k, v)| ((*k).to_string(), *v)).collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         v
     };
@@ -1533,8 +1662,12 @@ pub fn coverage_report(
         internal,
         pct(t.resolved, internal)
     ));
-    out.push_str("A call site is \"could be internal\" when the callee name is defined somewhere\n");
-    out.push_str("under this root. Calls into std or a third-party crate are excluded, because no\n");
+    out.push_str(
+        "A call site is \"could be internal\" when the callee name is defined somewhere\n",
+    );
+    out.push_str(
+        "under this root. Calls into std or a third-party crate are excluded, because no\n",
+    );
     out.push_str("internal edge could exist for them however good the resolver gets.\n\n");
 
     out.push_str("## Every call site, bucketed\n");
@@ -1610,7 +1743,9 @@ pub fn coverage_report(
 
     if !broken.is_empty() {
         out.push_str(&format!("\n## Broken links ({}, Markdown)\n", broken.len()));
-        out.push_str("targets pointing at no file or heading (existing out-of-scope links excluded):\n");
+        out.push_str(
+            "targets pointing at no file or heading (existing out-of-scope links excluded):\n",
+        );
         for (file, line, target) in broken.iter().take(20) {
             out.push_str(&format!("  {file}:{line}  →  {target}\n"));
         }
@@ -1667,7 +1802,14 @@ struct Surface {
 fn is_surface_kind(k: &str) -> bool {
     matches!(
         k,
-        "fn" | "def" | "struct" | "enum" | "trait" | "interface" | "type" | "class" | "const"
+        "fn" | "def"
+            | "struct"
+            | "enum"
+            | "trait"
+            | "interface"
+            | "type"
+            | "class"
+            | "const"
             | "macro"
     )
 }
@@ -1724,7 +1866,10 @@ fn public_surface(g: &Graph) -> BTreeMap<String, Surface> {
 
 fn caller_names(g: &Graph, q: &[String]) -> Vec<String> {
     let refs: Vec<&str> = q.iter().map(String::as_str).collect();
-    callers_of(g, &refs).into_iter().map(|c| c.qualname).collect()
+    callers_of(g, &refs)
+        .into_iter()
+        .map(|c| c.qualname)
+        .collect()
 }
 
 fn fmt_callers(names: &[String]) -> String {
@@ -1738,7 +1883,12 @@ fn fmt_callers(names: &[String]) -> String {
         } else {
             String::new()
         };
-        format!("    callers ({}): {}{}\n", names.len(), shown.join(", "), suffix)
+        format!(
+            "    callers ({}): {}{}\n",
+            names.len(),
+            shown.join(", "),
+            suffix
+        )
     }
 }
 
@@ -2148,7 +2298,11 @@ export function run(s: S): number { return s.step(); }
         let kept: Vec<String> = g.modules.iter().map(|m| m.name.clone()).collect();
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(stats.omitted, total - 1);
-        assert_eq!(kept, ["a"], "the single kept module should be the central one");
+        assert_eq!(
+            kept,
+            ["a"],
+            "the single kept module should be the central one"
+        );
     }
 
     /// A repo full of cross-linked docs and code that imports only external
@@ -2177,14 +2331,21 @@ export function run(s: S): number { return s.step(); }
                 "import os, json\n\nclass Worker:\n    def run(self):\n        pass\n".into(),
             ));
         }
-        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
         let (mut g, dir) = graph(&refs);
 
         // Every nontrivial keep count must retain at least one code module.
         for keep in [1usize, 2, 5, 10] {
             let mut gg = g.clone();
             crate::view::prune_to_central(&mut gg, keep, 0.10);
-            let code = gg.modules.iter().filter(|m| m.lang != Lang::Markdown).count();
+            let code = gg
+                .modules
+                .iter()
+                .filter(|m| m.lang != Lang::Markdown)
+                .count();
             assert!(
                 code > 0,
                 "keep={keep} produced a map with no code modules at all"
@@ -2209,13 +2370,24 @@ export function run(s: S): number { return s.step(); }
                 .collect();
             files.push((format!("doc_{i}.md"), format!("# Doc {i}\n\n{body}")));
         }
-        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
         let (mut g, dir) = graph(&refs);
         // keep must be < module count, or pruning is not required and the
         // ceiling deliberately does not engage.
         let stats = crate::view::prune_to_central(&mut g, 8, 0.10);
-        let prose_left = g.modules.iter().filter(|m| m.lang == Lang::Markdown).count();
-        let code_left = g.modules.iter().filter(|m| m.lang != Lang::Markdown).count();
+        let prose_left = g
+            .modules
+            .iter()
+            .filter(|m| m.lang == Lang::Markdown)
+            .count();
+        let code_left = g
+            .modules
+            .iter()
+            .filter(|m| m.lang != Lang::Markdown)
+            .count();
         let _ = fs::remove_dir_all(&dir);
         assert!(stats.prose_capped > 0, "oversized prose should be capped");
         assert_eq!(code_left, 1, "code must survive the prose ceiling");
@@ -2274,9 +2446,15 @@ export function run(s: S): number { return s.step(); }
         let unique = callers(&g, "solo", false);
         let json = callers(&g, "run", true);
         let _ = fs::remove_dir_all(&dir);
-        assert!(ambiguous.contains("INCOMPLETE"), "ambiguity must be disclosed");
+        assert!(
+            ambiguous.contains("INCOMPLETE"),
+            "ambiguity must be disclosed"
+        );
         assert!(ambiguous.contains("2 definitions"));
-        assert!(ambiguous.contains("rg -n"), "must offer the confirming command");
+        assert!(
+            ambiguous.contains("rg -n"),
+            "must offer the confirming command"
+        );
         assert!(
             !unique.contains("INCOMPLETE"),
             "a uniquely-named symbol must not raise a false alarm"
@@ -2288,7 +2466,10 @@ export function run(s: S): number { return s.step(); }
             qualified.contains("INCOMPLETE"),
             "qualifying must not hide the ambiguity"
         );
-        assert!(json.contains("\"lower_bound\": true"), "machine callers need the flag");
+        assert!(
+            json.contains("\"lower_bound\": true"),
+            "machine callers need the flag"
+        );
     }
 
     #[test]
@@ -2302,17 +2483,23 @@ export function run(s: S): number { return s.step(); }
         let text = callers(&g, "open", false);
         let json = callers(&g, "open", true);
         let _ = fs::remove_dir_all(&dir);
-        assert!(text.contains("NOT INDEXED"), "suppression must be disclosed: {text}");
+        assert!(
+            text.contains("NOT INDEXED"),
+            "suppression must be disclosed: {text}"
+        );
         assert!(json.contains("\"suppressed_common_name\": true"));
         assert!(json.contains("\"lower_bound\": true"));
-        assert!(!json.contains("\"complete\": true"), "must never claim completeness");
+        assert!(
+            !json.contains("\"complete\": true"),
+            "must never claim completeness"
+        );
     }
 
     #[test]
     fn cross_language_method_names_do_not_create_edges() {
         // A Python call to `apply_template` must not be attributed to a Rust
         // method of the same name — that invents a Python -> Rust dependency.
-            let (g, dir) = graph(&[
+        let (g, dir) = graph(&[
             (
                 "user.py",
                 "import os\n\ndef go(tok):\n    tok.apply_template('x')\n",
@@ -2342,7 +2529,10 @@ export function run(s: S): number { return s.step(); }
         // silently loses callers in scripts, tests and __init__ wiring.
         let (g, dir) = graph(&[
             ("lib.py", "def frequencies(x):\n    return x\n"),
-            ("top.py", "from lib import frequencies\n\nFR = frequencies(3)\n"),
+            (
+                "top.py",
+                "from lib import frequencies\n\nFR = frequencies(3)\n",
+            ),
         ]);
         let text = callers(&g, "frequencies", false);
         let _ = fs::remove_dir_all(&dir);
@@ -2358,13 +2548,22 @@ export function run(s: S): number { return s.step(); }
         // for the most common breaking change there is.
         let (g, dir) = graph(&[
             ("a.py", "class Config:\n    pass\n"),
-            ("b.py", "from a import Config\n\ndef build(c: Config) -> Config:\n    return c\n"),
+            (
+                "b.py",
+                "from a import Config\n\ndef build(c: Config) -> Config:\n    return c\n",
+            ),
         ]);
         let text = callers(&g, "Config", false);
         let json = callers(&g, "Config", true);
         let _ = fs::remove_dir_all(&dir);
-        assert!(text.contains("is a type"), "type queries need the type path: {text}");
-        assert!(text.contains("build"), "the referencing signature must be listed");
+        assert!(
+            text.contains("is a type"),
+            "type queries need the type path: {text}"
+        );
+        assert!(
+            text.contains("build"),
+            "the referencing signature must be listed"
+        );
         assert!(json.contains("\"references\""));
     }
 
@@ -2379,7 +2578,11 @@ export function run(s: S): number { return s.step(); }
         let names: Vec<&str> = g.modules.iter().map(|m| m.name.as_str()).collect();
         let unique: BTreeSet<&&str> = names.iter().collect();
         let _ = fs::remove_dir_all(&dir);
-        assert_eq!(names.len(), unique.len(), "module names must be unique: {names:?}");
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "module names must be unique: {names:?}"
+        );
     }
 
     #[test]
@@ -2402,7 +2605,10 @@ export function run(s: S): number { return s.step(); }
 
     #[test]
     fn def_reports_kind_signature_and_doc() {
-        let (g, dir) = graph(&[("src/lib.rs", "/// A widget.\npub struct Widget { pub n: i32 }\n")]);
+        let (g, dir) = graph(&[(
+            "src/lib.rs",
+            "/// A widget.\npub struct Widget { pub n: i32 }\n",
+        )]);
         let out = def(&g, "Widget", false);
         assert!(out.contains("1 definition(s)"));
         assert!(out.contains("Widget"));
@@ -2434,7 +2640,10 @@ export function run(s: S): number { return s.step(); }
     fn callers_resolves_cross_module_call_edge() {
         let (g, dir) = graph(&[
             ("src/a.rs", "pub fn helper() {}\n"),
-            ("src/b.rs", "use crate::a::helper;\npub fn run() { helper(); }\n"),
+            (
+                "src/b.rs",
+                "use crate::a::helper;\npub fn run() { helper(); }\n",
+            ),
         ]);
         let out = callers(&g, "helper", false);
         assert!(out.contains("1 caller(s)"), "{out}");
@@ -2456,8 +2665,14 @@ export function run(s: S): number { return s.step(); }
         // guess — no `~`. (Before receiver typing this same call resolved only
         // because the method name happened to be unique codebase-wide.)
         let (g, dir) = graph(&[
-            ("src/a.rs", "pub struct Widget;\nimpl Widget { pub fn frobnicate(&self) {} }\n"),
-            ("src/b.rs", "use crate::a::Widget;\npub fn run(w: Widget) { w.frobnicate(); }\n"),
+            (
+                "src/a.rs",
+                "pub struct Widget;\nimpl Widget { pub fn frobnicate(&self) {} }\n",
+            ),
+            (
+                "src/b.rs",
+                "use crate::a::Widget;\npub fn run(w: Widget) { w.frobnicate(); }\n",
+            ),
         ]);
         let out = callers(&g, "frobnicate", false);
         assert!(out.contains("b::run"), "{out}");
@@ -2486,7 +2701,10 @@ export function run(s: S): number { return s.step(); }
     fn neighbors_split_upstream_and_downstream() {
         let (g, dir) = graph(&[
             ("src/a.rs", "pub fn base() {}\n"),
-            ("src/b.rs", "use crate::a::base;\npub fn mid() { base(); }\n"),
+            (
+                "src/b.rs",
+                "use crate::a::base;\npub fn mid() { base(); }\n",
+            ),
             ("src/c.rs", "use crate::b::mid;\npub fn top() { mid(); }\n"),
         ]);
         let targets: BTreeSet<&str> = ["b"].into_iter().collect();
@@ -2530,7 +2748,10 @@ export function run(s: S): number { return s.step(); }
     fn context_bundles_def_callees_and_callers() {
         let (g, dir) = graph(&[
             ("src/a.rs", "pub fn helper() {}\n"),
-            ("src/b.rs", "use crate::a::helper;\npub fn run() { helper(); }\n"),
+            (
+                "src/b.rs",
+                "use crate::a::helper;\npub fn run() { helper(); }\n",
+            ),
         ]);
         let out = context(&g, "run", 4000, false);
         assert!(out.contains("# Context: b::run"), "{out}");
@@ -2579,10 +2800,22 @@ export function run(s: S): number { return s.step(); }
             "pub fn stable() {}\npub fn morph(a: i32, b: i32) {}\npub fn fresh() {}\n",
         )]);
         let (out, removed_n, changed_n) = api_report(&base.0, &cur.0, "HEAD", false);
-        assert!(out.contains("## Removed") && out.contains("api::gone"), "{out}");
-        assert!(out.contains("## Changed") && out.contains("api::morph"), "{out}");
-        assert!(out.contains("## Added") && out.contains("api::fresh"), "{out}");
-        assert!(!out.contains("stable"), "unchanged item must not appear:\n{out}");
+        assert!(
+            out.contains("## Removed") && out.contains("api::gone"),
+            "{out}"
+        );
+        assert!(
+            out.contains("## Changed") && out.contains("api::morph"),
+            "{out}"
+        );
+        assert!(
+            out.contains("## Added") && out.contains("api::fresh"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("stable"),
+            "unchanged item must not appear:\n{out}"
+        );
         // Counted separately on purpose: a removal always breaks callers, while a
         // signature change may be an added optional parameter. Only the first is
         // safe to gate CI on.
@@ -2612,7 +2845,10 @@ export function run(s: S): number { return s.step(); }
         let cov = coverage_report(&g, &[], false, false);
         assert!(cov.contains("## Broken links"), "{cov}");
         assert!(cov.contains("./ghost.md"), "{cov}");
-        assert!(!cov.contains("./setup.md"), "resolved link must not be broken:\n{cov}");
+        assert!(
+            !cov.contains("./setup.md"),
+            "resolved link must not be broken:\n{cov}"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

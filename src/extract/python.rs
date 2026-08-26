@@ -10,7 +10,9 @@ pub fn extract(src: &str) -> Result<FileFacts> {
     parser
         .set_language(&tree_sitter_python::LANGUAGE.into())
         .context("loading python grammar")?;
-    let tree = parser.parse(src, None).context("tree-sitter parse failed")?;
+    let tree = parser
+        .parse(src, None)
+        .context("tree-sitter parse failed")?;
 
     let mut facts = FileFacts::default();
     let mut items = Vec::new();
@@ -99,7 +101,10 @@ fn annotation_type(raw: &str) -> Option<String> {
     let t = collapse(raw);
     let t = t.trim().trim_matches(['"', '\'']).trim();
     // Optional[Foo] / list[Foo] — only unwrap the Optional-shaped ones.
-    let t = match t.strip_prefix("Optional[").and_then(|r| r.strip_suffix(']')) {
+    let t = match t
+        .strip_prefix("Optional[")
+        .and_then(|r| r.strip_suffix(']'))
+    {
         Some(inner) => inner.trim(),
         None => t,
     };
@@ -125,7 +130,9 @@ fn fn_env(node: Node, src: &str) -> TypeEnv {
         if !matches!(p.kind(), "typed_parameter" | "typed_default_parameter") {
             continue;
         }
-        let Some(ty) = p.child_by_field_name("type") else { continue };
+        let Some(ty) = p.child_by_field_name("type") else {
+            continue;
+        };
         let name = match p.kind() {
             "typed_default_parameter" => p.child_by_field_name("name").map(|n| text(n, src)),
             _ => p.named_children(&mut p.walk()).next().map(|n| text(n, src)),
@@ -427,7 +434,9 @@ fn push_callee(f: Node, src: &str, env: &TypeEnv, out: &mut Vec<RawCall>) {
 /// call resolution ("a" -> a, "d" -> c). Never rendered as re-exports.
 fn parse_import(t: &str, facts: &mut FileFacts) {
     let t = collapse(t);
-    let Some(rest) = t.strip_prefix("import ") else { return };
+    let Some(rest) = t.strip_prefix("import ") else {
+        return;
+    };
     for part in rest.split(',') {
         let (real, alias) = match part.split_once(" as ") {
             Some((r, a)) => (r.trim(), Some(a.trim())),
@@ -458,8 +467,12 @@ fn parse_import(t: &str, facts: &mut FileFacts) {
 /// based on whether the file is an __init__.py.
 fn parse_from_import(t: &str, facts: &mut FileFacts) {
     let t = collapse(t).replace(['(', ')'], "");
-    let Some(rest) = t.strip_prefix("from ") else { return };
-    let Some((module, names)) = rest.split_once(" import ") else { return };
+    let Some(rest) = t.strip_prefix("from ") else {
+        return;
+    };
+    let Some((module, names)) = rest.split_once(" import ") else {
+        return;
+    };
     let module = module.trim();
     for name in names.split(',') {
         let (real, alias) = match name.split_once(" as ") {
@@ -515,12 +528,18 @@ mod tests {
     use super::*;
 
     fn doc_of(src: &str) -> Option<String> {
-        extract(src).unwrap().items.into_iter().next().and_then(|i| i.doc)
+        extract(src)
+            .unwrap()
+            .items
+            .into_iter()
+            .next()
+            .and_then(|i| i.doc)
     }
 
     #[test]
     fn function_docstring_first_line() {
-        let src = "def foo():\n    \"\"\"Summary line.\n\n    More detail.\n    \"\"\"\n    return 1\n";
+        let src =
+            "def foo():\n    \"\"\"Summary line.\n\n    More detail.\n    \"\"\"\n    return 1\n";
         assert_eq!(doc_of(src).as_deref(), Some("Summary line."));
     }
 

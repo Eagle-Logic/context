@@ -34,7 +34,9 @@ pub struct ImportSite<'a> {
 /// Path form of a module name in `lang`'s import syntax.
 fn as_path(name: &str, lang: Lang) -> String {
     let from_sep = if name.contains("::") { "::" } else { "." };
-    name.split(from_sep).collect::<Vec<_>>().join(Lang::sep(lang))
+    name.split(from_sep)
+        .collect::<Vec<_>>()
+        .join(Lang::sep(lang))
 }
 
 /// Suggested on-disk destination for a module's file.
@@ -114,9 +116,7 @@ fn import_sites<'a>(g: &'a Graph, target: &str, to: &str) -> Vec<ImportSite<'a>>
 /// Plan the relocation of `from` to `to`: every site that must change.
 pub fn move_plan(g: &Graph, from: &str, to: &str, json_out: bool) -> String {
     let matches = |name: &str| {
-        name == from
-            || name.ends_with(&format!("::{from}"))
-            || name.ends_with(&format!(".{from}"))
+        name == from || name.ends_with(&format!("::{from}")) || name.ends_with(&format!(".{from}"))
     };
     let Some(target) = g.modules.iter().find(|m| matches(&m.name)) else {
         return format!("no module matching '{from}'\n");
@@ -163,17 +163,17 @@ pub fn move_plan(g: &Graph, from: &str, to: &str, json_out: bool) -> String {
 
     let mut out = format!("# Move plan: {} → {to}\n\n", target.name);
     match &file_move {
-        Some(f) => out.push_str(&format!("## 1. Move the file\n\n  {}  →  {f}\n\n", target.file)),
+        Some(f) => out.push_str(&format!(
+            "## 1. Move the file\n\n  {}  →  {f}\n\n",
+            target.file
+        )),
         None => out.push_str(&format!(
             "## 1. Move the file\n\n  {}  →  (destination path could not be derived)\n\n",
             target.file
         )),
     }
 
-    out.push_str(&format!(
-        "## 2. Rewrite {} import site(s)\n\n",
-        sites.len()
-    ));
+    out.push_str(&format!("## 2. Rewrite {} import site(s)\n\n", sites.len()));
     if sites.is_empty() {
         out.push_str("  none — nothing imports this module\n\n");
     } else {
@@ -310,16 +310,25 @@ mod tests {
         let (g, dir) = graph(&[
             ("pkg/__init__.py", ""),
             ("pkg/gate.py", "def check():\n    pass\n"),
-            ("app.py", "from pkg.gate import check\n\ndef go():\n    check()\n"),
+            (
+                "app.py",
+                "from pkg.gate import check\n\ndef go():\n    check()\n",
+            ),
         ]);
         let out = move_plan(&g, "pkg.gate", "pkg.routing.gate", false);
         let _ = fs::remove_dir_all(&dir);
-        assert!(out.contains("pkg/gate.py"), "must name the file to move: {out}");
+        assert!(
+            out.contains("pkg/gate.py"),
+            "must name the file to move: {out}"
+        );
         assert!(
             out.contains("pkg/routing/gate.py"),
             "destination path must be derived: {out}"
         );
-        assert!(out.contains("pkg.routing.gate"), "rewrite must be shown: {out}");
+        assert!(
+            out.contains("pkg.routing.gate"),
+            "rewrite must be shown: {out}"
+        );
         assert!(out.contains("1 import site"), "site count: {out}");
     }
 
@@ -339,7 +348,10 @@ mod tests {
         // A dependent reached only by receiver inference has no literal string to
         // rewrite, so it must be listed apart rather than presented as a site.
         let (g, dir) = graph(&[
-            ("lib.py", "class Thing:\n    def unique_method_name(self):\n        pass\n"),
+            (
+                "lib.py",
+                "class Thing:\n    def unique_method_name(self):\n        pass\n",
+            ),
             ("user.py", "def go(t):\n    t.unique_method_name()\n"),
         ]);
         let out = move_plan(&g, "lib", "core.lib", false);

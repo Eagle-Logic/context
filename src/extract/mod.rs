@@ -140,7 +140,8 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
             Some("md") | Some("markdown") => lang_selected(Lang::Markdown),
             // Skip `.d.ts` — ambient type declarations carry no topology.
             Some("ts") => {
-                lang_selected(Lang::TypeScript) && !path.to_str().is_some_and(|s| s.ends_with(".d.ts"))
+                lang_selected(Lang::TypeScript)
+                    && !path.to_str().is_some_and(|s| s.ends_with(".d.ts"))
             }
             _ => false,
         };
@@ -287,17 +288,85 @@ fn disambiguate_module_names(modules: &mut [Module]) {
 /// as a blind spot automatically instead of waiting to be allowlisted.
 const NON_SOURCE_EXTS: &[&str] = &[
     // images / fonts / media
-    "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "bmp", "pdf", "mp4", "mp3", "wav", "ttf",
-    "otf", "woff", "woff2",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "svg",
+    "ico",
+    "webp",
+    "bmp",
+    "pdf",
+    "mp4",
+    "mp3",
+    "wav",
+    "ttf",
+    "otf",
+    "woff",
+    "woff2",
     // archives / binaries / model weights
-    "zip", "gz", "tgz", "bz2", "xz", "zst", "tar", "bin", "so", "dylib", "dll", "exe", "a", "o",
-    "pyc", "pyd", "whl", "onnx", "pt", "pth", "safetensors", "gguf", "ggml", "npy", "npz", "pkl",
+    "zip",
+    "gz",
+    "tgz",
+    "bz2",
+    "xz",
+    "zst",
+    "tar",
+    "bin",
+    "so",
+    "dylib",
+    "dll",
+    "exe",
+    "a",
+    "o",
+    "pyc",
+    "pyd",
+    "whl",
+    "onnx",
+    "pt",
+    "pth",
+    "safetensors",
+    "gguf",
+    "ggml",
+    "npy",
+    "npz",
+    "pkl",
     // data / config / text
-    "json", "jsonl", "csv", "tsv", "parquet", "db", "sqlite", "lock", "log", "txt", "toml", "yaml",
-    "yml", "ini", "cfg", "env", "gbnf", "gitignore", "gitattributes",
+    "json",
+    "jsonl",
+    "csv",
+    "tsv",
+    "parquet",
+    "db",
+    "sqlite",
+    "lock",
+    "log",
+    "txt",
+    "toml",
+    "yaml",
+    "yml",
+    "ini",
+    "cfg",
+    "env",
+    "gbnf",
+    "gitignore",
+    "gitattributes",
     // backups / artifacts / keys: present in a tree, but not language blind spots
-    "bak", "backup", "archive", "orig", "rej", "tmp", "swp", "pub", "pem", "key",
-    "pin", "patch", "manifest", "tpl", "lockb",
+    "bak",
+    "backup",
+    "archive",
+    "orig",
+    "rej",
+    "tmp",
+    "swp",
+    "pub",
+    "pem",
+    "key",
+    "pin",
+    "patch",
+    "manifest",
+    "tpl",
+    "lockb",
 ];
 
 /// Count unmodeled source files by extension under `root`, honoring the same
@@ -387,7 +456,9 @@ fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>) {
             Lang::Rust => matches!(stem, "mod" | "lib" | "main"),
             Lang::Python => stem == "__init__",
             Lang::TypeScript => stem == "index",
-            Lang::Markdown => stem.eq_ignore_ascii_case("readme") || stem.eq_ignore_ascii_case("index"),
+            Lang::Markdown => {
+                stem.eq_ignore_ascii_case("readme") || stem.eq_ignore_ascii_case("index")
+            }
         };
         if !drop {
             segs.push(stem.to_string());
@@ -474,8 +545,7 @@ fn resolve_deps(modules: &mut [Module], root: &Path) {
                     .filter(|b| b.public)
                     .map(|b| display_reexport(b, m, &ctx))
                     .collect();
-                let (calls_per_item, call_deps, soft_deps, diag) =
-                    compute_calls(m, &ctx, &uni);
+                let (calls_per_item, call_deps, soft_deps, diag) = compute_calls(m, &ctx, &uni);
                 // An import-derived dep is hard evidence; only a dep that exists
                 // SOLELY via receiver inference stays marked soft.
                 let soft: Vec<String> = soft_deps
@@ -763,19 +833,122 @@ pub fn is_suppressed_method_name(name: &str) -> bool {
 }
 
 const STD_METHODS: &[&str] = &[
-    "new", "default", "clone", "into", "from", "as_ref", "as_mut", "as_str", "to_string",
-    "to_owned", "to_vec", "into_iter", "iter", "iter_mut", "next", "collect", "map", "filter",
-    "fold", "for_each", "any", "all", "find", "position", "push", "pop", "insert", "remove",
-    "get", "get_mut", "contains", "contains_key", "len", "is_empty", "clear", "extend",
-    "append", "join", "split", "trim", "parse", "unwrap", "unwrap_or", "unwrap_or_else",
-    "unwrap_or_default", "expect", "ok", "err", "is_some", "is_none", "is_ok", "is_err",
-    "and_then", "or_else", "take", "replace", "send", "recv", "lock", "read", "write",
-    "flush", "close", "open", "format", "items", "keys", "values", "update", "add", "copy",
-    "sort", "sort_by", "reverse", "index", "count", "startswith", "endswith", "strip",
-    "lstrip", "rstrip", "lower", "upper", "encode", "decode", "min", "max", "sum", "abs",
-    "enumerate", "zip", "first", "last", "entry", "or_insert", "or_default", "chars",
-    "bytes", "lines", "clamp", "floor", "ceil", "round", "sqrt", "powi", "powf", "exp",
-    "ln", "cos", "sin", "tan", "get_or_insert_with", "retain", "drain", "chunks", "windows",
+    "new",
+    "default",
+    "clone",
+    "into",
+    "from",
+    "as_ref",
+    "as_mut",
+    "as_str",
+    "to_string",
+    "to_owned",
+    "to_vec",
+    "into_iter",
+    "iter",
+    "iter_mut",
+    "next",
+    "collect",
+    "map",
+    "filter",
+    "fold",
+    "for_each",
+    "any",
+    "all",
+    "find",
+    "position",
+    "push",
+    "pop",
+    "insert",
+    "remove",
+    "get",
+    "get_mut",
+    "contains",
+    "contains_key",
+    "len",
+    "is_empty",
+    "clear",
+    "extend",
+    "append",
+    "join",
+    "split",
+    "trim",
+    "parse",
+    "unwrap",
+    "unwrap_or",
+    "unwrap_or_else",
+    "unwrap_or_default",
+    "expect",
+    "ok",
+    "err",
+    "is_some",
+    "is_none",
+    "is_ok",
+    "is_err",
+    "and_then",
+    "or_else",
+    "take",
+    "replace",
+    "send",
+    "recv",
+    "lock",
+    "read",
+    "write",
+    "flush",
+    "close",
+    "open",
+    "format",
+    "items",
+    "keys",
+    "values",
+    "update",
+    "add",
+    "copy",
+    "sort",
+    "sort_by",
+    "reverse",
+    "index",
+    "count",
+    "startswith",
+    "endswith",
+    "strip",
+    "lstrip",
+    "rstrip",
+    "lower",
+    "upper",
+    "encode",
+    "decode",
+    "min",
+    "max",
+    "sum",
+    "abs",
+    "enumerate",
+    "zip",
+    "first",
+    "last",
+    "entry",
+    "or_insert",
+    "or_default",
+    "chars",
+    "bytes",
+    "lines",
+    "clamp",
+    "floor",
+    "ceil",
+    "round",
+    "sqrt",
+    "powi",
+    "powf",
+    "exp",
+    "ln",
+    "cos",
+    "sin",
+    "tan",
+    "get_or_insert_with",
+    "retain",
+    "drain",
+    "chunks",
+    "windows",
 ];
 
 /// Free-call names that always belong to the language, not to the repo:
@@ -783,11 +956,45 @@ const STD_METHODS: &[&str] = &[
 /// classified external on a resolution failure, so the miss census stays
 /// readable — an `Err(..)` is never a call into your code.
 const STD_FREE: &[&str] = &[
-    "Ok", "Err", "Some", "None", "format", "vec", "print", "println", "eprint", "eprintln",
-    "panic", "assert", "assert_eq", "assert_ne", "debug_assert", "matches", "todo",
-    "unimplemented", "unreachable", "dbg", "int", "str", "list", "dict", "set", "tuple",
-    "bool", "float", "range", "super", "isinstance", "hasattr", "getattr", "setattr",
-    "String", "Vec", "Box", "Rc", "Arc",
+    "Ok",
+    "Err",
+    "Some",
+    "None",
+    "format",
+    "vec",
+    "print",
+    "println",
+    "eprint",
+    "eprintln",
+    "panic",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "matches",
+    "todo",
+    "unimplemented",
+    "unreachable",
+    "dbg",
+    "int",
+    "str",
+    "list",
+    "dict",
+    "set",
+    "tuple",
+    "bool",
+    "float",
+    "range",
+    "super",
+    "isinstance",
+    "hasattr",
+    "getattr",
+    "setattr",
+    "String",
+    "Vec",
+    "Box",
+    "Rc",
+    "Arc",
 ];
 
 /// method name -> set of (module, container type/class) defining it.
@@ -917,10 +1124,20 @@ struct EdgeOut {
 
 impl EdgeOut {
     fn plain(display: String, dep: Option<String>) -> Self {
-        EdgeOut { display, dep, heuristic: false, dispatch: false }
+        EdgeOut {
+            display,
+            dep,
+            heuristic: false,
+            dispatch: false,
+        }
     }
     fn guess(display: String, dep: Option<String>) -> Self {
-        EdgeOut { display, dep, heuristic: true, dispatch: false }
+        EdgeOut {
+            display,
+            dep,
+            heuristic: true,
+            dispatch: false,
+        }
     }
 }
 
@@ -995,7 +1212,10 @@ fn resolve_call(
         // `self.field.f()`: look the field's declared type up on the
         // enclosing type, then resolve as if it were written out.
         Receiver::SelfField(field) => {
-            return match container.and_then(|c| uni.fields.get(c)).and_then(|f| f.get(field)) {
+            return match container
+                .and_then(|c| uni.fields.get(c))
+                .and_then(|f| f.get(field))
+            {
                 Some(ty) => match field_receiver(ty, uni) {
                     Receiver::Typed(t) => typed_edge(&rc.path, &t, m, ctx, uni),
                     Receiver::Dyn(t) => dispatch_edge(&rc.path, &t, m, uni),
@@ -1017,7 +1237,12 @@ fn resolve_call(
         Receiver::Free => {}
     }
 
-    let segs: Vec<&str> = rc.path.split(s).map(str::trim).filter(|x| !x.is_empty()).collect();
+    let segs: Vec<&str> = rc
+        .path
+        .split(s)
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .collect();
     match segs.len() {
         0 => Resolution::External(String::new()),
         1 => {
@@ -1399,7 +1624,12 @@ fn dispatch_edge(name: &str, abstraction: &str, m: &Module, uni: &Universe) -> R
         } else {
             (format!("{om}{os}{ty}{os}{name}"), Some(om.clone()))
         };
-        EdgeOut { display, dep, heuristic: false, dispatch: true }
+        EdgeOut {
+            display,
+            dep,
+            heuristic: false,
+            dispatch: true,
+        }
     };
     // Concrete implementations first. The declaring trait/interface is only a
     // target when nothing overrides the method — i.e. it is a default body,
@@ -1456,7 +1686,12 @@ fn compute_calls(
     m: &Module,
     ctx: &Ctx,
     uni: &Universe,
-) -> (Vec<Vec<Call>>, BTreeSet<String>, BTreeSet<String>, Diagnostics) {
+) -> (
+    Vec<Vec<Call>>,
+    BTreeSet<String>,
+    BTreeSet<String>,
+    Diagnostics,
+) {
     struct Walk<'a> {
         m: &'a Module,
         ctx: &'a Ctx<'a>,
@@ -1529,7 +1764,11 @@ fn compute_calls(
                 self.per_item.push(
                     calls
                         .into_iter()
-                        .map(|(to, (heuristic, dispatch))| Call { to, heuristic, dispatch })
+                        .map(|(to, (heuristic, dispatch))| Call {
+                            to,
+                            heuristic,
+                            dispatch,
+                        })
                         .collect(),
                 );
                 let next = if matches!(it.kind.as_str(), "impl" | "trait" | "class" | "interface") {

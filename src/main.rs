@@ -358,10 +358,9 @@ fn snippet_for(g: &Graph) -> String {
         .sum();
     let prose_pct = (prose_bytes * 100).checked_div(all_bytes).unwrap_or(0);
 
-    let (sites, resolved): (usize, usize) = g
-        .modules
-        .iter()
-        .fold((0, 0), |(s, r), m| (s + m.diag.call_sites, r + m.diag.resolved));
+    let (sites, resolved): (usize, usize) = g.modules.iter().fold((0, 0), |(s, r), m| {
+        (s + m.diag.call_sites, r + m.diag.resolved)
+    });
     let resolve_pct = (resolved * 100).checked_div(sites).unwrap_or(0);
 
     let mut out = String::from("<!-- ctx:begin — regenerate with `ctx snippet` -->\n");
@@ -430,11 +429,12 @@ fn snippet_for(g: &Graph) -> String {
              `ctx doctor` before leaning on call edges.\n"
         ));
     }
-    out.push_str("\n`CODEBASE_MAP.md` is generated, not committed: gitignore it and rebuild on demand.\n");
+    out.push_str(
+        "\n`CODEBASE_MAP.md` is generated, not committed: gitignore it and rebuild on demand.\n",
+    );
     out.push_str("<!-- ctx:end -->\n");
     out
 }
-
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -464,9 +464,9 @@ fn main() -> Result<()> {
                     // nothing still has to say so.
                     let detail = match (b.fit, b.omitted) {
                         (true, 0) => String::new(),
-                        (true, n) => format!(
-                            " — pruned {n} of {module_count} least-central modules to fit"
-                        ),
+                        (true, n) => {
+                            format!(" — pruned {n} of {module_count} least-central modules to fit")
+                        }
                         (false, n) => {
                             // The map's header and footer are a fixed floor that
                             // no amount of pruning removes, so at very small
@@ -582,7 +582,12 @@ fn main() -> Result<()> {
             };
             print!(
                 "{}",
-                query::core(&g, limit, churn_map.as_ref(), matches!(format, Format::Json))
+                query::core(
+                    &g,
+                    limit,
+                    churn_map.as_ref(),
+                    matches!(format, Format::Json)
+                )
             );
         }
         Cmd::Trace {
@@ -610,7 +615,11 @@ fn main() -> Result<()> {
                 query::path(&g, &from, &to, matches!(format, Format::Json))
             );
         }
-        Cmd::Doctor { path, explain, format } => {
+        Cmd::Doctor {
+            path,
+            explain,
+            format,
+        } => {
             let g = extract::build_graph(&path)?;
             let unsupported = extract::unsupported_census(&path);
             print!(
@@ -699,7 +708,13 @@ fn main() -> Result<()> {
             print!(
                 "{}",
                 impact_text(
-                    &g, label, &targets, &upstream, &downstream, format, max_tokens
+                    &g,
+                    label,
+                    &targets,
+                    &upstream,
+                    &downstream,
+                    format,
+                    max_tokens
                 )
             );
         }
@@ -781,8 +796,8 @@ fn main() -> Result<()> {
 /// flattened whole; a single file builds the graph for its parent directory
 /// and flattens only the module that file produced.
 fn members_for(path: &std::path::Path) -> Result<Vec<parity::MemberView>> {
-    let meta = fs::metadata(path)
-        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+    let meta =
+        fs::metadata(path).map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
     if meta.is_dir() {
         let g = extract::build_graph(path)?;
         return Ok(g.modules.iter().flat_map(parity::flatten).collect());
@@ -895,7 +910,13 @@ fn run_diff(
         print!(
             "{}",
             impact_text(
-                &head, &label, &targets, &upstream, &downstream, format, max_tokens
+                &head,
+                &label,
+                &targets,
+                &upstream,
+                &downstream,
+                format,
+                max_tokens
             )
         );
     }
@@ -1070,7 +1091,10 @@ fn annotate_budget(text: String, view: View, budget: usize, fit: bool, format: F
     match format {
         Format::Md => text.replacen(
             "# Codebase Topology Map\n",
-            &format!("# Codebase Topology Map\nview: {} ({verdict})\n", view.name()),
+            &format!(
+                "# Codebase Topology Map\nview: {} ({verdict})\n",
+                view.name()
+            ),
             1,
         ),
         Format::Json => text,
@@ -1109,7 +1133,11 @@ fn subtree_text(
     let render_at = |v: View, neighbor_cap: Option<usize>| -> String {
         let mut gg = g.clone();
         view::apply(&mut gg, v);
-        let targets: Vec<&Module> = gg.modules.iter().filter(|m| matches_query(&m.name)).collect();
+        let targets: Vec<&Module> = gg
+            .modules
+            .iter()
+            .filter(|m| matches_query(&m.name))
+            .collect();
         let target_names: BTreeSet<&str> = targets.iter().map(|m| m.name.as_str()).collect();
         let (mut upstream, mut downstream) = query::neighbors(&gg, &target_names);
         let mut dropped = 0usize;
@@ -1220,7 +1248,6 @@ fn subtree_text(
     Ok(text)
 }
 
-
 /// Parse `--alias Old=New` into a container rename pair.
 fn parse_alias(s: &str) -> Result<(String, String), String> {
     match s.split_once('=') {
@@ -1251,7 +1278,11 @@ fn not_found_message(g: &Graph, query: &str) -> String {
         .iter()
         .map(|m| {
             let lower = m.name.to_lowercase();
-            let last = lower.rsplit(['.', ':']).next().unwrap_or(&lower).to_string();
+            let last = lower
+                .rsplit(['.', ':'])
+                .next()
+                .unwrap_or(&lower)
+                .to_string();
             (
                 m.name.as_str(),
                 lower.contains(&q) || last.contains(&q),
@@ -1336,7 +1367,12 @@ fn render_budgeted(g: &Graph, start: View, format: Format, max_tokens: usize) ->
     for &v in &ladder[start_idx..] {
         let text = render(v);
         if est_tokens(&text) <= max_tokens {
-            return Budgeted { view: v, text, fit: true, omitted: 0 };
+            return Budgeted {
+                view: v,
+                text,
+                fit: true,
+                omitted: 0,
+            };
         }
     }
 
@@ -1359,18 +1395,33 @@ fn render_budgeted(g: &Graph, start: View, format: Format, max_tokens: usize) ->
         } else {
             if mid == 1 {
                 // Even one module is over budget — emit it and say so.
-                return Budgeted { view: View::Skeleton, text, fit: false, omitted };
+                return Budgeted {
+                    view: View::Skeleton,
+                    text,
+                    fit: false,
+                    omitted,
+                };
             }
             hi = mid - 1;
         }
     }
 
     match best {
-        Some((_, text, omitted)) => Budgeted { view: View::Skeleton, text, fit: true, omitted },
+        Some((_, text, omitted)) => Budgeted {
+            view: View::Skeleton,
+            text,
+            fit: true,
+            omitted,
+        },
         // Unreachable in practice: mid == 1 returns above.
         None => {
             let (text, omitted) = render_pruned(&skel, format, max_tokens, 1, total);
-            Budgeted { view: View::Skeleton, text, fit: false, omitted }
+            Budgeted {
+                view: View::Skeleton,
+                text,
+                fit: false,
+                omitted,
+            }
         }
     }
 }
@@ -1454,9 +1505,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         for i in 0..40 {
             let body: String = (0..20)
-                .map(|j| {
-                    format!("class ClassWithADeliberatelyLongName_{i}_{j}:\n    pass\n\n")
-                })
+                .map(|j| format!("class ClassWithADeliberatelyLongName_{i}_{j}:\n    pass\n\n"))
                 .collect();
             fs::write(dir.join(format!("mod_{i}.py")), body).unwrap();
         }
@@ -1472,7 +1521,10 @@ mod tests {
         let b = render_budgeted(&g, View::Full, Format::Md, budget);
         let _ = fs::remove_dir_all(&dir);
 
-        assert!(b.fit, "a 2000-token budget should be satisfiable by pruning");
+        assert!(
+            b.fit,
+            "a 2000-token budget should be satisfiable by pruning"
+        );
         assert!(
             b.text.len() / 4 <= budget,
             "emitted ~{} tok exceeds the {budget} tok budget",
@@ -1523,7 +1575,10 @@ mod tests {
         let b = render_budgeted(&g, View::Full, Format::Md, 10_000_000);
         let _ = fs::remove_dir_all(&dir);
         assert!(b.fit);
-        assert_eq!(b.omitted, 0, "nothing should be dropped when everything fits");
+        assert_eq!(
+            b.omitted, 0,
+            "nothing should be dropped when everything fits"
+        );
         assert!(!b.text.contains("modules omitted"));
     }
 
@@ -1535,7 +1590,10 @@ mod tests {
         let b = render_budgeted(&g, View::Full, Format::Md, 1);
         let _ = fs::remove_dir_all(&dir);
         assert!(!b.fit, "an unmeetable budget must report fit = false");
-        assert!(!b.text.is_empty(), "something usable should still be emitted");
+        assert!(
+            !b.text.is_empty(),
+            "something usable should still be emitted"
+        );
     }
 
     #[test]
@@ -1545,7 +1603,10 @@ mod tests {
         let a = render_budgeted(&g, View::Full, Format::Md, 2_000);
         let b = render_budgeted(&g, View::Full, Format::Md, 2_000);
         let _ = fs::remove_dir_all(&dir);
-        assert_eq!(a.text, b.text, "same graph and budget must render identically");
+        assert_eq!(
+            a.text, b.text,
+            "same graph and budget must render identically"
+        );
         assert_eq!(a.omitted, b.omitted);
     }
 
@@ -1562,7 +1623,10 @@ mod tests {
         let small = snippet_for(&g);
         let _ = fs::remove_dir_all(&dir);
 
-        assert!(small.contains("<!-- ctx:begin"), "must be delimited for in-place regen");
+        assert!(
+            small.contains("<!-- ctx:begin"),
+            "must be delimited for in-place regen"
+        );
         assert!(small.contains("<!-- ctx:end -->"));
         assert!(small.contains("1 modules") || small.contains("1 module"));
         assert!(
@@ -1604,7 +1668,10 @@ mod tests {
     #[test]
     fn parse_range_forms() {
         assert_eq!(parse_range("a..b"), ("a".into(), Some("b".into())));
-        assert_eq!(parse_range("main..feature"), ("main".into(), Some("feature".into())));
+        assert_eq!(
+            parse_range("main..feature"),
+            ("main".into(), Some("feature".into()))
+        );
         // Three-dot range tolerated; leading dots on B stripped.
         assert_eq!(parse_range("a...b"), ("a".into(), Some("b".into())));
         // A bare ref or an open-ended `A..` means "vs the working tree".

@@ -253,9 +253,7 @@ impl Module {
         } else {
             &self.resolve_name
         };
-        base.split(self.lang.sep())
-            .map(|s| s.to_string())
-            .collect()
+        base.split(self.lang.sep()).map(|s| s.to_string()).collect()
     }
 
     pub fn item_count(&self) -> usize {

@@ -10,7 +10,9 @@ pub fn extract(src: &str) -> Result<FileFacts> {
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .context("loading rust grammar")?;
-    let tree = parser.parse(src, None).context("tree-sitter parse failed")?;
+    let tree = parser
+        .parse(src, None)
+        .context("tree-sitter parse failed")?;
 
     let mut facts = FileFacts::default();
     let mut items = Vec::new();
@@ -19,19 +21,21 @@ pub fn extract(src: &str) -> Result<FileFacts> {
     Ok(facts)
 }
 
-fn visit(
-    node: Node,
-    src: &str,
-    items: &mut Vec<Item>,
-    facts: &mut FileFacts,
-    module_level: bool,
-) {
+fn visit(node: Node, src: &str, items: &mut Vec<Item>, facts: &mut FileFacts, module_level: bool) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if module_level {
-            if let "function_item" | "function_signature_item" | "struct_item" | "union_item"
-            | "enum_item" | "trait_item" | "mod_item" | "type_item" | "const_item"
-            | "static_item" | "macro_definition" = child.kind()
+            if let "function_item"
+            | "function_signature_item"
+            | "struct_item"
+            | "union_item"
+            | "enum_item"
+            | "trait_item"
+            | "mod_item"
+            | "type_item"
+            | "const_item"
+            | "static_item"
+            | "macro_definition" = child.kind()
             {
                 if let Some(n) = child.child_by_field_name("name") {
                     facts.defined.insert(text(n, src).to_string());
@@ -81,7 +85,14 @@ fn visit(
             }
             "type_item" | "associated_type" | "const_item" | "static_item" => {
                 let sig = clip(collapse(text(child, src)).trim_end_matches(';'));
-                items.push(item(child.kind(), sig, child, src, Vec::new(), def_name(child, src)));
+                items.push(item(
+                    child.kind(),
+                    sig,
+                    child,
+                    src,
+                    Vec::new(),
+                    def_name(child, src),
+                ));
             }
             "macro_definition" => {
                 let name = def_name(child, src);
@@ -155,9 +166,10 @@ fn fn_env(node: Node, src: &str, outer: &TypeEnv) -> TypeEnv {
             if p.kind() != "parameter" {
                 continue;
             }
-            let (Some(pat), Some(ty)) =
-                (p.child_by_field_name("pattern"), p.child_by_field_name("type"))
-            else {
+            let (Some(pat), Some(ty)) = (
+                p.child_by_field_name("pattern"),
+                p.child_by_field_name("type"),
+            ) else {
                 continue;
             };
             let name = text(pat, src).trim_start_matches("mut ").trim().to_string();
@@ -189,21 +201,34 @@ fn bounded_param(p: Node, src: &str) -> Option<(String, String)> {
 /// The first non-lifetime, non-marker trait in a bound list (`: Sampler + Send`).
 fn first_bound(bounds: &str) -> Option<String> {
     const MARKERS: &[&str] = &[
-        "Send", "Sync", "Sized", "Copy", "Clone", "Debug", "Display", "Default", "Eq", "PartialEq",
-        "Ord", "PartialOrd", "Hash", "Unpin", "'static",
+        "Send",
+        "Sync",
+        "Sized",
+        "Copy",
+        "Clone",
+        "Debug",
+        "Display",
+        "Default",
+        "Eq",
+        "PartialEq",
+        "Ord",
+        "PartialOrd",
+        "Hash",
+        "Unpin",
+        "'static",
     ];
     bounds
         .trim_start_matches(':')
         .split('+')
         .map(|b| strip_generics(b.trim()))
         .map(|b| last_seg(&b))
-        .find(|b| {
-            !b.is_empty() && !b.starts_with('\'') && !MARKERS.contains(&b.as_str())
-        })
+        .find(|b| !b.is_empty() && !b.starts_with('\'') && !MARKERS.contains(&b.as_str()))
 }
 
 /// Smart-pointer wrappers that are transparent for method dispatch.
-const TRANSPARENT: &[&str] = &["Box", "Arc", "Rc", "RefCell", "Cell", "Mutex", "RwLock", "Cow"];
+const TRANSPARENT: &[&str] = &[
+    "Box", "Arc", "Rc", "RefCell", "Cell", "Mutex", "RwLock", "Cow",
+];
 
 /// Turn a declared type into the receiver kind it implies, or None when the
 /// type says nothing useful about which method body runs (`Vec<T>`, `Option<T>`,
@@ -227,7 +252,9 @@ fn classify_type(raw: &str, generics: &HashMap<String, String>) -> Option<Receiv
     let base = last_seg(&strip_generics(t));
     if TRANSPARENT.contains(&base.as_str()) {
         // Look through the wrapper: Box<dyn Sampler> dispatches like `dyn Sampler`.
-        let inner = t.find('<').map(|i| &t[i + 1..t.rfind('>').unwrap_or(t.len())]);
+        let inner = t
+            .find('<')
+            .map(|i| &t[i + 1..t.rfind('>').unwrap_or(t.len())]);
         return inner.and_then(|i| classify_type(i, generics));
     }
     if let Some(bound) = generics.get(&base) {
@@ -538,7 +565,10 @@ fn receiver_of(v: Node, src: &str, env: &TypeEnv) -> Receiver {
         }
         // `self.field.method()` — resolved later against the enclosing type's
         // declared field types.
-        "field_expression" => match (v.child_by_field_name("value"), v.child_by_field_name("field")) {
+        "field_expression" => match (
+            v.child_by_field_name("value"),
+            v.child_by_field_name("field"),
+        ) {
             (Some(o), Some(fld)) if text(o, src) == "self" => {
                 Receiver::SelfField(text(fld, src).to_string())
             }
@@ -550,7 +580,9 @@ fn receiver_of(v: Node, src: &str, env: &TypeEnv) -> Receiver {
             Some(f) if f.kind() == "scoped_identifier" => {
                 let path = strip_turbofish(&collapse(text(f, src)));
                 match path.rsplit_once("::") {
-                    Some((ty, _)) => classify_type(ty, &HashMap::new()).unwrap_or(Receiver::Unknown),
+                    Some((ty, _)) => {
+                        classify_type(ty, &HashMap::new()).unwrap_or(Receiver::Unknown)
+                    }
                     None => Receiver::Unknown,
                 }
             }
@@ -883,7 +915,10 @@ mod tests {
     #[test]
     fn nested_brace_use_expands_without_inventing_paths() {
         let paths: Vec<String> = expand_use_tree("crate::{a::{alpha, gamma}, b::beta}");
-        assert_eq!(paths, ["crate::a::alpha", "crate::a::gamma", "crate::b::beta"]);
+        assert_eq!(
+            paths,
+            ["crate::a::alpha", "crate::a::gamma", "crate::b::beta"]
+        );
     }
 
     #[test]
@@ -904,8 +939,14 @@ mod tests {
             .map(|i| format!("pub field_with_a_long_name_{i}: SomeLongTypeName<Inner>"))
             .collect();
         let s = clip_structure("pub struct Big", &members);
-        assert!(s.contains("more }"), "a clipped member list must say what is missing: {s}");
-        assert!(!s.ends_with('…'), "a bare ellipsis reads as a complete list");
+        assert!(
+            s.contains("more }"),
+            "a clipped member list must say what is missing: {s}"
+        );
+        assert!(
+            !s.ends_with('…'),
+            "a bare ellipsis reads as a complete list"
+        );
     }
 
     fn items(src: &str) -> Vec<Item> {

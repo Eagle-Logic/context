@@ -241,10 +241,12 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
         "modules" => (render::module_list(&g), false),
         "subtree" => match sarg("module") {
             // Same code path as the CLI, so the two cannot drift again.
-            Some(m) => match crate::subtree_text(&g, m, view_arg(View::Full), crate::Format::Md, budget) {
-                Ok(t) => (t, false),
-                Err(e) => (format!("{e}"), true),
-            },
+            Some(m) => {
+                match crate::subtree_text(&g, m, view_arg(View::Full), crate::Format::Md, budget) {
+                    Ok(t) => (t, false),
+                    Err(e) => (format!("{e}"), true),
+                }
+            }
             None => ("missing required argument 'module'".into(), true),
         },
         "def" => match sarg("name") {
@@ -256,7 +258,10 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
             None => ("missing required argument 'name'".into(), true),
         },
         "context" => match sarg("name") {
-            Some(n) => (query::context(&g, n, uarg("max_tokens", 4000), false), false),
+            Some(n) => (
+                query::context(&g, n, uarg("max_tokens", 4000), false),
+                false,
+            ),
             None => ("missing required argument 'name'".into(), true),
         },
         "core" => (query::core(&g, uarg("limit", 30), None, false), false),
@@ -302,8 +307,13 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        for expected in ["map", "def", "callers", "context", "core", "doctor", "trace", "path"] {
-            assert!(names.contains(&expected), "missing tool {expected}: {names:?}");
+        for expected in [
+            "map", "def", "callers", "context", "core", "doctor", "trace", "path",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing tool {expected}: {names:?}"
+            );
         }
     }
 

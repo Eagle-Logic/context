@@ -151,7 +151,10 @@ pub fn add_worktree(repo: &Path, at: &Path, refname: &str) -> Result<()> {
 
 /// Remove a worktree created by [`add_worktree`]. Best-effort.
 pub fn remove_worktree(repo: &Path, at: &Path) {
-    let _ = git(repo, &["worktree", "remove", "--force", &at.to_string_lossy()]);
+    let _ = git(
+        repo,
+        &["worktree", "remove", "--force", &at.to_string_lossy()],
+    );
 }
 
 #[cfg(test)]

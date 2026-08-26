@@ -18,7 +18,9 @@ pub fn extract(src: &str, tsx: bool) -> Result<FileFacts> {
     parser
         .set_language(&lang.into())
         .context("loading typescript grammar")?;
-    let tree = parser.parse(src, None).context("tree-sitter parse failed")?;
+    let tree = parser
+        .parse(src, None)
+        .context("tree-sitter parse failed")?;
 
     let mut facts = FileFacts::default();
     let mut items = Vec::new();
@@ -82,9 +84,7 @@ fn visit(node: Node, src: &str, items: &mut Vec<Item>, facts: &mut FileFacts) {
         match child.kind() {
             "import_statement" => parse_import(child, src, facts),
             "export_statement" => parse_export(child, src, items, facts),
-            k if DECL_KINDS.contains(&k) => {
-                definition(child, child, src, items, facts, false)
-            }
+            k if DECL_KINDS.contains(&k) => definition(child, child, src, items, facts, false),
             "lexical_declaration" | "variable_declaration" => {
                 lexical(child, child, src, items, facts, false)
             }
@@ -160,7 +160,9 @@ fn definition(
             let body = decl.child_by_field_name("body");
             let sig = head(decl, body, src);
             let env = fn_env(decl, src);
-            let calls = body.map(|b| collect_calls(b, src, &env)).unwrap_or_default();
+            let calls = body
+                .map(|b| collect_calls(b, src, &env))
+                .unwrap_or_default();
             ("fn", sig, Vec::new(), calls)
         }
         "class_declaration" | "abstract_class_declaration" => {
@@ -171,7 +173,12 @@ fn definition(
         }
         "interface_declaration" => {
             let body = decl.child_by_field_name("body");
-            ("interface", interface_sig(decl, body, src), Vec::new(), Vec::new())
+            (
+                "interface",
+                interface_sig(decl, body, src),
+                Vec::new(),
+                Vec::new(),
+            )
         }
         "enum_declaration" => {
             let body = decl.child_by_field_name("body");
@@ -211,7 +218,10 @@ fn heritage(decl: Node, src: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut c = decl.walk();
     for ch in decl.named_children(&mut c) {
-        if !matches!(ch.kind(), "class_heritage" | "extends_type_clause" | "implements_clause" | "extends_clause") {
+        if !matches!(
+            ch.kind(),
+            "class_heritage" | "extends_type_clause" | "implements_clause" | "extends_clause"
+        ) {
             continue;
         }
         let mut h = ch.walk();
@@ -243,10 +253,8 @@ fn property_types(body: Node, src: &str) -> BTreeMap<String, String> {
         if !matches!(m.kind(), "public_field_definition" | "property_signature") {
             continue;
         }
-        let (Some(n), Some(t)) = (
-            m.child_by_field_name("name"),
-            m.child_by_field_name("type"),
-        ) else {
+        let (Some(n), Some(t)) = (m.child_by_field_name("name"), m.child_by_field_name("type"))
+        else {
             continue;
         };
         if let Some(ty) = type_name(&collapse(text(t, src))) {
@@ -262,7 +270,11 @@ fn type_name(raw: &str) -> Option<String> {
     let t = raw.trim().trim_start_matches(':').trim();
     let t = t.strip_prefix("readonly ").unwrap_or(t).trim();
     // `Promise<Foo>` / `Array<Foo>` wrap a value; the receiver is the wrapper.
-    let base = t.split(['<', '|', '&', '[', '(']).next().unwrap_or(t).trim();
+    let base = t
+        .split(['<', '|', '&', '[', '('])
+        .next()
+        .unwrap_or(t)
+        .trim();
     let base = base.rsplit('.').next().unwrap_or(base).trim();
     if base.is_empty() || !base.chars().next().is_some_and(char::is_uppercase) {
         return None;
@@ -319,7 +331,12 @@ fn lexical(
             continue;
         };
         let value = decl.child_by_field_name("value");
-        let is_fn = value.is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression" | "function"));
+        let is_fn = value.is_some_and(|v| {
+            matches!(
+                v.kind(),
+                "arrow_function" | "function_expression" | "function"
+            )
+        });
 
         // Skip local non-callable consts — low architectural signal.
         if !exported && !is_fn {
@@ -335,12 +352,18 @@ fn lexical(
                 .map(|p| collapse(text(p, src)))
                 .unwrap_or_else(|| "()".to_string());
             let env = fn_env(v, src);
-            let calls = body.map(|b| collect_calls(b, src, &env)).unwrap_or_default();
+            let calls = body
+                .map(|b| collect_calls(b, src, &env))
+                .unwrap_or_default();
             ("fn", format!("const {name} = {params} =>"), calls)
         } else {
             ("const", format!("const {name}"), Vec::new())
         };
-        let sig = if exported { format!("export {sig}") } else { sig };
+        let sig = if exported {
+            format!("export {sig}")
+        } else {
+            sig
+        };
         let mut it = mk(kind, clip(&sig), outer, src, Vec::new(), Some(name));
         it.raw_calls = calls;
         if is_fn {
@@ -388,7 +411,11 @@ fn interface_sig(decl: Node, body: Option<Node>, src: &str) -> String {
     let fields: Vec<String> = body
         .named_children(&mut cursor)
         .filter(|c| c.kind() == "property_signature")
-        .map(|c| collapse(text(c, src)).trim_end_matches([';', ',']).to_string())
+        .map(|c| {
+            collapse(text(c, src))
+                .trim_end_matches([';', ','])
+                .to_string()
+        })
         .collect();
     if fields.is_empty() {
         head
@@ -441,19 +468,26 @@ fn collect_calls(body: Node, src: &str, env: &TypeEnv) -> Vec<RawCall> {
     call_nodes.reverse();
     let mut out = Vec::new();
     for n in call_nodes {
-        let Some(f) = n.child_by_field_name("function") else { continue };
+        let Some(f) = n.child_by_field_name("function") else {
+            continue;
+        };
         match f.kind() {
             "identifier" => out.push(RawCall {
                 path: text(f, src).to_string(),
                 recv: Receiver::Free,
             }),
             "member_expression" => {
-                let Some(prop) = f.child_by_field_name("property") else { continue };
+                let Some(prop) = f.child_by_field_name("property") else {
+                    continue;
+                };
                 let recv = match f.child_by_field_name("object") {
                     Some(o) if o.kind() == "this" => Receiver::SelfType,
                     // `this.field.m()`
                     Some(o) if o.kind() == "member_expression" => {
-                        match (o.child_by_field_name("object"), o.child_by_field_name("property")) {
+                        match (
+                            o.child_by_field_name("object"),
+                            o.child_by_field_name("property"),
+                        ) {
                             (Some(inner), Some(fld)) if inner.kind() == "this" => {
                                 Receiver::SelfField(text(fld, src).to_string())
                             }
@@ -585,9 +619,9 @@ fn doc_comment(node: Node, src: &str) -> Option<String> {
         } else if let Some(rest) = t.strip_prefix("//") {
             // Strip decorative banners (`// ----- Foo`, `//////`); a line that
             // is only separators contributes nothing.
-            let cleaned = rest
-                .trim()
-                .trim_matches(|c: char| matches!(c, '-' | '=' | '*' | '#' | '/') || c.is_whitespace());
+            let cleaned = rest.trim().trim_matches(|c: char| {
+                matches!(c, '-' | '=' | '*' | '#' | '/') || c.is_whitespace()
+            });
             if !cleaned.is_empty() {
                 lines.push(cleaned.to_string());
             }
@@ -597,7 +631,10 @@ fn doc_comment(node: Node, src: &str) -> Option<String> {
         sib = s.prev_sibling();
     }
     lines.reverse();
-    lines.into_iter().find(|l| !l.is_empty()).map(|l| clip_doc(&l))
+    lines
+        .into_iter()
+        .find(|l| !l.is_empty())
+        .map(|l| clip_doc(&l))
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -730,7 +767,11 @@ mod tests {
         let it = items("/** Does a thing. */\nexport function foo(a: number): void {}\n");
         assert_eq!(it.len(), 1);
         assert_eq!(it[0].kind, "fn");
-        assert!(it[0].signature.starts_with("export function foo"), "{}", it[0].signature);
+        assert!(
+            it[0].signature.starts_with("export function foo"),
+            "{}",
+            it[0].signature
+        );
         assert_eq!(it[0].doc.as_deref(), Some("Does a thing."));
     }
 
@@ -745,7 +786,11 @@ mod tests {
     fn interface_inlines_fields() {
         let it = items("export interface Props { name: string; count: number }\n");
         assert_eq!(it[0].kind, "interface");
-        assert!(it[0].signature.contains("name: string"), "{}", it[0].signature);
+        assert!(
+            it[0].signature.contains("name: string"),
+            "{}",
+            it[0].signature
+        );
     }
 
     #[test]

@@ -252,7 +252,9 @@ fn frontmatter_lines(src: &str) -> usize {
             || l.starts_with(' ')
             || l.starts_with('\t')
             || t.split_once(':').is_some_and(|(k, _)| {
-                !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || "_-.\"'".contains(c))
+                !k.is_empty()
+                    && k.chars()
+                        .all(|c| c.is_alphanumeric() || "_-.\"'".contains(c))
             });
         if !yamlish {
             return 0;
@@ -298,7 +300,8 @@ fn is_structural(t: &str) -> bool {
         || t.starts_with("- ")
         || t.starts_with("* ")
         || t.starts_with("<!--")
-        || t.chars().all(|c| c == '-' || c == '=' || c == '*' || c == ' ')
+        || t.chars()
+            .all(|c| c == '-' || c == '=' || c == '*' || c == ' ')
 }
 
 /// Extract link targets from a line: inline `[t](url)`, images `![t](url)`,
@@ -342,7 +345,11 @@ fn extract_links(line: &str, defs: &HashMap<String, String>, out: &mut Vec<RawCa
 
 /// Resolve a `[...]`-opened link, trying inline, then reference, then shortcut
 /// forms. Returns the target URL and the index just past the whole construct.
-fn bracket_link(b: &[char], open: usize, defs: &HashMap<String, String>) -> Option<(String, usize)> {
+fn bracket_link(
+    b: &[char],
+    open: usize,
+    defs: &HashMap<String, String>,
+) -> Option<(String, usize)> {
     let rb = find_char(b, open + 1, ']')?;
     // Inline: `[text](url "title")`.
     if b.get(rb + 1) == Some(&'(') {
@@ -456,12 +463,16 @@ mod tests {
 
     #[test]
     fn links_become_edges_code_fences_ignored() {
-        let src = "# T\n\nSee [other](./other.md#sec) and [[Wiki]].\n\n```\n[not](a-link.md)\n```\n";
+        let src =
+            "# T\n\nSee [other](./other.md#sec) and [[Wiki]].\n\n```\n[not](a-link.md)\n```\n";
         let calls = &extract(src).unwrap().items[0].raw_calls;
         let paths: Vec<&str> = calls.iter().map(|c| c.path.as_str()).collect();
         assert!(paths.contains(&"./other.md#sec"), "{paths:?}");
         assert!(paths.contains(&"[[Wiki]]"), "{paths:?}");
-        assert!(!paths.iter().any(|p| p.contains("a-link")), "fenced link leaked: {paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.contains("a-link")),
+            "fenced link leaked: {paths:?}"
+        );
     }
 
     #[test]
@@ -489,9 +500,15 @@ See the [design doc][design] and the [guide][] and a [shortcut].
             .iter()
             .map(|c| c.path.clone())
             .collect();
-        assert!(paths.contains(&"./design.md#goals".to_string()), "{paths:?}");
+        assert!(
+            paths.contains(&"./design.md#goals".to_string()),
+            "{paths:?}"
+        );
         assert!(paths.contains(&"./guide.md".to_string()), "{paths:?}");
-        assert!(paths.contains(&"https://example.com".to_string()), "{paths:?}");
+        assert!(
+            paths.contains(&"https://example.com".to_string()),
+            "{paths:?}"
+        );
         // The definition lines themselves must not leak in as prose or links.
         assert_eq!(paths.len(), 3, "{paths:?}");
     }
@@ -516,7 +533,11 @@ See the [design doc][design] and the [guide][] and a [shortcut].
         let src = "---\ntitle: My Page\ntags: [a, b]\n---\n\n# Real Heading\n\n## Sub\n";
         let items = extract(src).unwrap().items;
         let sigs: Vec<&str> = items.iter().map(|i| i.signature.as_str()).collect();
-        assert_eq!(sigs, ["Real Heading"], "frontmatter must not become a heading");
+        assert_eq!(
+            sigs,
+            ["Real Heading"],
+            "frontmatter must not become a heading"
+        );
         assert_eq!(items[0].signature, "Real Heading");
         // Line numbers must still refer to the original file, not a stripped copy.
         assert_eq!(items[0].line, 6);

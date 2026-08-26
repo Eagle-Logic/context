@@ -102,7 +102,11 @@ pub type AliasMap = BTreeMap<String, Vec<String>>;
 
 impl Member {
     fn key(&self) -> Key {
-        (self.container.as_deref().map(canon), self.name.clone(), self.role)
+        (
+            self.container.as_deref().map(canon),
+            self.name.clone(),
+            self.role,
+        )
     }
     /// Container-agnostic key, for detecting moves and additions.
     fn nr(&self) -> (String, Role) {
@@ -257,7 +261,8 @@ pub fn report(
     let target: Vec<&Member> = target.iter().map(|m| &m.0).collect();
 
     // Explicit `--alias Old=New` wins; anything left is inferred from overlap.
-    let mut containers: BTreeMap<String, String> = infer_container_aliases(&source, &target, aliases);
+    let mut containers: BTreeMap<String, String> =
+        infer_container_aliases(&source, &target, aliases);
     let inferred: BTreeMap<String, String> = containers.clone();
     for (k, v) in container_aliases {
         containers.insert(canon(k), canon(v));
@@ -565,8 +570,7 @@ mod tests {
 
     fn members(rel: &str, content: &str) -> Vec<MemberView> {
         let id = N.fetch_add(1, Ordering::SeqCst);
-        let dir =
-            std::env::temp_dir().join(format!("ctx_parity_{}_{}", std::process::id(), id));
+        let dir = std::env::temp_dir().join(format!("ctx_parity_{}_{}", std::process::id(), id));
         let _ = fs::remove_dir_all(&dir);
         let p = dir.join(rel);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -584,8 +588,14 @@ mod tests {
         let py = members("a.py", "class TriStateRouter:\n    def route(self, p):\n        pass\n    def zone(self, s):\n        pass\n    def embed(self, t):\n        pass\n");
         let rs = members("b.rs", "pub struct IntentGate;\nimpl IntentGate {\n    pub fn route(&self, p: &str) {}\n    pub fn zone(&self, s: f32) {}\n    pub fn embed(&self, t: &[String]) {}\n}\n");
         let (out, missing) = report(&py, &rs, &AliasMap::new(), &BTreeMap::new(), false);
-        assert_eq!(missing, 0, "a pure container rename must not read as missing: {out}");
-        assert!(out.contains("Inferred container renames"), "must disclose: {out}");
+        assert_eq!(
+            missing, 0,
+            "a pure container rename must not read as missing: {out}"
+        );
+        assert!(
+            out.contains("Inferred container renames"),
+            "must disclose: {out}"
+        );
     }
 
     #[test]
@@ -602,7 +612,10 @@ mod tests {
     fn unrelated_containers_are_not_paired() {
         // Guard against the inference inventing a rename: no shared members means
         // no pairing, and the report must still say they are missing.
-        let py = members("a.py", "class Alpha:\n    def one(self):\n        pass\n    def two(self):\n        pass\n");
+        let py = members(
+            "a.py",
+            "class Alpha:\n    def one(self):\n        pass\n    def two(self):\n        pass\n",
+        );
         let rs = members("b.rs", "pub struct Beta;\nimpl Beta {\n    pub fn nine(&self) {}\n    pub fn ten(&self) {}\n}\n");
         let (out, missing) = report(&py, &rs, &AliasMap::new(), &BTreeMap::new(), false);
         assert!(missing > 0, "unrelated types must not be paired: {out}");
@@ -644,9 +657,15 @@ mod tests {
         );
         let (out, missing) = report(&py, &rs, &AliasMap::new(), &BTreeMap::new(), false);
         assert_eq!(missing, 1, "{out}"); // `gone` missing
-        assert!(out.contains("Missing in port") && out.contains("gone"), "{out}");
+        assert!(
+            out.contains("Missing in port") && out.contains("gone"),
+            "{out}"
+        );
         assert!(out.contains("Arity drift") && out.contains("run"), "{out}"); // 2 → 1
-        assert!(out.contains("Added in port") && out.contains("extra"), "{out}");
+        assert!(
+            out.contains("Added in port") && out.contains("extra"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -662,12 +681,18 @@ mod tests {
             "pub fn normalize(x: i32) -> i32 { x }\npub fn run(x: i32) -> i32 { x }\n",
         );
         let (out, _) = report(&py, &rs, &AliasMap::new(), &BTreeMap::new(), false);
-        assert!(out.contains("Call drift") && out.contains("normalize"), "{out}");
+        assert!(
+            out.contains("Call drift") && out.contains("normalize"),
+            "{out}"
+        );
     }
 
     #[test]
     fn py_rust_alias_maps_init_to_new() {
-        let py = members("a.py", "class Gate:\n    def __init__(self, cfg):\n        pass\n");
+        let py = members(
+            "a.py",
+            "class Gate:\n    def __init__(self, cfg):\n        pass\n",
+        );
         let rs = members(
             "a.rs",
             "pub struct Gate;\nimpl Gate {\n    pub fn new(cfg: Cfg) -> Self { Gate }\n}\n",
@@ -680,6 +705,10 @@ mod tests {
         let aliased = report(&py, &rs, &py_rust_aliases(), &BTreeMap::new(), false);
         assert_eq!(aliased.1, 0, "{}", aliased.0);
         assert!(aliased.0.contains("Aligned via alias"), "{}", aliased.0);
-        assert!(!aliased.0.contains("## Added"), "new must not read as added:\n{}", aliased.0);
+        assert!(
+            !aliased.0.contains("## Added"),
+            "new must not read as added:\n{}",
+            aliased.0
+        );
     }
 }

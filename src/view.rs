@@ -76,7 +76,10 @@ pub struct PruneStats {
 pub fn prune_to_central(g: &mut Graph, keep: usize, max_prose_share: f64) -> PruneStats {
     let n = g.modules.len();
     if keep >= n {
-        return PruneStats { omitted: 0, prose_capped: 0 };
+        return PruneStats {
+            omitted: 0,
+            prose_capped: 0,
+        };
     }
     let share = if (0.0..1.0).contains(&max_prose_share) {
         max_prose_share
@@ -137,7 +140,10 @@ pub fn prune_to_central(g: &mut Graph, keep: usize, max_prose_share: f64) -> Pru
         idx += 1;
         k
     });
-    PruneStats { omitted: n - g.modules.len(), prose_capped }
+    PruneStats {
+        omitted: n - g.modules.len(),
+        prose_capped,
+    }
 }
 
 pub fn apply(g: &mut Graph, view: View) {
