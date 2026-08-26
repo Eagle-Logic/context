@@ -625,8 +625,24 @@ claude mcp add ctx -- ctx mcp
 ```
 
 Each tool takes a `path` argument (default `.`); `def`/`callers`/`context` also
-take `name`, and `subtree` takes `module`. The server builds the graph per call
-(~100 ms), so results are always current.
+take `name`, and `subtree` takes `module`.
+
+The graph is reused across calls while the source it was built from is
+unchanged. Staleness is checked by re-walking for mtime and length — a stat per
+file, no reads — so a hit costs a walk instead of a parse, and any edit,
+addition or deletion rebuilds. Answers are still always current; the difference
+is that an unchanged tree is not re-parsed five times in a row.
+
+It matters most where the parse is expensive. A five-call session on a
+14,073-file repo, measured with `--metrics`:
+
+| | first call | later calls | session |
+|---|---|---|---|
+| rebuilding every call | 938 ms | ~685 ms each | **3,676 ms** |
+| reusing the graph | 680 ms | 5–10 ms each | **708 ms** |
+
+The cache is bounded and lives only for the life of the process — the CLI is
+one-shot and unaffected.
 
 **Two limits apply over MCP that don't apply on the CLI**, because an MCP result
 lands straight in a model's context with no shell to pipe it through and no

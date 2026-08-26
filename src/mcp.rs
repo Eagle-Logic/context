@@ -4,14 +4,80 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
+use crate::model::Graph;
 use crate::view::View;
 use crate::{extract, query, render, view};
+
+/// Graphs already built in this process, newest first.
+///
+/// Every tool call rebuilds the graph from source, which is what keeps answers
+/// current and is cheap on a small repo. On a large one it dominates: measured
+/// on a 14,073-file tree, a five-call session spent 3,676 ms, and a `def` for a
+/// name that does not exist — a no-op query — still cost 680 ms. Essentially
+/// all of it was re-parsing an unchanged tree.
+///
+/// So the graph is kept and reused while the source it was built from is
+/// unchanged, verified by re-walking for mtime and length. That check is a stat
+/// per file with no reads, so a hit costs a walk instead of a parse.
+///
+/// Bounded, because a graph for a large repo is not small and an MCP server is
+/// long-lived. Sessions overwhelmingly query one root, so a handful of entries
+/// covers the real access pattern; beyond that the oldest is dropped.
+const GRAPH_CACHE_ENTRIES: usize = 4;
+
+struct CachedGraph {
+    root: PathBuf,
+    fingerprint: u64,
+    graph: Arc<Graph>,
+}
+
+static GRAPH_CACHE: OnceLock<Mutex<Vec<CachedGraph>>> = OnceLock::new();
+
+/// Build the graph for `root`, reusing the cached one if the tree is unchanged.
+///
+/// Correctness rule: a hit requires the fingerprint to match, and the
+/// fingerprint covers exactly the file set `build_graph` parses. Returning a
+/// stale graph would make ctx quietly wrong about current source, which is
+/// worse than being slow.
+fn graph_for(root: &Path) -> Result<Arc<Graph>> {
+    let fingerprint = extract::source_fingerprint(root);
+    let cache = GRAPH_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+
+    if let Ok(mut c) = cache.lock() {
+        if let Some(i) = c
+            .iter()
+            .position(|e| e.root == root && e.fingerprint == fingerprint)
+        {
+            let hit = c.remove(i);
+            let g = Arc::clone(&hit.graph);
+            c.insert(0, hit);
+            return Ok(g);
+        }
+    }
+
+    let g = Arc::new(extract::build_graph(root)?);
+    if let Ok(mut c) = cache.lock() {
+        // Drop any stale entry for this root before inserting the fresh one,
+        // so an edited tree does not keep a dead graph alive in the cache.
+        c.retain(|e| e.root != root);
+        c.insert(
+            0,
+            CachedGraph {
+                root: root.to_path_buf(),
+                fingerprint,
+                graph: Arc::clone(&g),
+            },
+        );
+        c.truncate(GRAPH_CACHE_ENTRIES);
+    }
+    Ok(g)
+}
 
 /// Opt-in per-call instrumentation: what each tool actually cost.
 ///
@@ -365,10 +431,11 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
         Err(msg) => return (msg, true),
     };
     let path = root_path.as_path();
-    let g = match extract::build_graph(path) {
+    let g = match graph_for(path) {
         Ok(g) => g,
         Err(e) => return (format!("error building graph for {requested}: {e}"), true),
     };
+    let g = &*g;
     let sarg = |k: &str| args.get(k).and_then(Value::as_str);
     let uarg = |k: &str, d: u64| args.get(k).and_then(Value::as_u64).unwrap_or(d) as usize;
     let barg = |k: &str| args.get(k).and_then(Value::as_bool).unwrap_or(false);
@@ -401,7 +468,7 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
             let v = view_arg(View::Skeleton);
             match budget {
                 Some(b) => {
-                    let r = crate::render_budgeted(&g, v, crate::Format::Md, b);
+                    let r = crate::render_budgeted(g, v, crate::Format::Md, b);
                     // The CLI reports the view chosen and whether it fit on
                     // stderr; over MCP there is no stderr, so it goes in band or
                     // it is lost.
@@ -421,17 +488,20 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
                     (text, false)
                 }
                 None => {
-                    let mut g = g;
+                    // `view::apply` mutates, and the graph is shared with the
+                    // cache, so this branch works on a copy. Only reachable
+                    // when a caller explicitly opts out of the budget.
+                    let mut g = g.clone();
                     view::apply(&mut g, v);
                     (render::markdown(&g), false)
                 }
             }
         }
-        "modules" => (clamp(render::module_list(&g), budget, "ctx modules"), false),
+        "modules" => (clamp(render::module_list(g), budget, "ctx modules"), false),
         "subtree" => match sarg("module") {
             // Same code path as the CLI, so the two cannot drift again.
             Some(m) => {
-                match crate::subtree_text(&g, m, view_arg(View::Full), crate::Format::Md, budget) {
+                match crate::subtree_text(g, m, view_arg(View::Full), crate::Format::Md, budget) {
                     Ok(t) => (t, false),
                     Err(e) => (format!("{e}"), true),
                 }
@@ -439,40 +509,37 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
             None => ("missing required argument 'module'".into(), true),
         },
         "def" => match sarg("name") {
-            Some(n) => (query::def(&g, n, false), false),
+            Some(n) => (query::def(g, n, false), false),
             None => ("missing required argument 'name'".into(), true),
         },
         "callers" => match sarg("name") {
             Some(n) => (
-                clamp(query::callers(&g, n, false), budget, "ctx callers"),
+                clamp(query::callers(g, n, false), budget, "ctx callers"),
                 false,
             ),
             None => ("missing required argument 'name'".into(), true),
         },
         "context" => match sarg("name") {
-            Some(n) => (
-                query::context(&g, n, uarg("max_tokens", 4000), false),
-                false,
-            ),
+            Some(n) => (query::context(g, n, uarg("max_tokens", 4000), false), false),
             None => ("missing required argument 'name'".into(), true),
         },
-        "core" => (query::core(&g, uarg("limit", 30), None, false), false),
+        "core" => (query::core(g, uarg("limit", 30), None, false), false),
         "trace" => match sarg("name") {
             Some(n) => (
-                query::trace(&g, n, uarg("depth", 3), barg("reverse"), false),
+                query::trace(g, n, uarg("depth", 3), barg("reverse"), false),
                 false,
             ),
             None => ("missing required argument 'name'".into(), true),
         },
         "path" => match (sarg("from"), sarg("to")) {
-            (Some(f), Some(t)) => (query::path(&g, f, t, false), false),
+            (Some(f), Some(t)) => (query::path(g, f, t, false), false),
             _ => ("missing required argument 'from' or 'to'".into(), true),
         },
         "doctor" => {
             let unsupported = extract::unsupported_census(path);
             (
                 clamp(
-                    query::coverage_report(&g, &unsupported, barg("explain"), false),
+                    query::coverage_report(g, &unsupported, barg("explain"), false),
                     budget,
                     "ctx doctor",
                 ),
@@ -650,5 +717,75 @@ mod tests {
         let cut = "some rows\n[ctx] TRUNCATED at 25000 tokens: 900 more line(s) withheld";
         let l = metric_line(1, "modules", &json!({}), cut, false, 5);
         assert_eq!(l["truncated"], true);
+    }
+
+    #[test]
+    fn an_unchanged_tree_is_served_from_cache() {
+        let dir = std::env::temp_dir().join(format!("ctx_cache_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let dir = dir.canonicalize().unwrap();
+
+        let first = graph_for(&dir).unwrap();
+        let second = graph_for(&dir).unwrap();
+        // Same allocation, not merely an equal graph: proves no rebuild.
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged tree must be served from cache, not rebuilt"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_edited_tree_is_rebuilt_not_served_stale() {
+        let dir = std::env::temp_dir().join(format!("ctx_cache_edit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let dir = dir.canonicalize().unwrap();
+
+        let first = graph_for(&dir).unwrap();
+        let before = first.modules[0].items.len();
+
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        let second = graph_for(&dir).unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "an edited tree must not be served from cache"
+        );
+        assert!(
+            second.modules[0].items.len() > before,
+            "the rebuilt graph must reflect the edit"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_cache_is_bounded() {
+        // A long-lived server must not accumulate graphs for every path it is
+        // ever asked about.
+        let base = std::env::temp_dir().join(format!("ctx_cache_bound_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut dirs = Vec::new();
+        for i in 0..(GRAPH_CACHE_ENTRIES + 3) {
+            let d = base.join(format!("r{i}/src"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("a.rs"), format!("fn f{i}() {{}}\n")).unwrap();
+            dirs.push(base.join(format!("r{i}")).canonicalize().unwrap());
+        }
+        for d in &dirs {
+            graph_for(d).unwrap();
+        }
+        let len = GRAPH_CACHE.get().unwrap().lock().unwrap().len();
+        assert!(
+            len <= GRAPH_CACHE_ENTRIES,
+            "cache grew to {len}, cap is {GRAPH_CACHE_ENTRIES}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
