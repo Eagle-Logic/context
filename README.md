@@ -139,7 +139,9 @@ If you need type-perfect resolution inside one language, use an LSP. If you
 want the same graph across a polyglot repo with nothing to install and answers
 that state their own confidence, that's this.
 
-And `ctx` does ship the boot map too (`ctx map`) — it's just not the headline.
+`ctx` does ship the boot map too (`ctx map`), so you can have it if you want it.
+But we'll say plainly what dogfooding taught us: it's the least useful thing
+here. [More on why](#maps-when-you-want-them).
 
 ## Install
 
@@ -308,6 +310,24 @@ of the surface.
 
 ## Maps, when you want them
 
+**In our own use, `map` is the least useful command here — including with
+`--max-tokens`.** It ships because it's occasionally the right tool, not because
+it's the point, and it's listed last for a reason.
+
+The problem isn't the output; it's the shape of the transaction. A map is
+breadth paid for up front, before you know which part you'll need, and it's
+stale the moment you edit. In practice an agent spends that budget once and then
+still runs `ctx context` on the one symbol it actually touches — which would have
+answered the question on its own, current at the moment it was asked. Budget
+fitting bounds the cost but doesn't change the economics: a cheaper blob is
+still a blob.
+
+Where it does earn its place: a genuine cold start on an unfamiliar repo, a
+committed `CODEBASE_MAP.md` for humans, or feeding another tool via `--format
+json`. For everything else, reach for `context`, `trace`, `callers`, or
+`subtree` — a scoped answer beats a ranked summary, which is the whole argument
+of this README.
+
 `map` and `subtree` take `--view` to scale detail to informational need — each
 level adds a whole category, so token spend buys precision, not noise:
 
@@ -317,8 +337,9 @@ level adds a whole category, so token spend buys precision, not noise:
 | `interface` | + public signatures, struct fields, enum variants | 301 KB (~75k tok) |
 | `full` (default) | + private items and call edges | 451 KB (~112k tok) |
 
-On a mid-size repo (70 files) skeleton is ~3k tokens — cheap enough for the
-first turn of every session. Rust visibility is `pub`-based; Python uses the
+On a mid-size repo (70 files) skeleton is ~3k tokens, which is cheap enough that
+the cost isn't the objection — the objection is that it's the wrong shape.
+Rust visibility is `pub`-based; Python uses the
 underscore convention (dunders like `__init__` count as public); TypeScript uses
 the `export` keyword (public class methods are interface, `private`/`#` members
 are dropped). Trait methods and trait impls are always interface.
@@ -385,14 +406,15 @@ take `name`, and `subtree` takes `module`. The server builds the graph per call
 
 `ctx snippet` prints a ready-made "Codebase Discovery Tools" block — append it to
 the target repo's `CLAUDE.md` (`ctx snippet >> CLAUDE.md`). It teaches the agent
-a lookup protocol: boot with `ctx map --view skeleton`, pull `ctx subtree
-<module>` before touching a module, follow call edges instead of grepping, and
-only read raw source for implementation bodies.
+a query-first protocol: run `ctx context <name>` when you're about to touch a
+symbol, `ctx callers` before changing a signature, `ctx trace`/`ctx path` to
+follow control flow instead of grepping, and only read raw source for
+implementation bodies. Reaching for a whole-repo map is the exception, not the
+opening move.
 
-To keep a committed `CODEBASE_MAP.md` fresh, regenerate it from a git pre-commit
-hook or a Claude Code hook (`ctx map . -o CODEBASE_MAP.md`) — or skip the file
-entirely and have sessions run `ctx map` at boot; generation is ~100 ms, so
-freshness is free.
+If you do want a committed `CODEBASE_MAP.md` for human readers, regenerate it
+from a git pre-commit hook or a Claude Code hook (`ctx map . -o
+CODEBASE_MAP.md`); generation is ~100 ms, so freshness is free.
 
 ## Markdown as a graph
 

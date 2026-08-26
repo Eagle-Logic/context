@@ -217,19 +217,16 @@ enum Cmd {
 
 const SNIPPET: &str = r#"## Codebase Discovery Tools
 
-`ctx` is a deterministic static-analysis CLI for this repo (Rust, Python, TypeScript, Markdown). Use it to
-orient yourself instead of grepping raw source; only read raw files when you need
-implementation bodies.
+`ctx` is a deterministic static-analysis CLI for this repo (Rust, Python, TypeScript, Markdown).
+Query it for the specific fact you need instead of grepping raw source; only read raw files when
+you need implementation bodies. Prefer the targeted queries below over whole-repo maps — a scoped
+answer is cheaper, current, and states its own completeness.
 
-- `ctx map --view skeleton` — bird's-eye architecture: modules, deps, type names (cheapest)
-- `ctx map --view interface` — + public signatures, struct fields, enum variants (API surface)
-- `ctx map` — + private items and per-function call edges (`→ callee`) for tracing execution
-  (a trailing `~` means the edge was inferred from an opaque receiver rather than an import,
-  path, or declared type — trust it less; a trailing `*` means one branch of a dynamic-dispatch
-  fan-out through a trait object / interface / bounded generic, where exactly one branch runs)
-- `ctx modules` — one line per module with dependency edges
-- `ctx subtree <module> [--view ...]` — one module plus its immediate upstream dependencies
-  and downstream dependents
+Edge markers, which appear anywhere call edges are shown: a trailing `~` means the edge was
+inferred from an opaque receiver rather than an import, path, or declared type — trust it less;
+a trailing `*` means one branch of a dynamic-dispatch fan-out through a trait object / interface
+/ bounded generic, where exactly one branch runs.
+
 - `ctx def <name>` — where a symbol is defined: module, kind, line, and signature (jump-to-def
   without knowing the module; accepts bare `Foo` or qualified `Type::method`)
 - `ctx callers <name>` — every function that calls the given function/method (resolved reverse
@@ -257,16 +254,25 @@ implementation bodies.
   sites that could be internal at all — std and third-party calls are excluded because no
   internal edge could exist for them), plus the exact callee names ctx could not pin. Run once
   to calibrate; add `--explain` for the full per-name census
+- `ctx subtree <module> [--view ...]` — one module plus its immediate upstream dependencies
+  and downstream dependents (broader orientation, still scoped)
+- `ctx modules` — one line per module with dependency edges
+- `ctx map [--view skeleton|interface|full] [--max-tokens N]` — the whole-repo map. Least
+  useful command here: it is breadth paid for before you know what you need, and stale as
+  soon as you edit. Use it for a genuine cold start on an unfamiliar repo or to feed another
+  tool with `--format json`, not as a routine opening move
 - add `--format json` to any of the above for machine-readable output
 
-Protocol: before modifying or analyzing code, run `ctx map --view skeleton` to load the
-topology. When you're about to work on a specific symbol, run `ctx context <name>` — it bundles
-the definition, signature types, callees, and callers in one call, so you rarely need to open the
-file until you're editing its body. For broader orientation use `ctx subtree <module>`; before
-changing a signature run `ctx callers <name>` to see the blast radius, and to follow control
-flow use `ctx trace <name>` or `ctx path <from> <to>` rather than grepping. `callers` and
-`context` end with a completeness line saying whether any call site bearing that name went
-unresolved — when it says the answer is complete, it is, and you can skip the confirming grep;
+Protocol: query for what you need, when you need it — do not front-load a map. When you are
+about to work on a specific symbol, run `ctx context <name>` — it bundles the definition,
+signature types, callees, and callers in one call, so you rarely need to open the file until you
+are editing its body. Before changing a signature run `ctx callers <name>` to see the blast
+radius; to follow control flow use `ctx trace <name>` or `ctx path <from> <to>` rather than
+grepping; for broader orientation use `ctx subtree <module>`. Reach for `ctx map` only on a cold
+start in an unfamiliar repo.
+
+`callers` and `context` end with a completeness line saying whether any call site bearing that
+name went unresolved — when it says the answer is complete, it is, and you can skip the grep;
 `ctx trace` instead annotates each node with `[+N outside graph]` where a branch left the
 resolved edges. Line anchors (`[L42]`) give exact positions for surgical reads.
 "#;
