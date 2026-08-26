@@ -38,13 +38,6 @@ pub fn neighbors<'a>(
     (upstream, downstream)
 }
 
-fn sep_of(m: &Module) -> &'static str {
-    match m.lang {
-        Lang::Rust => "::",
-        Lang::Python | Lang::TypeScript | Lang::Markdown => ".",
-    }
-}
-
 /// Split a possibly-qualified name into segments, accepting either `::` or
 /// `.` so `SteerOverride::to_config`, `pkg.mod.fn`, and bare `to_config`
 /// all work regardless of language.
@@ -71,7 +64,7 @@ fn collect_defs(
     parent: Option<&str>,
     out: &mut Vec<Def>,
 ) {
-    let sep = sep_of(m);
+    let sep = Lang::sep(m.lang);
     for it in items {
         if it.name.as_deref() == Some(last) && parent.is_none_or(|p| container == Some(p)) {
             let qualname = match container {
@@ -171,7 +164,7 @@ fn collect_callers(
     q: &[&str],
     out: &mut Vec<Caller>,
 ) {
-    let sep = sep_of(m);
+    let sep = Lang::sep(m.lang);
     for it in items {
         let edges: Vec<Call> = it
             .calls
@@ -340,7 +333,7 @@ fn collect_nodes<'a>(
     path: &mut Vec<String>,
     out: &mut Vec<(FnNode, &'a Item)>,
 ) {
-    let sep = sep_of(m);
+    let sep = Lang::sep(m.lang);
     for it in items {
         let named = it.name.clone();
         if matches!(it.kind.as_str(), "fn" | "def") {
@@ -807,7 +800,7 @@ fn def_index(g: &Graph) -> HashMap<String, DefLite> {
     }
     let mut idx = HashMap::new();
     for m in &g.modules {
-        rec(&m.items, m, None, sep_of(m), &mut idx);
+        rec(&m.items, m, None, Lang::sep(m.lang), &mut idx);
     }
     idx
 }
@@ -846,7 +839,7 @@ fn find_targets<'a>(
     }
     let mut out = Vec::new();
     for m in &g.modules {
-        rec(&m.items, m, None, sep_of(m), last, parent, &mut out);
+        rec(&m.items, m, None, Lang::sep(m.lang), last, parent, &mut out);
     }
     out
 }
@@ -1543,7 +1536,7 @@ fn public_surface(g: &Graph) -> BTreeMap<String, Surface> {
     }
     let mut map = BTreeMap::new();
     for m in &g.modules {
-        rec(&m.items, m, None, sep_of(m), false, &mut map);
+        rec(&m.items, m, None, Lang::sep(m.lang), false, &mut map);
     }
     map
 }

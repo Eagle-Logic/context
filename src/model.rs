@@ -120,6 +120,18 @@ impl Lang {
             Lang::Markdown => "markdown",
         }
     }
+
+    /// The language's module-path separator. Every qualified name — module
+    /// names, item qualnames, call paths — is joined and split with this, so
+    /// a new language getting it wrong here is wrong everywhere at once.
+    /// Deliberately the single definition: it used to be copied into three
+    /// files, where two could agree and the third silently disagree.
+    pub fn sep(self) -> &'static str {
+        match self {
+            Lang::Rust => "::",
+            Lang::Python | Lang::TypeScript | Lang::Markdown => ".",
+        }
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -214,11 +226,10 @@ pub struct RawCall {
 
 impl Module {
     pub fn name_segs(&self) -> Vec<String> {
-        let sep = match self.lang {
-            Lang::Rust => "::",
-            Lang::Python | Lang::TypeScript | Lang::Markdown => ".",
-        };
-        self.name.split(sep).map(|s| s.to_string()).collect()
+        self.name
+            .split(self.lang.sep())
+            .map(|s| s.to_string())
+            .collect()
     }
 
     pub fn item_count(&self) -> usize {

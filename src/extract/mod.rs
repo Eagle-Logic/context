@@ -205,16 +205,9 @@ fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>) {
             Lang::Python | Lang::TypeScript | Lang::Markdown => "root".to_string(),
         }
     } else {
-        segs.join(sep(lang))
+        segs.join(lang.sep())
     };
     (name, crate_prefix)
-}
-
-fn sep(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Rust => "::",
-        Lang::Python | Lang::TypeScript | Lang::Markdown => ".",
-    }
 }
 
 struct Ctx<'a> {
@@ -475,7 +468,7 @@ fn chase(name: &str, rest: &[String], ctx: &Ctx, depth: usize) -> (String, Vec<S
 
     // The leftover segment may itself be a submodule file (routed through
     // a directory module like foo/mod.rs or a package __init__.py).
-    let child = format!("{}{}{}", name, sep(m.lang), sym);
+    let child = format!("{}{}{}", name, Lang::sep(m.lang), sym);
     if ctx.by_name.contains_key(&child) {
         return chase(&child, &rest[1..], ctx, depth - 1);
     }
@@ -517,7 +510,7 @@ fn provides(mi: usize, sym: &str, ctx: &Ctx, depth: usize) -> bool {
     }
     if ctx
         .by_name
-        .contains_key(&format!("{}{}{}", m.name, sep(m.lang), sym))
+        .contains_key(&format!("{}{}{}", m.name, Lang::sep(m.lang), sym))
     {
         return true;
     }
@@ -768,7 +761,7 @@ fn resolve_call(
     uni: &Universe,
     locals: &BTreeMap<String, String>,
 ) -> Resolution {
-    let s = sep(m.lang);
+    let s = Lang::sep(m.lang);
 
     // Markdown "calls" are links; resolve them as doc/heading references.
     if m.lang == Lang::Markdown {
@@ -1045,7 +1038,7 @@ fn method_edge(
     uni: &Universe,
     receiver_unknown: bool,
 ) -> Resolution {
-    let s = sep(m.lang);
+    let s = Lang::sep(m.lang);
     if let Some(c) = container {
         if container_has_method(m, c, name) {
             // Reliable for a self receiver; a guess for an opaque one.
@@ -1090,7 +1083,7 @@ fn owner_edge(
     ctx: &Ctx,
 ) -> Option<(String, Option<String>)> {
     let &omi = ctx.by_name.get(om)?;
-    let os = sep(ctx.modules[omi].lang);
+    let os = Lang::sep(ctx.modules[omi].lang);
     if om == m.name {
         Some((format!("{oc}{os}{name}"), None))
     } else {
@@ -1158,7 +1151,7 @@ fn dispatch_edge(name: &str, abstraction: &str, m: &Module, uni: &Universe) -> R
     let Some(owners) = uni.methods.get(name) else {
         return miss(name, uni);
     };
-    let os = sep(m.lang);
+    let os = Lang::sep(m.lang);
     let edge_to = |om: &String, ty: &String| {
         let (display, dep) = if om == &m.name {
             (format!("{ty}{os}{name}"), None)
@@ -1207,7 +1200,7 @@ fn finish_call(fm: &str, fr: &[String], m: &Module, ctx: &Ctx) -> Option<(String
         return None;
     }
     // Backed by a resolved import/path landing on a defined symbol: trusted.
-    let s = sep(target.lang);
+    let s = Lang::sep(target.lang);
     if fm == m.name {
         Some((fr.join(s), None))
     } else {
@@ -1332,7 +1325,7 @@ fn extend_locals(
     if !matches!(it.kind.as_str(), "fn" | "def") {
         return locals.clone();
     }
-    let s = sep(m.lang);
+    let s = Lang::sep(m.lang);
     let owner = it.name.as_deref().or(fn_path);
     let mut out = locals.clone();
     for ch in &it.children {
@@ -1357,7 +1350,7 @@ fn apply_calls(items: &mut [Item], resolved: &mut std::vec::IntoIter<Vec<Call>>)
 }
 
 fn display_reexport(b: &Binding, m: &Module, ctx: &Ctx) -> String {
-    let s = sep(m.lang);
+    let s = Lang::sep(m.lang);
     let target = match resolve_path(&b.path, m, ctx) {
         Some((name, rest)) if rest.is_empty() => name,
         Some((name, rest)) => format!("{name}{s}{}", rest.join(s)),

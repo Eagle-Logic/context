@@ -481,10 +481,56 @@ scanned subtree. Prose→code resolution is not yet modelled.
   not associated constructors — still fall back to the unique-name heuristic.
   `doctor` names every such miss rather than hiding it.
 
-Adding a language = one extractor file producing a `FileFacts` (items, imports,
-re-export bindings, defined names) plus the tree-sitter grammar crate — and, for
-a language that resolves imports by path rather than by name (as TypeScript
-does), a `candidates()` branch that maps a specifier to absolute module segments.
+## Adding a language
+
+Everything downstream of extraction — resolution, the call graph, `core`,
+`parity`, `diff`, the MCP server — consumes one language-neutral struct and
+never asks what produced it. So a new language is one extractor file plus a
+grammar crate, wired in at a handful of places the compiler will point you at.
+
+**1. The contract.** Add `src/extract/<lang>.rs` exposing:
+
+```rust
+pub fn extract(src: &str) -> Result<FileFacts>
+```
+
+`FileFacts` (`src/model.rs`) is four fields: `items`, `imports`, `reexports`,
+`defined`. The work is in populating `Item` — and specifically in `raw_calls`,
+where each `RawCall` carries a `Receiver` (`Free`, `SelfType`, `SelfField`,
+`Typed`, `Dyn`, `Unknown`). **`Receiver` is where edge confidence comes from.**
+An extractor that returns `Unknown` everywhere compiles and runs, and produces a
+map in which every edge is marked `~`. Getting `Typed` and `Dyn` right is most of
+the value. `src/extract/python.rs` is the smallest complete example and the
+template worth copying; note that `TypeEnv` (local-binding type tracking) is
+deliberately per-language, not shared, so that part is written fresh each time.
+
+**2. Add the `Lang` variant**, then run `cargo check`. Seven exhaustive matches
+will fail to compile, and each is a real decision:
+
+| site | decision |
+|---|---|
+| `extract/mod.rs` dispatch | call your `extract()` |
+| `extract/mod.rs` stem collapse | which filename collapses to its directory (`mod`/`lib`/`main`, `__init__`, `index`) |
+| `extract/mod.rs` root name | the name of the root module (`crate` vs `root`) |
+| `extract/mod.rs` `candidates()` | import string → absolute module segments — by name (Rust/Python) or by path (TypeScript) |
+| `model.rs` `Lang::name()` | display string |
+| `model.rs` `Lang::sep()` | path separator (`::` vs `.`) |
+| `view.rs` visibility | what "public" means: a keyword, a naming convention, an `export` |
+
+Only `candidates()` and the visibility rule are real design work.
+
+**3. Four places the compiler will _not_ catch** — each has a `_` fallback, so
+missing one fails silently rather than loudly:
+
+- the extension allowlist in `build_graph` — miss it and your files are never
+  walked, and the map is simply empty
+- the extension → `Lang` mapping (`_ => continue`)
+- `is_package` (`_ => false`)
+- `UNSUPPORTED_SOURCE_EXTS` — remove your extension, or `ctx doctor` keeps
+  reporting the language as a blind spot after you've added it
+
+Grammars are compiled into the binary, so a new grammar crate is a real
+binary-size decision, not just a dependency.
 
 ## Contributing
 
