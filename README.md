@@ -147,6 +147,9 @@ here. [More on why](#maps-when-you-want-them).
 Requires a Rust toolchain (1.85+).
 
 ```sh
+cargo install code-context
+
+# or from git
 cargo install --git https://github.com/Eagle-Logic/context
 
 # or from a clone
@@ -154,8 +157,8 @@ git clone https://github.com/Eagle-Logic/context
 cd context && cargo install --path .
 ```
 
-Single binary, `ctx`. No runtime dependencies — the tree-sitter grammars are
-compiled in.
+The crate is `code-context`; the binary it installs is `ctx`. Single binary, no
+runtime dependencies — the tree-sitter grammars are compiled in.
 
 ## The queries
 

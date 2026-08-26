@@ -21,7 +21,7 @@ use view::View;
 #[command(
     name = "ctx",
     version,
-    about = "Deterministic AST skeleton maps of a codebase for agent context injection"
+    about = "Queryable code graph for coding agents: call graphs, blast radius, API breakage, cross-language parity"
 )]
 struct Cli {
     #[command(subcommand)]

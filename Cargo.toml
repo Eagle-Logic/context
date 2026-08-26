@@ -1,13 +1,13 @@
 [package]
-name = "context"
+name = "code-context"
 version = "0.17.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Deterministic AST skeleton maps of a codebase for agent context injection"
+description = "Queryable code graph for coding agents: call graphs, blast radius, API breakage, cross-language parity"
 license = "MIT"
 repository = "https://github.com/Eagle-Logic/context"
 readme = "README.md"
-keywords = ["ast", "codebase", "context", "llm", "tree-sitter"]
+keywords = ["call-graph", "code-analysis", "agent", "llm", "tree-sitter"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
