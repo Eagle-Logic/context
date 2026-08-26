@@ -436,8 +436,12 @@ mod tests {
 
     #[test]
     fn path_outside_the_root_is_refused_with_a_reason() {
-        // /tmp is outside the crate directory the test process runs in.
-        let (text, is_error) = dispatch("modules", &json!({"path": "/tmp"}));
+        // The system temp dir: an absolute path that exists on every platform
+        // and is never inside the crate the test process runs in. Hardcoding
+        // /tmp here failed on Windows for the wrong reason — it does not exist,
+        // so it was rejected as unresolvable rather than as out-of-root.
+        let outside = std::env::temp_dir();
+        let (text, is_error) = dispatch("modules", &json!({"path": outside.to_string_lossy()}));
         assert!(is_error, "escaping the root must be an error, got: {text}");
         // The refusal has to say WHY and how to override it, or the caller —
         // a model — just retries the same thing.
