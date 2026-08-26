@@ -560,6 +560,33 @@ Both are default-deny with an explicit opt-out. A model has no legitimate reason
 to leave the project it was pointed at, and it cannot see the cost of doing so
 until the tokens are already spent.
 
+#### Measuring what it costs
+
+`ctx mcp --metrics <file>` appends one JSON line per tool call — tool,
+arguments, output tokens, whether the budget bit, duration — plus a session
+total when the client disconnects. `-` writes to stderr. It is off by default
+and never touches a tool's response, so enabling it cannot change what the model
+sees.
+
+It exists because "query instead of loading a map" is an argument until someone
+counts. On a 14,073-file repo, orienting and then working one symbol:
+
+| session | tokens |
+|---|---|
+| `core` → `def` → `context` → `callers` → `trace` | **9,286** |
+| `map` → the same four queries | **33,682** |
+
+The map alone is 24,992 of that, and the agent still ran all four queries
+afterwards — the map answered none of them. Swap it for `ctx core` as the
+orientation step and that 24,992 becomes 596: a **42×** cheaper way to answer
+"where am I", and 3.6× cheaper over the session.
+
+```sh
+ctx mcp --metrics /tmp/ctx.jsonl
+jq -s 'map(select(.summary|not)) | group_by(.tool)
+       | map({tool: .[0].tool, calls: length, tokens: (map(.output_tokens)|add)})' /tmp/ctx.jsonl
+```
+
 ### Claude Code
 
 `ctx snippet` prints a "Codebase Discovery" block **measured for this repo** —

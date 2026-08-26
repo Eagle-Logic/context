@@ -300,6 +300,11 @@ enum Cmd {
         /// leave the project it was pointed at.
         #[arg(long)]
         root: Option<PathBuf>,
+        /// Append one JSON line per tool call (tool, arguments, output tokens,
+        /// duration) to this file, plus a session total on exit. `-` for
+        /// stderr. Off by default; never affects a tool's response.
+        #[arg(long)]
+        metrics: Option<PathBuf>,
     },
     /// Print the CLAUDE.md discovery block, measured for this repo
     Snippet {
@@ -790,7 +795,7 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Cmd::Mcp { root } => mcp::run(root)?,
+        Cmd::Mcp { root, metrics } => mcp::run(root, metrics)?,
         Cmd::Snippet { path } => {
             let g = extract::build_graph(&path)?;
             print!("{}", snippet_for(&g));

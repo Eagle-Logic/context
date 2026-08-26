@@ -4,12 +4,79 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use crate::view::View;
 use crate::{extract, query, render, view};
+
+/// Opt-in per-call instrumentation: what each tool actually cost.
+///
+/// The case for measuring at all: "an agent should query rather than load a
+/// map" is an argument until someone counts the tokens. This is the counter.
+///
+/// It never touches a tool's response — metrics go to a separate sink, so
+/// enabling them cannot change what the model sees. That keeps the output a
+/// pure function of the source tree, which is the property the whole tool
+/// rests on. Durations are monotonic `Instant` deltas rather than wall-clock
+/// readings, so nothing here introduces a dependency on the time of day.
+struct Metrics {
+    out: Box<dyn Write + Send>,
+    seq: u64,
+    total_tokens: usize,
+    total_ms: u128,
+}
+
+static METRICS: OnceLock<Mutex<Metrics>> = OnceLock::new();
+
+/// The JSON line for one tool call. Pure, so the shape is testable without
+/// standing up a server or touching the process-global sink.
+fn metric_line(seq: u64, tool: &str, args: &Value, text: &str, is_error: bool, ms: u128) -> Value {
+    json!({
+        "seq": seq,
+        "tool": tool,
+        "args": args,
+        "output_chars": text.len(),
+        "output_tokens": crate::est_tokens(text),
+        // Surfaced per call so a budget that keeps biting is visible in the
+        // log rather than only in the response the model already consumed.
+        "truncated": text.contains("[ctx] TRUNCATED"),
+        "is_error": is_error,
+        "ms": ms,
+    })
+}
+
+/// Record one tool call. No-op unless `--metrics` was passed.
+fn record(tool: &str, args: &Value, text: &str, is_error: bool, elapsed_ms: u128) {
+    let Some(m) = METRICS.get() else { return };
+    let Ok(mut m) = m.lock() else { return };
+    m.seq += 1;
+    m.total_tokens += crate::est_tokens(text);
+    m.total_ms += elapsed_ms;
+    let line = metric_line(m.seq, tool, args, text, is_error, elapsed_ms);
+    let _ = writeln!(m.out, "{line}");
+    let _ = m.out.flush();
+}
+
+/// Totals for the session, written when the client closes the pipe.
+///
+/// The per-call lines answer "what did this cost"; this line answers "what did
+/// the whole session cost", which is the number worth quoting.
+fn record_summary() {
+    let Some(m) = METRICS.get() else { return };
+    let Ok(mut m) = m.lock() else { return };
+    let line = json!({
+        "summary": true,
+        "calls": m.seq,
+        "total_output_tokens": m.total_tokens,
+        "total_ms": m.total_ms,
+    });
+    let _ = writeln!(m.out, "{line}");
+    let _ = m.out.flush();
+}
 
 /// The directory this server may read.
 ///
@@ -19,7 +86,7 @@ use crate::{extract, query, render, view};
 /// default-deny with an explicit opt-out, not a documented caveat.
 ///
 /// Set once at startup and never from a request, so no argument can widen it.
-static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 /// Resolve a caller-supplied `path` against [`ROOT`], refusing anything that
 /// escapes it.
@@ -55,7 +122,30 @@ fn resolve_in_root(path: &str) -> std::result::Result<PathBuf, String> {
     Ok(real)
 }
 
-pub fn run(root: Option<PathBuf>) -> Result<()> {
+pub fn run(root: Option<PathBuf>, metrics: Option<PathBuf>) -> Result<()> {
+    if let Some(p) = metrics {
+        // `-` means stderr: stdout carries the JSON-RPC stream, so it is the
+        // one sink that must stay clean.
+        let out: Box<dyn Write + Send> = if p.as_os_str() == "-" {
+            Box::new(io::stderr())
+        } else {
+            Box::new(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&p)
+                    .with_context(|| format!("cannot open metrics file {}", p.display()))?,
+            )
+        };
+        METRICS
+            .set(Mutex::new(Metrics {
+                out,
+                seq: 0,
+                total_tokens: 0,
+                total_ms: 0,
+            }))
+            .ok();
+    }
     let root = root.unwrap_or(std::env::current_dir()?);
     let root = root
         .canonicalize()
@@ -68,6 +158,7 @@ pub fn run(root: Option<PathBuf>) -> Result<()> {
     loop {
         buf.clear();
         if handle.read_line(&mut buf)? == 0 {
+            record_summary();
             break; // EOF: client closed the pipe
         }
         let line = buf.trim();
@@ -261,7 +352,9 @@ fn tools_call(req: &Value) -> Value {
         .and_then(|p| p.get("arguments"))
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let started = Instant::now();
     let (text, is_error) = dispatch(name, &args);
+    record(name, &args, &text, is_error, started.elapsed().as_millis());
     json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
 }
 
@@ -517,5 +610,45 @@ mod tests {
                 "{name} must advertise max_tokens"
             );
         }
+    }
+
+    #[test]
+    fn metrics_are_off_unless_asked_for() {
+        // The default path must not panic, allocate a sink, or write anywhere.
+        record("map", &json!({}), "some output", false, 7);
+        record_summary();
+        assert!(
+            METRICS.get().is_none(),
+            "metrics must stay unset until --metrics is passed"
+        );
+    }
+
+    #[test]
+    fn a_metric_line_reports_what_the_call_cost() {
+        let l = metric_line(
+            3,
+            "callers",
+            &json!({"name": "new"}),
+            "abcdefghijkl",
+            false,
+            42,
+        );
+        assert_eq!(l["seq"], 3);
+        assert_eq!(l["tool"], "callers");
+        assert_eq!(l["args"]["name"], "new");
+        assert_eq!(l["output_chars"], 12);
+        assert_eq!(l["output_tokens"], crate::est_tokens("abcdefghijkl"));
+        assert_eq!(l["ms"], 42);
+        assert_eq!(l["truncated"], false);
+        assert_eq!(l["is_error"], false);
+    }
+
+    #[test]
+    fn a_truncated_response_is_flagged_in_the_log() {
+        // Otherwise a budget that keeps biting is invisible to whoever is
+        // reading the log rather than the responses.
+        let cut = "some rows\n[ctx] TRUNCATED at 25000 tokens: 900 more line(s) withheld";
+        let l = metric_line(1, "modules", &json!({}), cut, false, 5);
+        assert_eq!(l["truncated"], true);
     }
 }
