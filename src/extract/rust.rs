@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, HashMap};
+
 use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
 
@@ -55,7 +57,9 @@ fn visit(
                     }
                 }
             }
-            "function_item" | "function_signature_item" => items.push(function(child, src)),
+            "function_item" | "function_signature_item" => {
+                items.push(function(child, src, &TypeEnv::default()))
+            }
             "struct_item" | "union_item" => items.push(structure(child, src)),
             "enum_item" => items.push(enumeration(child, src)),
             "trait_item" | "impl_item" => items.push(container(child, src, facts)),
@@ -89,18 +93,154 @@ fn visit(
     }
 }
 
-fn function(node: Node, src: &str) -> Item {
-    let (sig, raw_calls) = match node.child_by_field_name("body") {
-        Some(body) => (head_before(node, body, src), collect_calls(body, src)),
+fn function(node: Node, src: &str, outer: &TypeEnv) -> Item {
+    let env = fn_env(node, src, outer);
+    let (sig, raw_calls, nested) = match node.child_by_field_name("body") {
+        Some(body) => {
+            let (calls, nested) = body_facts(body, src, &env);
+            (head_before(node, body, src), calls, nested)
+        }
         None => (
             collapse(text(node, src)).trim_end_matches(';').to_string(),
             Vec::new(),
+            Vec::new(),
         ),
     };
-    let mut it = item("fn", sig, node, src, Vec::new(), def_name(node, src));
+    let mut it = item("fn", sig, node, src, nested, def_name(node, src));
     it.raw_calls = raw_calls;
     it.arity = arity(node);
     it
+}
+
+/// The receiver types ctx can name inside one function body: parameters with
+/// declared types, generic parameters standing for a trait bound, and `let`
+/// bindings whose type is annotated or obvious from the initializer. An outer
+/// function's environment is inherited so a closure or nested `fn` still sees
+/// the enclosing bindings.
+#[derive(Default, Clone)]
+struct TypeEnv {
+    vars: HashMap<String, Receiver>,
+}
+
+fn fn_env(node: Node, src: &str, outer: &TypeEnv) -> TypeEnv {
+    let mut env = outer.clone();
+    // Generic parameters bounded by a trait dispatch over its implementors:
+    // `fn run<S: Sampler>(s: S)` makes `s` a dispatch receiver.
+    let mut generics: HashMap<String, String> = HashMap::new();
+    let mut c = node.walk();
+    for ch in node.named_children(&mut c) {
+        match ch.kind() {
+            "type_parameters" => {
+                let mut tc = ch.walk();
+                for p in ch.named_children(&mut tc) {
+                    if let Some((n, b)) = bounded_param(p, src) {
+                        generics.insert(n, b);
+                    }
+                }
+            }
+            "where_clause" => {
+                let mut wc = ch.walk();
+                for pred in ch.named_children(&mut wc) {
+                    if let Some((n, b)) = bounded_param(pred, src) {
+                        generics.entry(n).or_insert(b);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(params) = node.child_by_field_name("parameters") {
+        let mut c = params.walk();
+        for p in params.named_children(&mut c) {
+            if p.kind() != "parameter" {
+                continue;
+            }
+            let (Some(pat), Some(ty)) =
+                (p.child_by_field_name("pattern"), p.child_by_field_name("type"))
+            else {
+                continue;
+            };
+            let name = text(pat, src).trim_start_matches("mut ").trim().to_string();
+            if name.is_empty() || name.contains(['(', '[', '{']) {
+                continue; // destructuring pattern — no single receiver name
+            }
+            if let Some(r) = classify_type(text(ty, src), &generics) {
+                env.vars.insert(name, r);
+            }
+        }
+    }
+    env
+}
+
+/// `S: Sampler` in either a `<..>` list or a `where` clause -> (S, Sampler).
+/// The grammar exposes these as an unnamed (type_identifier, trait_bounds)
+/// pair rather than named fields, so both are located positionally.
+fn bounded_param(p: Node, src: &str) -> Option<(String, String)> {
+    let mut c = p.walk();
+    let kids: Vec<Node> = p.named_children(&mut c).collect();
+    let name = kids
+        .iter()
+        .find(|k| matches!(k.kind(), "type_identifier" | "constrained_type_parameter"))?;
+    let bounds = kids.iter().find(|k| k.kind() == "trait_bounds")?;
+    let n = text(*name, src).trim().to_string();
+    first_bound(text(*bounds, src)).map(|b| (n, b))
+}
+
+/// The first non-lifetime, non-marker trait in a bound list (`: Sampler + Send`).
+fn first_bound(bounds: &str) -> Option<String> {
+    const MARKERS: &[&str] = &[
+        "Send", "Sync", "Sized", "Copy", "Clone", "Debug", "Display", "Default", "Eq", "PartialEq",
+        "Ord", "PartialOrd", "Hash", "Unpin", "'static",
+    ];
+    bounds
+        .trim_start_matches(':')
+        .split('+')
+        .map(|b| strip_generics(b.trim()))
+        .map(|b| last_seg(&b))
+        .find(|b| {
+            !b.is_empty() && !b.starts_with('\'') && !MARKERS.contains(&b.as_str())
+        })
+}
+
+/// Smart-pointer wrappers that are transparent for method dispatch.
+const TRANSPARENT: &[&str] = &["Box", "Arc", "Rc", "RefCell", "Cell", "Mutex", "RwLock", "Cow"];
+
+/// Turn a declared type into the receiver kind it implies, or None when the
+/// type says nothing useful about which method body runs (`Vec<T>`, `Option<T>`,
+/// primitives).
+fn classify_type(raw: &str, generics: &HashMap<String, String>) -> Option<Receiver> {
+    let t = collapse(raw);
+    let t = t
+        .trim()
+        .trim_start_matches('&')
+        .trim()
+        .trim_start_matches("'a")
+        .trim()
+        .trim_start_matches("mut ")
+        .trim();
+    if let Some(rest) = t.strip_prefix("dyn ") {
+        return Some(Receiver::Dyn(last_seg(&strip_generics(rest))));
+    }
+    if let Some(rest) = t.strip_prefix("impl ") {
+        return first_bound(rest).map(Receiver::Dyn);
+    }
+    let base = last_seg(&strip_generics(t));
+    if TRANSPARENT.contains(&base.as_str()) {
+        // Look through the wrapper: Box<dyn Sampler> dispatches like `dyn Sampler`.
+        let inner = t.find('<').map(|i| &t[i + 1..t.rfind('>').unwrap_or(t.len())]);
+        return inner.and_then(|i| classify_type(i, generics));
+    }
+    if let Some(bound) = generics.get(&base) {
+        return Some(Receiver::Dyn(bound.clone()));
+    }
+    if base.is_empty() || !base.chars().next().is_some_and(char::is_uppercase) {
+        return None;
+    }
+    Some(Receiver::Typed(base))
+}
+
+fn last_seg(s: &str) -> String {
+    s.rsplit("::").next().unwrap_or(s).trim().to_string()
 }
 
 /// Value-parameter count for a `fn`, excluding a `self` receiver.
@@ -116,15 +256,24 @@ fn arity(node: Node) -> Option<usize> {
 }
 
 fn structure(node: Node, src: &str) -> Item {
+    let mut field_types = BTreeMap::new();
     let sig = match node.child_by_field_name("body") {
         Some(body) if body.kind() == "field_declaration_list" => {
             let head = head_before(node, body, src);
             let mut cursor = body.walk();
-            let fields: Vec<String> = body
+            let decls: Vec<Node> = body
                 .named_children(&mut cursor)
                 .filter(|c| c.kind() == "field_declaration")
-                .map(|c| collapse(text(c, src)))
                 .collect();
+            for d in &decls {
+                // Field types make `self.field.method()` resolvable.
+                if let (Some(n), Some(t)) =
+                    (d.child_by_field_name("name"), d.child_by_field_name("type"))
+                {
+                    field_types.insert(text(n, src).to_string(), collapse(text(t, src)));
+                }
+            }
+            let fields: Vec<String> = decls.iter().map(|c| collapse(text(*c, src))).collect();
             if fields.is_empty() {
                 head
             } else {
@@ -134,7 +283,9 @@ fn structure(node: Node, src: &str) -> Item {
         // Tuple structs / unit structs: the whole declaration is the signature.
         _ => clip(collapse(text(node, src)).trim_end_matches(';')),
     };
-    item("struct", sig, node, src, Vec::new(), def_name(node, src))
+    let mut it = item("struct", sig, node, src, Vec::new(), def_name(node, src));
+    it.field_types = field_types;
+    it
 }
 
 fn enumeration(node: Node, src: &str) -> Item {
@@ -165,38 +316,162 @@ fn container(node: Node, src: &str, facts: &mut FileFacts) -> Item {
         // impl blocks: the implementing type is the container name.
         let name = node
             .child_by_field_name("type")
-            .map(|t| strip_generics(&collapse(text(t, src))));
+            .map(|t| last_seg(&strip_generics(&collapse(text(t, src)))));
         ("impl", name)
     };
-    match node.child_by_field_name("body") {
+    // `impl Trait for Type` — the trait is what callers dispatch through.
+    let implements: Vec<String> = node
+        .child_by_field_name("trait")
+        .map(|t| vec![last_seg(&strip_generics(&collapse(text(t, src))))])
+        .unwrap_or_default();
+    let mut it = match node.child_by_field_name("body") {
         Some(body) => {
             let mut sub = Vec::new();
             visit(body, src, &mut sub, facts, false);
             item(kind, head_before(node, body, src), node, src, sub, name)
         }
         None => item(kind, collapse(text(node, src)), node, src, Vec::new(), name),
-    }
+    };
+    it.implements = implements;
+    it
 }
 
-/// Walk a function body collecting every call site.
-fn collect_calls(body: Node, src: &str) -> Vec<RawCall> {
-    let mut out = Vec::new();
+/// Walk a function body for everything resolution needs: the call sites (with
+/// receivers typed wherever the source says what they are) and any nested
+/// `fn` items, which become children so their calls are attributed to them
+/// rather than smeared onto the enclosing function.
+fn body_facts(body: Node, src: &str, env: &TypeEnv) -> (Vec<RawCall>, Vec<Item>) {
+    // Pass 1: local bindings and nested functions. Call sites are noted but
+    // not resolved yet, so a binding declared below a call still types it.
+    let mut env = env.clone();
+    let mut call_nodes: Vec<Node> = Vec::new();
+    let mut nested: Vec<Item> = Vec::new();
     let mut stack = vec![body];
     while let Some(n) = stack.pop() {
-        if n.kind() == "call_expression" {
-            if let Some(f) = n.child_by_field_name("function") {
-                push_callee(f, src, &mut out);
+        match n.kind() {
+            "function_item" => {
+                nested.push(function(n, src, &env));
+                continue; // its body belongs to it, not to us
             }
+            // Types declared inside a function body are real definitions: skip
+            // them and `let w = Walk {..}; w.step()` has no type to resolve
+            // against, silently breaking the call chain at that hop.
+            "struct_item" | "union_item" | "enum_item" | "impl_item" | "trait_item" => {
+                nested.push(local_type(n, src));
+                continue;
+            }
+            "let_declaration" => {
+                if let Some((name, r)) = let_binding(n, src, &env) {
+                    env.vars.insert(name, r);
+                }
+                // A `let`-bound closure is a callable the enclosing function
+                // owns; calls to it are internal edges, not mystery names.
+                if let Some(c) = let_closure(n, src, &env) {
+                    nested.push(c);
+                }
+            }
+            "call_expression" => call_nodes.push(n),
+            _ => {}
         }
         let mut c = n.walk();
         for ch in n.named_children(&mut c) {
             stack.push(ch);
         }
     }
-    out
+
+    // Pass 2: resolve receivers against the completed environment. Reverse
+    // restores source order, which the stack walk inverted.
+    call_nodes.reverse();
+    let mut out = Vec::new();
+    for n in call_nodes {
+        if let Some(f) = n.child_by_field_name("function") {
+            push_callee(f, src, &env, &mut out);
+        }
+    }
+    (out, nested)
 }
 
-fn push_callee(f: Node, src: &str, out: &mut Vec<RawCall>) {
+/// A struct/enum/impl/trait declared inside a function body, lifted to a child
+/// item so its methods are indexed like any other type's.
+fn local_type(n: Node, src: &str) -> Item {
+    let mut scratch = FileFacts::default();
+    match n.kind() {
+        "struct_item" | "union_item" => structure(n, src),
+        "enum_item" => enumeration(n, src),
+        _ => container(n, src, &mut scratch),
+    }
+}
+
+/// `let pct = |n, d| ...` — a named closure, lifted to a child `fn` item so it
+/// is findable by `def`, traceable, and resolvable as a callee.
+fn let_closure(n: Node, src: &str, env: &TypeEnv) -> Option<Item> {
+    let pat = n.child_by_field_name("pattern")?;
+    let name = text(pat, src).trim_start_matches("mut ").trim().to_string();
+    if name.is_empty() || name.contains(['(', '[', '{', ':']) {
+        return None;
+    }
+    let value = n.child_by_field_name("value")?;
+    if value.kind() != "closure_expression" {
+        return None;
+    }
+    let params = value.child_by_field_name("parameters");
+    let body = value.child_by_field_name("body");
+    let sig = match body {
+        Some(b) => collapse(&src[n.start_byte()..b.start_byte()])
+            .trim_end_matches('{')
+            .trim()
+            .to_string(),
+        None => collapse(text(n, src)),
+    };
+    let (raw_calls, inner) = match body {
+        Some(b) => body_facts(b, src, env),
+        None => (Vec::new(), Vec::new()),
+    };
+    let mut it = item("fn", clip(&sig), n, src, inner, Some(name));
+    it.raw_calls = raw_calls;
+    it.arity = params.map(|p| {
+        let mut c = p.walk();
+        p.named_children(&mut c).count()
+    });
+    Some(it)
+}
+
+/// The type a `let` introduces: an explicit annotation, or a constructor call
+/// / struct literal on the right-hand side.
+fn let_binding(n: Node, src: &str, env: &TypeEnv) -> Option<(String, Receiver)> {
+    let pat = n.child_by_field_name("pattern")?;
+    let name = text(pat, src).trim_start_matches("mut ").trim().to_string();
+    if name.is_empty() || name.contains(['(', '[', '{', ':']) {
+        return None; // destructuring — no single receiver name
+    }
+    let generics = HashMap::new();
+    if let Some(ty) = n.child_by_field_name("type") {
+        if let Some(r) = classify_type(text(ty, src), &generics) {
+            return Some((name, r));
+        }
+    }
+    let value = n.child_by_field_name("value")?;
+    let r = match value.kind() {
+        // `let e = Engine::new(..)` — an associated function names its type.
+        "call_expression" => {
+            let f = value.child_by_field_name("function")?;
+            let path = strip_turbofish(&collapse(text(f, src)));
+            let (ty, _) = path.rsplit_once("::")?;
+            classify_type(ty, &generics)?
+        }
+        // `let c = Config { .. }`
+        "struct_expression" => {
+            let nm = value.child_by_field_name("name")?;
+            classify_type(text(nm, src), &generics)?
+        }
+        // `let x = y;` propagates y's type.
+        "identifier" => env.vars.get(text(value, src))?.clone(),
+        _ => return None,
+    };
+    Some((name, r))
+}
+
+fn push_callee(f: Node, src: &str, env: &TypeEnv, out: &mut Vec<RawCall>) {
     match f.kind() {
         "identifier" => out.push(RawCall {
             path: text(f, src).to_string(),
@@ -204,8 +479,18 @@ fn push_callee(f: Node, src: &str, out: &mut Vec<RawCall>) {
         }),
         "scoped_identifier" => {
             let t = strip_turbofish(&collapse(text(f, src)));
-            if t.starts_with('<') {
-                return; // <T as Trait>::f — unresolvable without type info
+            // `<T as Trait>::f(..)` — qualified trait dispatch. The trait is
+            // named right there, so this resolves to its implementors.
+            if let Some(rest) = t.strip_prefix('<') {
+                if let Some((qual, method)) = rest.split_once(">::") {
+                    if let Some((_, tr)) = qual.split_once(" as ") {
+                        out.push(RawCall {
+                            path: method.trim().to_string(),
+                            recv: Receiver::Dyn(last_seg(&strip_generics(tr.trim()))),
+                        });
+                    }
+                }
+                return;
             }
             if let Some(rest) = t.strip_prefix("Self::") {
                 out.push(RawCall {
@@ -221,16 +506,14 @@ fn push_callee(f: Node, src: &str, out: &mut Vec<RawCall>) {
         }
         "generic_function" => {
             if let Some(inner) = f.child_by_field_name("function") {
-                push_callee(inner, src, out);
+                push_callee(inner, src, env, out);
             }
         }
         "field_expression" => {
             if let Some(field) = f.child_by_field_name("field") {
-                // `self.method()` is reliably the enclosing impl; any other
-                // receiver (`expr.method()`) has an unknown type.
                 let recv = match f.child_by_field_name("value") {
-                    Some(v) if text(v, src) == "self" => Receiver::SelfType,
-                    _ => Receiver::Unknown,
+                    Some(v) => receiver_of(v, src, env),
+                    None => Receiver::Unknown,
                 };
                 out.push(RawCall {
                     path: text(field, src).to_string(),
@@ -239,6 +522,41 @@ fn push_callee(f: Node, src: &str, out: &mut Vec<RawCall>) {
             }
         }
         _ => {}
+    }
+}
+
+/// Classify the receiver expression of a method call.
+fn receiver_of(v: Node, src: &str, env: &TypeEnv) -> Receiver {
+    match v.kind() {
+        "self" => Receiver::SelfType,
+        "identifier" => {
+            let name = text(v, src);
+            if name == "self" {
+                return Receiver::SelfType;
+            }
+            env.vars.get(name).cloned().unwrap_or(Receiver::Unknown)
+        }
+        // `self.field.method()` — resolved later against the enclosing type's
+        // declared field types.
+        "field_expression" => match (v.child_by_field_name("value"), v.child_by_field_name("field")) {
+            (Some(o), Some(fld)) if text(o, src) == "self" => {
+                Receiver::SelfField(text(fld, src).to_string())
+            }
+            _ => Receiver::Unknown,
+        },
+        // `Engine::new().step()` / `self.build().step()`: the constructor names
+        // the type it returns.
+        "call_expression" => match v.child_by_field_name("function") {
+            Some(f) if f.kind() == "scoped_identifier" => {
+                let path = strip_turbofish(&collapse(text(f, src)));
+                match path.rsplit_once("::") {
+                    Some((ty, _)) => classify_type(ty, &HashMap::new()).unwrap_or(Receiver::Unknown),
+                    None => Receiver::Unknown,
+                }
+            }
+            _ => Receiver::Unknown,
+        },
+        _ => Receiver::Unknown,
     }
 }
 
@@ -488,6 +806,8 @@ fn item(
         arity: None,
         name,
         raw_calls: Vec::new(),
+        implements: Vec::new(),
+        field_types: BTreeMap::new(),
     }
 }
 

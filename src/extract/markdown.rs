@@ -97,6 +97,8 @@ pub fn extract(src: &str) -> Result<FileFacts> {
                 calls: Vec::new(),
                 children: Vec::new(),
                 arity: None,
+                implements: Vec::new(),
+                field_types: Default::default(),
                 name: Some(s),
                 raw_calls: Vec::new(),
             };

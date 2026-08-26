@@ -38,13 +38,6 @@ pub fn neighbors<'a>(
     (upstream, downstream)
 }
 
-fn sep_of(m: &Module) -> &'static str {
-    match m.lang {
-        Lang::Rust => "::",
-        Lang::Python | Lang::TypeScript | Lang::Markdown => ".",
-    }
-}
-
 /// Split a possibly-qualified name into segments, accepting either `::` or
 /// `.` so `SteerOverride::to_config`, `pkg.mod.fn`, and bare `to_config`
 /// all work regardless of language.
@@ -71,7 +64,7 @@ fn collect_defs(
     parent: Option<&str>,
     out: &mut Vec<Def>,
 ) {
-    let sep = sep_of(m);
+    let sep = Lang::sep(m.lang);
     for it in items {
         if it.name.as_deref() == Some(last) && parent.is_none_or(|p| container == Some(p)) {
             let qualname = match container {
@@ -171,7 +164,7 @@ fn collect_callers(
     q: &[&str],
     out: &mut Vec<Caller>,
 ) {
-    let sep = sep_of(m);
+    let sep = Lang::sep(m.lang);
     for it in items {
         let edges: Vec<Call> = it
             .calls
@@ -322,6 +315,7 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
                 })
             })
             .collect();
+        let (unresolved, external, zones) = name_diagnostics(g, q.last().copied().unwrap_or(""));
         return serde_json::to_string_pretty(&json!({
             "query": query,
             "callers": arr,
@@ -333,6 +327,16 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
             "lower_bound": lower_bound,
             "ambiguous_name": ambiguous,
             "suppressed_common_name": suppressed,
+            // Measured, per-name: how many call sites bearing this name ctx
+            // could not pin, and how many it proved external. `complete` is
+            // scoped to that question — it is not a claim about the two flags
+            // above, which cover losses this count cannot see.
+            "completeness": {
+                "unresolved_call_sites_with_this_name": unresolved,
+                "external_call_sites_with_this_name": external,
+                "unresolved_in_modules": zones.iter().map(|(m, c)| json!({"module": m, "count": c})).collect::<Vec<_>>(),
+                "complete": unresolved == 0 && external == 0,
+            },
             "references": refs
                 .iter()
                 .map(|(m, it)| json!({
@@ -348,6 +352,7 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
             + "\n";
     }
 
+    let last = *q.last().unwrap();
     // Spelled out the same way whether or not anything was found: the risk of
     // acting on an incomplete blast radius does not depend on the count.
     let recall_note = if suppressed {
@@ -400,21 +405,10 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
             "no callers found for '{query}'\n\
              (only resolved call edges are indexed; ambiguous calls and \
              ubiquitous std-named methods are intentionally dropped)\n{type_note}{recall_note}"
-        );
-    }
+        ) + &completeness_note(g, last, "result");    }
     let mut out = format!("{} caller(s) of '{}':\n\n", found.len(), query);
     for c in &found {
-        let edges: Vec<String> = c
-            .edges
-            .iter()
-            .map(|e| {
-                if e.heuristic {
-                    format!("{}~", e.to)
-                } else {
-                    e.to.clone()
-                }
-            })
-            .collect();
+        let edges: Vec<String> = c.edges.iter().map(edge_str).collect();
         out.push_str(&format!(
             "{}  ({}:{})  → {}\n",
             c.qualname,
@@ -426,7 +420,11 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
     if found.iter().any(|c| c.edges.iter().any(|e| e.heuristic)) {
         out.push_str("\n(~ = heuristic edge: attributed by receiver inference, not import/path)\n");
     }
+    if found.iter().any(|c| c.edges.iter().any(|e| e.dispatch)) {
+        out.push_str("(* = dispatch edge: one branch of a trait/interface fan-out)\n");
+    }
     out.push_str(&recall_note);
+    out.push_str(&completeness_note(g, last, "blast radius"));
     out
 }
 
@@ -438,6 +436,473 @@ fn callers_of(g: &Graph, q: &[&str]) -> Vec<Caller> {
     }
     found.sort_by(|a, b| (&a.qualname, a.line).cmp(&(&b.qualname, b.line)));
     found
+}
+
+// ---- call graph (trace / path) ---------------------------------------------
+
+/// One callable in the call graph: a function, method, or `let`-bound closure.
+pub struct FnNode {
+    pub qualname: String,
+    pub file: String,
+    pub line: usize,
+    pub module: String,
+    segs: Vec<String>,
+}
+
+/// How a caller reaches a callee. Carried through traversals so a trace can
+/// say which hops are worth double-checking.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Confidence {
+    /// Backed by an import, a path, or a declared receiver type.
+    Proven,
+    /// Attributed by receiver inference — verify before relying on it.
+    Heuristic,
+    /// One branch of a dynamic-dispatch fan-out: reachable, but only one
+    /// sibling branch actually runs on any given call.
+    Dispatch,
+}
+
+impl Confidence {
+    fn mark(self) -> &'static str {
+        match self {
+            Confidence::Proven => "",
+            Confidence::Heuristic => "~",
+            Confidence::Dispatch => "*",
+        }
+    }
+}
+
+/// The resolved call graph: callables as nodes, resolved call edges as arcs.
+/// `trace` and `path` are walks over this; nothing here re-parses source.
+pub struct CallGraph {
+    pub nodes: Vec<FnNode>,
+    out: Vec<Vec<(usize, Confidence)>>,
+    incoming: Vec<Vec<(usize, Confidence)>>,
+    /// Per node, call edges that matched no node in the graph — the honest
+    /// edge of the map, reported rather than silently dropped.
+    dangling: Vec<Vec<String>>,
+}
+
+/// An edge display may carry a fan-out annotation (`Trait::m [7 impls]`);
+/// strip it before matching against node names.
+fn edge_target(to: &str) -> &str {
+    to.split(" [").next().unwrap_or(to).trim()
+}
+
+fn collect_nodes<'a>(
+    items: &'a [Item],
+    m: &Module,
+    path: &mut Vec<String>,
+    out: &mut Vec<(FnNode, &'a Item)>,
+) {
+    let sep = Lang::sep(m.lang);
+    for it in items {
+        let named = it.name.clone();
+        if matches!(it.kind.as_str(), "fn" | "def") {
+            if let Some(n) = &named {
+                let mut qual = m.name.clone();
+                for p in path.iter() {
+                    qual.push_str(sep);
+                    qual.push_str(p);
+                }
+                qual.push_str(sep);
+                qual.push_str(n);
+                out.push((
+                    FnNode {
+                        segs: segments(&qual).into_iter().map(str::to_string).collect(),
+                        qualname: qual,
+                        file: m.file.clone(),
+                        line: it.line,
+                        module: m.name.clone(),
+                    },
+                    it,
+                ));
+            }
+        }
+        // Containers and enclosing functions both qualify what is nested in
+        // them, so a nested helper reads as `outer::helper`.
+        match (
+            matches!(it.kind.as_str(), "impl" | "trait" | "class" | "interface" | "mod" | "fn" | "def"),
+            &named,
+        ) {
+            (true, Some(n)) => {
+                path.push(n.clone());
+                collect_nodes(&it.children, m, path, out);
+                path.pop();
+            }
+            _ => collect_nodes(&it.children, m, path, out),
+        }
+    }
+}
+
+pub fn call_graph(g: &Graph) -> CallGraph {
+    let mut raw: Vec<(FnNode, &Item)> = Vec::new();
+    for m in &g.modules {
+        let mut path = Vec::new();
+        collect_nodes(&m.items, m, &mut path, &mut raw);
+    }
+    // Index by bare name so a call edge can be matched by suffix cheaply.
+    let mut by_last: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, (n, _)) in raw.iter().enumerate() {
+        if let Some(last) = n.segs.last() {
+            by_last.entry(last.as_str()).or_default().push(i);
+        }
+    }
+
+    let n = raw.len();
+    let mut out: Vec<Vec<(usize, Confidence)>> = vec![Vec::new(); n];
+    let mut incoming: Vec<Vec<(usize, Confidence)>> = vec![Vec::new(); n];
+    let mut dangling: Vec<Vec<String>> = vec![Vec::new(); n];
+
+    for (i, (node, it)) in raw.iter().enumerate() {
+        for c in &it.calls {
+            let q: Vec<&str> = segments(edge_target(&c.to));
+            let Some(&last) = q.last() else { continue };
+            let cands = by_last.get(last).cloned().unwrap_or_default();
+            let mut hits: Vec<usize> = cands
+                .into_iter()
+                .filter(|&j| {
+                    let s = &raw[j].0.segs;
+                    s.len() >= q.len() && s[s.len() - q.len()..] == *q
+                })
+                .collect();
+            if hits.is_empty() {
+                dangling[i].push(c.to.clone());
+                continue;
+            }
+            // An unqualified edge that matches several definitions almost
+            // always means the one in the same module.
+            if hits.len() > 1 {
+                let same: Vec<usize> = hits
+                    .iter()
+                    .copied()
+                    .filter(|&j| raw[j].0.module == node.module)
+                    .collect();
+                if !same.is_empty() {
+                    hits = same;
+                }
+            }
+            let conf = if c.dispatch {
+                Confidence::Dispatch
+            } else if c.heuristic || hits.len() > 1 {
+                Confidence::Heuristic
+            } else {
+                Confidence::Proven
+            };
+            for j in hits {
+                if !out[i].iter().any(|&(k, _)| k == j) {
+                    out[i].push((j, conf));
+                    incoming[j].push((i, conf));
+                }
+            }
+        }
+    }
+
+    CallGraph {
+        nodes: raw.into_iter().map(|(n, _)| n).collect(),
+        out,
+        incoming,
+        dangling,
+    }
+}
+
+impl CallGraph {
+    fn arcs(&self, i: usize, reverse: bool) -> &[(usize, Confidence)] {
+        if reverse { &self.incoming[i] } else { &self.out[i] }
+    }
+
+    /// Nodes whose qualified name ends with the query's segments.
+    fn find(&self, query: &str) -> Vec<usize> {
+        let q = segments(query);
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let mut hits: Vec<usize> = (0..self.nodes.len())
+            .filter(|&i| {
+                let s = &self.nodes[i].segs;
+                s.len() >= q.len() && s[s.len() - q.len()..] == *q
+            })
+            .collect();
+        hits.sort_by(|&a, &b| self.nodes[a].qualname.cmp(&self.nodes[b].qualname));
+        hits
+    }
+}
+
+struct TraceLine {
+    depth: usize,
+    node: usize,
+    conf: Confidence,
+    /// Why this branch stopped: "seen" (already expanded), "depth", or none.
+    stop: Option<&'static str>,
+    /// Number of call edges out of this node that left the graph.
+    dangling: usize,
+    last_of_parent: bool,
+}
+
+/// Depth-first walk producing a printable call tree. Cycles and repeated
+/// subtrees are cut with a marker rather than expanded again, so recursion is
+/// safe and the output stays finite.
+fn walk_tree(cg: &CallGraph, root: usize, depth: usize, reverse: bool) -> Vec<TraceLine> {
+    let mut out = Vec::new();
+    let mut expanded: BTreeSet<usize> = BTreeSet::new();
+
+    /// One step of the walk: which node, how it was reached, and where in the
+    /// tree it sits.
+    struct Step {
+        node: usize,
+        conf: Confidence,
+        depth: usize,
+        last: bool,
+    }
+
+    fn rec(
+        cg: &CallGraph,
+        st: Step,
+        max: usize,
+        reverse: bool,
+        expanded: &mut BTreeSet<usize>,
+        out: &mut Vec<TraceLine>,
+    ) {
+        let Step { node: i, conf, depth: d, last } = st;
+        let kids = cg.arcs(i, reverse);
+        let seen = expanded.contains(&i);
+        let stop = if seen && !kids.is_empty() {
+            Some("seen above")
+        } else if d >= max && !kids.is_empty() {
+            Some("depth limit")
+        } else {
+            None
+        };
+        out.push(TraceLine {
+            depth: d,
+            node: i,
+            conf,
+            stop,
+            dangling: cg.dangling[i].len(),
+            last_of_parent: last,
+        });
+        if stop.is_some() {
+            return;
+        }
+        expanded.insert(i);
+        let kids = kids.to_vec();
+        for (k, (j, c)) in kids.iter().enumerate() {
+            let step = Step {
+                node: *j,
+                conf: *c,
+                depth: d + 1,
+                last: k + 1 == kids.len(),
+            };
+            rec(cg, step, max, reverse, expanded, out);
+        }
+    }
+    let root_step = Step {
+        node: root,
+        conf: Confidence::Proven,
+        depth: 0,
+        last: true,
+    };
+    rec(cg, root_step, depth, reverse, &mut expanded, &mut out);
+    out
+}
+
+/// Draw the tree with box-drawing prefixes. `open[d]` tracks whether an
+/// ancestor at depth d still has siblings below it.
+fn render_tree(cg: &CallGraph, lines: &[TraceLine], out: &mut String) {
+    // open[d] == "the ancestor at depth d+1 still has siblings below it", so a
+    // continuation bar is drawn under it.
+    let mut open: Vec<bool> = Vec::new();
+    for l in lines {
+        open.truncate(l.depth.saturating_sub(1));
+        let mut prefix = String::new();
+        for d in 0..l.depth {
+            if d + 1 == l.depth {
+                prefix.push_str(if l.last_of_parent { "└─ " } else { "├─ " });
+            } else {
+                prefix.push_str(if open.get(d).copied().unwrap_or(false) { "│  " } else { "   " });
+            }
+        }
+        if l.depth > 0 {
+            open.push(!l.last_of_parent);
+        }
+        let n = &cg.nodes[l.node];
+        let mut suffix = String::new();
+        if let Some(s) = l.stop {
+            suffix.push_str(&format!("  ({s})"));
+        }
+        if l.dangling > 0 && l.stop.is_none() {
+            suffix.push_str(&format!("  [+{} outside graph]", l.dangling));
+        }
+        out.push_str(&format!(
+            "{prefix}{}{}  [{}:{}]{}\n",
+            n.qualname,
+            l.conf.mark(),
+            n.file,
+            n.line,
+            suffix
+        ));
+    }
+}
+
+/// `ctx trace <sym>` — the call tree rooted at a symbol: what it reaches
+/// (forward) or what reaches it (`--reverse`), to a bounded depth.
+pub fn trace(g: &Graph, query: &str, depth: usize, reverse: bool, json_out: bool) -> String {
+    let cg = call_graph(g);
+    let roots = cg.find(query);
+    if roots.is_empty() {
+        return format!(
+            "no callable named '{query}' in the call graph\n\
+             (ctx trace walks functions, methods, and named closures; try `ctx def {query}`)\n"
+        );
+    }
+
+    if json_out {
+        let blocks: Vec<_> = roots
+            .iter()
+            .take(3)
+            .map(|&r| {
+                let lines = walk_tree(&cg, r, depth, reverse);
+                json!({
+                    "root": cg.nodes[r].qualname,
+                    "file": cg.nodes[r].file,
+                    "line": cg.nodes[r].line,
+                    "tree": lines.iter().map(|l| json!({
+                        "depth": l.depth,
+                        "qualname": cg.nodes[l.node].qualname,
+                        "file": cg.nodes[l.node].file,
+                        "line": cg.nodes[l.node].line,
+                        "confidence": match l.conf {
+                            Confidence::Proven => "proven",
+                            Confidence::Heuristic => "heuristic",
+                            Confidence::Dispatch => "dispatch",
+                        },
+                        "stopped": l.stop,
+                        "edges_outside_graph": l.dangling,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        return serde_json::to_string_pretty(&json!({
+            "query": query,
+            "direction": if reverse { "callers" } else { "callees" },
+            "depth": depth,
+            "traces": blocks,
+        }))
+        .unwrap_or_default()
+            + "\n";
+    }
+
+    let dir = if reverse { "callers of" } else { "call tree from" };
+    let mut out = format!("# {dir} '{query}'  (depth {depth})\n");
+    out.push_str("~ heuristic edge (verify) · * one branch of a dispatch fan-out\n\n");
+    for &r in roots.iter().take(3) {
+        let lines = walk_tree(&cg, r, depth, reverse);
+        render_tree(&cg, &lines, &mut out);
+        out.push('\n');
+    }
+    if roots.len() > 3 {
+        out.push_str(&format!("({} more definitions matched '{query}')\n", roots.len() - 3));
+    }
+    out
+}
+
+/// `ctx path <from> <to>` — the shortest call path between two symbols, or an
+/// honest statement that the resolved graph contains none.
+pub fn path(g: &Graph, from: &str, to: &str, json_out: bool) -> String {
+    let cg = call_graph(g);
+    let starts = cg.find(from);
+    let goals: BTreeSet<usize> = cg.find(to).into_iter().collect();
+    if starts.is_empty() || goals.is_empty() {
+        let missing = if starts.is_empty() { from } else { to };
+        return format!("no callable named '{missing}' in the call graph\n");
+    }
+
+    // BFS from every match of `from`; the first goal reached is a shortest path.
+    let mut prev: HashMap<usize, (usize, Confidence)> = HashMap::new();
+    let mut seen: BTreeSet<usize> = starts.iter().copied().collect();
+    let mut queue: std::collections::VecDeque<usize> = starts.iter().copied().collect();
+    let mut found: Option<usize> = None;
+    'bfs: while let Some(i) = queue.pop_front() {
+        if goals.contains(&i) && !starts.contains(&i) {
+            found = Some(i);
+            break 'bfs;
+        }
+        for &(j, c) in &cg.out[i] {
+            if seen.insert(j) {
+                prev.insert(j, (i, c));
+                queue.push_back(j);
+            }
+        }
+    }
+    // A start that is itself the goal is a zero-hop answer.
+    let found = found.or_else(|| starts.iter().copied().find(|i| goals.contains(i)));
+
+    let Some(end) = found else {
+        if json_out {
+            return serde_json::to_string_pretty(&json!({
+                "from": from, "to": to, "found": false, "hops": null, "path": [],
+            }))
+            .unwrap_or_default()
+                + "\n";
+        }
+        return format!(
+            "no call path from '{from}' to '{to}' in the resolved graph\n\
+             (the graph only contains edges ctx could prove; run `ctx doctor` to see\n\
+             how much of this repo resolved, and which callee names went unpinned)\n"
+        );
+    };
+
+    // Rebuild the route back to whichever start it came from. Each entry
+    // carries the confidence of the hop *into* that node, so the marker lands
+    // on the callee rather than the caller.
+    let mut route: Vec<(usize, Confidence)> = Vec::new();
+    let mut cur = end;
+    loop {
+        match prev.get(&cur) {
+            Some(&(p, c)) => {
+                route.push((cur, c));
+                cur = p;
+            }
+            // The start node has no inbound hop.
+            None => {
+                route.push((cur, Confidence::Proven));
+                break;
+            }
+        }
+    }
+    route.reverse();
+    let hops = route.len().saturating_sub(1);
+
+    if json_out {
+        return serde_json::to_string_pretty(&json!({
+            "from": from,
+            "to": to,
+            "found": true,
+            "hops": hops,
+            "path": route.iter().enumerate().map(|(k, (i, c))| json!({
+                "qualname": cg.nodes[*i].qualname,
+                "file": cg.nodes[*i].file,
+                "line": cg.nodes[*i].line,
+                "confidence": if k == 0 { "proven" } else { match c {
+                    Confidence::Proven => "proven",
+                    Confidence::Heuristic => "heuristic",
+                    Confidence::Dispatch => "dispatch",
+                }},
+            })).collect::<Vec<_>>(),
+        }))
+        .unwrap_or_default()
+            + "\n";
+    }
+
+    let mut out = format!("# path: {from} → {to}  ({hops} hop(s))\n");
+    out.push_str("~ heuristic edge (verify) · * one branch of a dispatch fan-out\n\n");
+    for (k, (i, c)) in route.iter().enumerate() {
+        let n = &cg.nodes[*i];
+        let arrow = if k == 0 { String::new() } else { format!("{}→ ", "  ".repeat(k)) };
+        let mark = if k == 0 { "" } else { c.mark() };
+        out.push_str(&format!("{arrow}{}{}  [{}:{}]\n", n.qualname, mark, n.file, n.line));
+    }
+    out
 }
 
 // ---- context ---------------------------------------------------------------
@@ -497,7 +962,7 @@ fn def_index(g: &Graph) -> HashMap<String, DefLite> {
     }
     let mut idx = HashMap::new();
     for m in &g.modules {
-        rec(&m.items, m, None, sep_of(m), &mut idx);
+        rec(&m.items, m, None, Lang::sep(m.lang), &mut idx);
     }
     idx
 }
@@ -536,7 +1001,7 @@ fn find_targets<'a>(
     }
     let mut out = Vec::new();
     for m in &g.modules {
-        rec(&m.items, m, None, sep_of(m), last, parent, &mut out);
+        rec(&m.items, m, None, Lang::sep(m.lang), last, parent, &mut out);
     }
     out
 }
@@ -586,11 +1051,58 @@ fn signature_types<'a>(
 }
 
 fn edge_str(c: &Call) -> String {
-    if c.heuristic {
-        format!("{}~", c.to)
-    } else {
-        c.to.clone()
+    crate::render::edge_str(c)
+}
+
+/// What the diagnostics say about call sites bearing a given callee name:
+/// how many went unresolved (and where), and how many were classified as
+/// external. The raw material for telling a caller whether an answer is
+/// complete or merely everything ctx could prove.
+fn name_diagnostics<'a>(g: &'a Graph, name: &str) -> (usize, usize, Vec<(&'a str, usize)>) {
+    let mut unresolved = 0usize;
+    let mut external = 0usize;
+    let mut zones: Vec<(&str, usize)> = Vec::new();
+    for m in &g.modules {
+        if let Some(&c) = m.diag.unresolved_names.get(name) {
+            unresolved += c;
+            zones.push((m.name.as_str(), c));
+        }
+        if let Some(&c) = m.diag.extern_names.get(name) {
+            external += c;
+        }
     }
+    zones.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    (unresolved, external, zones)
+}
+
+/// A one-line verdict on whether a name-keyed answer can be trusted as
+/// complete. An agent should not have to run `ctx doctor` to find out that the
+/// specific symbol it asked about is one of the unresolved ones.
+fn completeness_note(g: &Graph, name: &str, subject: &str) -> String {
+    let (unresolved, external, zones) = name_diagnostics(g, name);
+    if unresolved > 0 {
+        let where_ = zones
+            .iter()
+            .take(4)
+            .map(|(m, c)| format!("{m} {c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!(
+            "\ncompleteness: {unresolved} call site(s) named `{name}` could not be pinned \
+             ({where_}) —\nthis {subject} may be incomplete; grep `{name}` to confirm.\n"
+        );
+    }
+    if external > 0 {
+        return format!(
+            "\ncompleteness: every internal call site named `{name}` resolved, but {external} \
+             call(s)\nto that name were classified external (a std/third-party name collision). \
+             If `{name}`\nis also invoked on a value ctx could not type, those calls are not listed.\n"
+        );
+    }
+    format!(
+        "\ncompleteness: no call site named `{name}` went unresolved anywhere in this tree —\n\
+         this {subject} is complete to the limit of what ctx parses.\n"
+    )
 }
 
 /// Assemble everything needed to edit a symbol — definition, the types in its
@@ -627,13 +1139,23 @@ pub fn context(g: &Graph, query: &str, max_tokens: usize, json_out: bool) -> Str
                 json!({
                     "definition": {"qualname": qual, "kind": it.kind, "file": m.file, "line": it.line, "signature": it.signature, "doc": it.doc},
                     "signature_types": types,
-                    "calls": it.calls.iter().map(|c| json!({"to": c.to, "heuristic": c.heuristic})).collect::<Vec<_>>(),
+                    "calls": it.calls.iter().map(|c| json!({"to": c.to, "heuristic": c.heuristic, "dispatch": c.dispatch})).collect::<Vec<_>>(),
                     "callers": callers.iter().map(|c| json!({"caller": c.qualname, "file": c.file, "line": c.line})).collect::<Vec<_>>(),
                 })
             })
             .collect();
-        return serde_json::to_string_pretty(&json!({"query": query, "context": blocks}))
-            .unwrap_or_default()
+        let (unresolved, external, zones) = name_diagnostics(g, last);
+        return serde_json::to_string_pretty(&json!({
+            "query": query,
+            "context": blocks,
+            "completeness": {
+                "unresolved_call_sites_with_this_name": unresolved,
+                "external_call_sites_with_this_name": external,
+                "unresolved_in_modules": zones.iter().map(|(m, c)| json!({"module": m, "count": c})).collect::<Vec<_>>(),
+                "complete": unresolved == 0 && external == 0,
+            },
+        }))
+        .unwrap_or_default()
             + "\n";
     }
 
@@ -683,6 +1205,7 @@ pub fn context(g: &Graph, query: &str, max_tokens: usize, json_out: bool) -> Str
             );
         }
     }
+    out.push_str(&completeness_note(g, last, "caller list"));
     out
 }
 
@@ -888,40 +1411,70 @@ pub fn core(
 
 /// A completeness/blind-spot report: how much of the call graph resolved,
 /// where confidence is low, and which source files are not modeled at all.
-pub fn coverage_report(g: &Graph, unsupported: &[(String, usize)], json_out: bool) -> String {
-    let (mut sites, mut resolved, mut heuristic, mut std_builtin) = (0usize, 0usize, 0usize, 0usize);
+///
+/// The headline is *internal recall* — resolved edges over call sites that
+/// could have been internal at all. The older "internal edges / all call
+/// sites" figure counted `vec.push()` and `serde_json::to_string()` against
+/// ctx, so it read like a failure rate when it was mostly a measure of how
+/// much std and third-party code the repo calls.
+pub fn coverage_report(
+    g: &Graph,
+    unsupported: &[(String, usize)],
+    explain: bool,
+    json_out: bool,
+) -> String {
+    let mut t = Totals::default();
     let mut by_lang: BTreeMap<&str, usize> = BTreeMap::new();
     for m in &g.modules {
-        sites += m.diag.call_sites;
-        resolved += m.diag.resolved;
-        heuristic += m.diag.heuristic;
-        std_builtin += m.diag.std_builtin;
+        t.add(&m.diag);
         *by_lang.entry(m.lang.name()).or_default() += 1;
     }
-    // Genuine misses: neither an internal edge nor a known std/builtin call.
-    let dropped = sites.saturating_sub(resolved).saturating_sub(std_builtin);
     let pct = |n: usize, d: usize| if d == 0 { 0.0 } else { 100.0 * n as f64 / d as f64 };
-    let miss = |m: &Module| m.diag.call_sites - m.diag.resolved - m.diag.std_builtin;
+    let internal = t.resolved + t.unresolved;
 
-    // Low-confidence zones: high heuristic ratio (min 10 resolved), and most
-    // genuinely-unresolved call sites.
+    // Low-confidence zones: high heuristic ratio (min 10 resolved), and the
+    // modules holding the most genuine misses.
     let mut heur_zones: Vec<&Module> = g
         .modules
         .iter()
-        .filter(|m| m.diag.resolved >= 10)
+        .filter(|m| m.diag.resolved >= 10 && m.diag.heuristic > 0)
         .collect();
     heur_zones.sort_by(|a, b| {
         pct(b.diag.heuristic, b.diag.resolved)
             .partial_cmp(&pct(a.diag.heuristic, a.diag.resolved))
             .unwrap()
+            .then(b.diag.heuristic.cmp(&a.diag.heuristic))
     });
-    let mut drop_zones: Vec<&Module> = g.modules.iter().filter(|m| miss(m) > 0).collect();
-    drop_zones.sort_by_key(|&m| std::cmp::Reverse(miss(m)));
+    let mut miss_zones: Vec<&Module> = g
+        .modules
+        .iter()
+        .filter(|m| m.diag.unresolved > 0)
+        .collect();
+    miss_zones.sort_by_key(|m| std::cmp::Reverse(m.diag.unresolved));
+
+    // The names behind the misses — the actionable half of the report.
+    let mut miss_census: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut extern_census: BTreeMap<&str, usize> = BTreeMap::new();
+    for m in &g.modules {
+        for (n, c) in &m.diag.unresolved_names {
+            *miss_census.entry(n.as_str()).or_default() += c;
+        }
+        for (n, c) in &m.diag.extern_names {
+            *extern_census.entry(n.as_str()).or_default() += c;
+        }
+    }
+    let ranked = |c: &BTreeMap<&str, usize>| {
+        let mut v: Vec<(String, usize)> =
+            c.iter().map(|(k, v)| ((*k).to_string(), *v)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v
+    };
+    let miss_ranked = ranked(&miss_census);
+    let extern_ranked = ranked(&extern_census);
 
     // Markdown broken links: targets that resolve to no file or heading. These
     // are true dead links (out-of-scope `../` links that exist on disk are not
-    // counted), so they warrant a dedicated report rather than the generic
-    // "external/unpinned" bucket that suits code.
+    // counted), so they warrant a dedicated report.
     let broken: Vec<(&str, usize, &str)> = g
         .modules
         .iter()
@@ -938,12 +1491,19 @@ pub fn coverage_report(g: &Graph, unsupported: &[(String, usize)], json_out: boo
             "root": g.root,
             "modules": g.modules.len(),
             "modules_by_lang": by_lang,
-            "call_sites": sites,
-            "resolved": resolved,
-            "heuristic": heuristic,
-            "std_builtin": std_builtin,
-            "dropped": dropped,
-            "broken_links": broken.iter().map(|(f, l, t)| json!({"file": f, "line": l, "target": t})).collect::<Vec<_>>(),
+            "call_sites": t.sites,
+            "resolved": t.resolved,
+            "heuristic": t.heuristic,
+            "dispatch": t.dispatch,
+            "external": t.external,
+            "unresolved": t.unresolved,
+            "internal_call_sites": internal,
+            "internal_recall_pct": (pct(t.resolved, internal) * 10.0).round() / 10.0,
+            "unresolved_names": miss_ranked.iter().map(|(n, c)| json!({"name": n, "count": c})).collect::<Vec<_>>(),
+            "external_names": if explain {
+                extern_ranked.iter().map(|(n, c)| json!({"name": n, "count": c})).collect::<Vec<_>>()
+            } else { Vec::new() },
+            "broken_links": broken.iter().map(|(f, l, tg)| json!({"file": f, "line": l, "target": tg})).collect::<Vec<_>>(),
             "unsupported_files": unsupported.iter().map(|(e, n)| json!({"ext": e, "count": n})).collect::<Vec<_>>(),
         }))
         .unwrap_or_default()
@@ -965,23 +1525,62 @@ pub fn coverage_report(g: &Graph, unsupported: &[(String, usize)], json_out: boo
         g.modules.len(),
         langs.join(", ")
     ));
-    out.push_str("## Call-edge resolution\n");
-    out.push_str("ctx only draws edges it can prove; std/builtin and external-crate calls are\n");
-    out.push_str("intentionally not edged, so a low internal-edge fraction is expected, not a defect.\n\n");
-    out.push_str(&format!("call sites:          {sites}\n"));
+
+    out.push_str("## Internal recall — the number to trust\n");
     out.push_str(&format!(
-        "  internal edges:    {resolved} ({:.1}%)   [{heuristic} heuristic (~), {:.1}% of edges]\n",
-        pct(resolved, sites),
-        pct(heuristic, resolved)
+        "  {}/{} = {:.1}%   of call sites that could be internal, ctx pinned this many.\n\n",
+        t.resolved,
+        internal,
+        pct(t.resolved, internal)
+    ));
+    out.push_str("A call site is \"could be internal\" when the callee name is defined somewhere\n");
+    out.push_str("under this root. Calls into std or a third-party crate are excluded, because no\n");
+    out.push_str("internal edge could exist for them however good the resolver gets.\n\n");
+
+    out.push_str("## Every call site, bucketed\n");
+    out.push_str(&format!("call sites:            {}\n", t.sites));
+    out.push_str(&format!(
+        "  internal edges:      {:<6} [{} heuristic (~), {} dispatch fan-out (*)]\n",
+        t.resolved, t.heuristic, t.dispatch
     ));
     out.push_str(&format!(
-        "  std / builtin:     {std_builtin} ({:.1}%)   [push/iter/map/… — never edged by design]\n",
-        pct(std_builtin, sites)
+        "  external (provable): {:<6} ({:.1}%)  callee defined nowhere here — std/extern\n",
+        t.external,
+        pct(t.external, t.sites)
     ));
     out.push_str(&format!(
-        "  external / unpinned: {dropped} ({:.1}%)   [external-crate, dynamic, or ambiguous]\n",
-        pct(dropped, sites)
+        "  unresolved internal: {:<6} ({:.1}%)  the real misses — see below\n",
+        t.unresolved,
+        pct(t.unresolved, t.sites)
     ));
+
+    if !miss_ranked.is_empty() {
+        let shown = if explain { miss_ranked.len() } else { 15 };
+        out.push_str("\n## What ctx missed (callee names that exist here but went unpinned)\n");
+        out.push_str("grep these; every other edge in the map is one ctx could prove.\n");
+        for (n, c) in miss_ranked.iter().take(shown) {
+            out.push_str(&format!("  {c:>5}  {n}\n"));
+        }
+        if miss_ranked.len() > shown {
+            out.push_str(&format!(
+                "  … and {} more distinct name(s) — rerun with --explain for the full census\n",
+                miss_ranked.len() - shown
+            ));
+        }
+    }
+
+    if !miss_zones.is_empty() {
+        out.push_str("\n## Where the misses are\n");
+        for m in miss_zones.iter().take(8) {
+            let mi = m.diag.resolved + m.diag.unresolved;
+            out.push_str(&format!(
+                "  {:<32} {:>4} unresolved   (module recall {:.0}%)\n",
+                m.name,
+                m.diag.unresolved,
+                pct(m.diag.resolved, mi)
+            ));
+        }
+    }
 
     if !heur_zones.is_empty() {
         out.push_str("\n## Low-confidence zones (edges to distrust — grep to confirm)\n");
@@ -995,15 +1594,17 @@ pub fn coverage_report(g: &Graph, unsupported: &[(String, usize)], json_out: boo
             ));
         }
     }
-    if !drop_zones.is_empty() {
-        out.push_str("\n## Most external/unpinned calls (mapped least completely — relative signal)\n");
-        for m in drop_zones.iter().take(8) {
-            out.push_str(&format!(
-                "  {:<32} {} unpinned of {} sites\n",
-                m.name,
-                miss(m),
-                m.diag.call_sites
-            ));
+
+    if explain && !extern_ranked.is_empty() {
+        out.push_str(&format!(
+            "\n## External census ({} distinct names, provably not internal)\n",
+            extern_ranked.len()
+        ));
+        for (n, c) in extern_ranked.iter().take(40) {
+            out.push_str(&format!("  {c:>5}  {n}\n"));
+        }
+        if extern_ranked.len() > 40 {
+            out.push_str(&format!("  … and {} more\n", extern_ranked.len() - 40));
         }
     }
 
@@ -1029,6 +1630,27 @@ pub fn coverage_report(g: &Graph, unsupported: &[(String, usize)], json_out: boo
     }
     out.push_str("  (supported: .rs .py .ts .tsx .md)\n");
     out
+}
+
+#[derive(Default)]
+struct Totals {
+    sites: usize,
+    resolved: usize,
+    heuristic: usize,
+    dispatch: usize,
+    external: usize,
+    unresolved: usize,
+}
+
+impl Totals {
+    fn add(&mut self, d: &crate::model::Diagnostics) {
+        self.sites += d.call_sites;
+        self.resolved += d.resolved;
+        self.heuristic += d.heuristic;
+        self.dispatch += d.dispatch;
+        self.external += d.external;
+        self.unresolved += d.unresolved;
+    }
 }
 
 // ---- api diff (breaking-change detector) -----------------------------------
@@ -1095,7 +1717,7 @@ fn public_surface(g: &Graph) -> BTreeMap<String, Surface> {
     }
     let mut map = BTreeMap::new();
     for m in &g.modules {
-        rec(&m.items, m, None, sep_of(m), false, &mut map);
+        rec(&m.items, m, None, Lang::sep(m.lang), false, &mut map);
     }
     map
 }
@@ -1227,6 +1849,263 @@ mod tests {
         }
         let g = build_graph(&dir).unwrap();
         (g, dir)
+    }
+
+    /// A three-language dispatch fixture: an abstraction, two implementations
+    /// that override it, a concrete field, a local binding, and a nested
+    /// helper. Reused by the dispatch/typing/trace tests below.
+    const RUST_DISPATCH: &str = r#"
+pub trait Sampler { fn step(&self, x: f32) -> f32; fn name(&self) -> &'static str { tag() } }
+pub struct Greedy;
+impl Sampler for Greedy { fn step(&self, x: f32) -> f32 { pick_max(x) } }
+pub struct TopK { pub k: usize }
+impl Sampler for TopK { fn step(&self, x: f32) -> f32 { self.trim(x) } }
+impl TopK { fn trim(&self, x: f32) -> f32 { x } }
+fn pick_max(x: f32) -> f32 { x }
+fn tag() -> &'static str { "s" }
+
+pub struct Engine { sampler: Box<dyn Sampler>, top: TopK }
+impl Engine {
+    pub fn run(&self, x: f32) -> f32 { self.sampler.step(x) }
+    pub fn run_with(&self, s: &dyn Sampler, x: f32) -> f32 { s.step(x) }
+    pub fn run_generic<S: Sampler>(&self, s: S, x: f32) -> f32 { s.step(x) }
+    pub fn run_concrete(&self, x: f32) -> f32 { self.top.trim(x) }
+    pub fn run_local(&self, x: f32) -> f32 { let k = TopK { k: 2 }; k.trim(x) }
+    pub fn label(&self, s: &dyn Sampler) -> &'static str { s.name() }
+    pub fn nested(&self, x: f32) -> f32 { fn dbl(v: f32) -> f32 { v } let half = |v: f32| v; half(dbl(x)) }
+}
+"#;
+
+    /// Every call edge out of the named function, markers included.
+    fn edges_of(g: &Graph, name: &str) -> Vec<String> {
+        fn rec(items: &[Item], name: &str, out: &mut Vec<String>) {
+            for it in items {
+                if it.name.as_deref() == Some(name) {
+                    out.extend(it.calls.iter().map(edge_str));
+                }
+                rec(&it.children, name, out);
+            }
+        }
+        let mut out = Vec::new();
+        for m in &g.modules {
+            rec(&m.items, name, &mut out);
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn dyn_field_param_and_generic_all_fan_out_over_implementations() {
+        let (g, dir) = graph(&[("src/lib.rs", RUST_DISPATCH)]);
+        // A boxed trait-object field, a `&dyn` parameter, and a bounded
+        // generic are three spellings of the same dispatch: all reach both
+        // implementations, and every branch is marked `*`.
+        for f in ["run", "run_with", "run_generic"] {
+            let e = edges_of(&g, f);
+            assert_eq!(e, vec!["Greedy::step*", "TopK::step*"], "{f}: {e:?}");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concrete_receiver_types_resolve_without_fanning_out() {
+        let (g, dir) = graph(&[("src/lib.rs", RUST_DISPATCH)]);
+        // A field declared `TopK` and a `let` bound to a `TopK` literal both
+        // pin the one real target — no fan-out, no heuristic marker.
+        assert_eq!(edges_of(&g, "run_concrete"), vec!["TopK::trim"]);
+        assert_eq!(edges_of(&g, "run_local"), vec!["TopK::trim"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn default_trait_method_is_the_target_when_nothing_overrides_it() {
+        let (g, dir) = graph(&[("src/lib.rs", RUST_DISPATCH)]);
+        // `step` is overridden by both impls, so the trait's own declaration
+        // is not a target. `name` is not overridden, so its default body is.
+        assert_eq!(edges_of(&g, "label"), vec!["Sampler::name*"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn nested_fns_and_named_closures_become_callable_children() {
+        let (g, dir) = graph(&[("src/lib.rs", RUST_DISPATCH)]);
+        let e = edges_of(&g, "nested");
+        assert_eq!(e, vec!["nested::dbl", "nested::half"], "{e:?}");
+        // …and are findable as definitions in their own right.
+        assert!(def(&g, "dbl", false).contains("1 definition(s)"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trace_walks_transitively_through_a_dispatch_fan_out() {
+        let (g, dir) = graph(&[("src/lib.rs", RUST_DISPATCH)]);
+        let out = trace(&g, "run", 3, false, false);
+        // One hop reaches both impls; the second hop reaches what each impl
+        // calls — the thing `callers` cannot do.
+        assert!(out.contains("Greedy::step"), "{out}");
+        assert!(out.contains("TopK::step"), "{out}");
+        assert!(out.contains("pick_max"), "{out}");
+        assert!(out.contains("TopK::trim"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trace_reverse_walks_callers_and_terminates_on_cycles() {
+        let src = "pub fn a() { b() }
+pub fn b() { c() }
+pub fn c() { a() }
+";
+        let (g, dir) = graph(&[("src/lib.rs", src)]);
+        let out = trace(&g, "c", 5, true, false);
+        assert!(out.contains("crate::b"), "{out}");
+        // A cycle must be cut, not expanded forever.
+        assert!(out.contains("seen above"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trace_depth_bounds_the_tree() {
+        let src = "pub fn a() { b() }
+pub fn b() { c() }
+pub fn c() {}
+";
+        let (g, dir) = graph(&[("src/lib.rs", src)]);
+        let shallow = trace(&g, "a", 1, false, false);
+        assert!(shallow.contains("crate::b"), "{shallow}");
+        assert!(!shallow.contains("crate::c"), "{shallow}");
+        assert!(trace(&g, "a", 2, false, false).contains("crate::c"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn path_finds_a_multi_hop_route_and_reports_hop_count() {
+        let src = "pub fn a() { b() }
+pub fn b() { c() }
+pub fn c() { d() }
+pub fn d() {}
+";
+        let (g, dir) = graph(&[("src/lib.rs", src)]);
+        let out = path(&g, "a", "d", false);
+        assert!(out.contains("3 hop(s)"), "{out}");
+        for step in ["crate::a", "crate::b", "crate::c", "crate::d"] {
+            assert!(out.contains(step), "{out}");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn path_crosses_modules_and_a_dispatch_boundary() {
+        let (g, dir) = graph(&[("src/lib.rs", RUST_DISPATCH)]);
+        let out = path(&g, "run", "pick_max", false);
+        assert!(out.contains("2 hop(s)"), "{out}");
+        // The dispatch hop is marked, so the route is not mistaken for proof
+        // that this specific branch runs.
+        assert!(out.contains("Greedy::step*"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn path_says_so_when_no_route_exists() {
+        let src = "pub fn a() {}
+pub fn z() {}
+";
+        let (g, dir) = graph(&[("src/lib.rs", src)]);
+        let out = path(&g, "a", "z", false);
+        assert!(out.contains("no call path"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn doctor_recall_excludes_provably_external_calls() {
+        // One internal call, one call into std. The old denominator counted
+        // both, reporting 50%; recall counts only the call that could have
+        // been an internal edge.
+        let src = "pub fn helper() {}
+pub fn go(v: Vec<u8>) { helper(); v.len(); }
+";
+        let (g, dir) = graph(&[("src/lib.rs", src)]);
+        let out = coverage_report(&g, &[], false, false);
+        assert!(out.contains("100.0%"), "{out}");
+        assert!(out.contains("external (provable)"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Two types share a method name and the receiver carries no declared
+    /// type, so ctx cannot say which one runs — the canonical genuine miss.
+    const AMBIGUOUS: &str = r#"
+pub struct A;
+pub struct B;
+impl A { pub fn render(&self) {} }
+impl B { pub fn render(&self) {} }
+pub fn go(items: Vec<A>) { for i in items { i.render(); } }
+"#;
+
+    #[test]
+    fn doctor_names_what_it_could_not_pin() {
+        let (g, dir) = graph(&[("src/lib.rs", AMBIGUOUS)]);
+        let out = coverage_report(&g, &[], true, false);
+        assert!(out.contains("unresolved internal: 1"), "{out}");
+        // The name is spelled out, so the fix is one grep away rather than a
+        // percentage with nothing behind it.
+        assert!(out.contains("What ctx missed"), "{out}");
+        assert!(out.contains("render"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn callers_states_whether_the_blast_radius_is_complete() {
+        let src = "pub fn target() {}\npub fn caller() { target(); }\n";
+        let (g, dir) = graph(&[("src/lib.rs", src)]);
+        let out = callers(&g, "target", false);
+        assert!(out.contains("1 caller(s)"), "{out}");
+        assert!(out.contains("this blast radius is complete"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn callers_warns_when_call_sites_with_that_name_went_unresolved() {
+        let (g, dir) = graph(&[("src/lib.rs", AMBIGUOUS)]);
+        let out = callers(&g, "render", false);
+        // The unpinnable call site is disclosed rather than silently missing,
+        // so an agent knows this one answer needs a confirming grep.
+        assert!(out.contains("may be incomplete"), "{out}");
+        assert!(out.contains("crate 1"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn python_base_class_calls_fan_out_over_subclasses() {
+        let src = r#"
+class Base:
+    def step(self): ...
+
+class A(Base):
+    def step(self): return 1
+
+class B(Base):
+    def step(self): return 2
+
+def run(b: Base):
+    return b.step()
+"#;
+        let (g, dir) = graph(&[("pkg/m.py", src)]);
+        let e = edges_of(&g, "run");
+        assert_eq!(e, vec!["A.step*", "B.step*"], "{e:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn typescript_interface_calls_fan_out_over_implementations() {
+        let src = r#"
+export interface S { step(): number; }
+export class A implements S { step(): number { return 1; } }
+export class B implements S { step(): number { return 2; } }
+export function run(s: S): number { return s.step(); }
+"#;
+        let (g, dir) = graph(&[("src/m.ts", src)]);
+        let e = edges_of(&g, "run");
+        assert_eq!(e, vec!["A.step*", "B.step*"], "{e:?}");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1572,12 +2451,30 @@ mod tests {
     }
 
     #[test]
-    fn opaque_receiver_edge_is_flagged_heuristic() {
-        // `w.frobnicate()` — receiver type unknown; resolved only because the
-        // method name is unique codebase-wide, so it must be marked `~`.
+    fn declared_param_type_resolves_the_receiver_as_proven() {
+        // `w: Widget` is written in the source, so `w.frobnicate()` is not a
+        // guess — no `~`. (Before receiver typing this same call resolved only
+        // because the method name happened to be unique codebase-wide.)
         let (g, dir) = graph(&[
             ("src/a.rs", "pub struct Widget;\nimpl Widget { pub fn frobnicate(&self) {} }\n"),
             ("src/b.rs", "use crate::a::Widget;\npub fn run(w: Widget) { w.frobnicate(); }\n"),
+        ]);
+        let out = callers(&g, "frobnicate", false);
+        assert!(out.contains("b::run"), "{out}");
+        assert!(!out.contains("frobnicate~"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn opaque_receiver_edge_is_flagged_heuristic() {
+        // A `for` binding carries no declared type, so the only reason this
+        // resolves is that the method name is unique codebase-wide: `~`.
+        let (g, dir) = graph(&[
+            ("src/a.rs", "pub struct Widget;\nimpl Widget { pub fn frobnicate(&self) {} }\n"),
+            (
+                "src/b.rs",
+                "use crate::a::Widget;\npub fn run(ws: Vec<Widget>) { for w in ws { w.frobnicate(); } }\n",
+            ),
         ]);
         let out = callers(&g, "frobnicate", false);
         assert!(out.contains("b::run"), "{out}");
@@ -1712,7 +2609,7 @@ mod tests {
         let out = callers(&g, "install", false);
         assert!(out.contains("guide"), "{out}");
         // The dead link surfaces in the coverage report's broken-links section.
-        let cov = coverage_report(&g, &[], false);
+        let cov = coverage_report(&g, &[], false, false);
         assert!(cov.contains("## Broken links"), "{cov}");
         assert!(cov.contains("./ghost.md"), "{cov}");
         assert!(!cov.contains("./setup.md"), "resolved link must not be broken:\n{cov}");
@@ -1720,13 +2617,15 @@ mod tests {
     }
 
     #[test]
-    fn coverage_separates_internal_std_and_blind_spots() {
+    fn coverage_separates_internal_external_and_blind_spots() {
         let src = "pub fn helper() {}\n\
                    pub fn run() { helper(); let v: Vec<i32> = Vec::new(); v.len(); }\n";
         let (g, dir) = graph(&[("src/a.rs", src)]);
-        let out = coverage_report(&g, &[("cpp".to_string(), 2)], false);
+        let out = coverage_report(&g, &[("cpp".to_string(), 2)], false, false);
         assert!(out.contains("internal edges:"), "{out}");
-        assert!(out.contains("std / builtin:"), "{out}"); // v.len()
+        // `Vec::new()` and `v.len()` are provably external, not misses.
+        assert!(out.contains("external (provable): 2"), "{out}");
+        assert!(out.contains("unresolved internal: 0"), "{out}");
         assert!(out.contains(".cpp"), "{out}"); // blind spot listed
         let _ = fs::remove_dir_all(dir);
     }

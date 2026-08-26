@@ -22,7 +22,7 @@ use view::View;
 #[command(
     name = "ctx",
     version,
-    about = "Deterministic AST skeleton maps of a codebase for agent context injection"
+    about = "Queryable code graph for coding agents: call graphs, blast radius, API breakage, cross-language parity"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -163,10 +163,41 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
     },
+    /// Forward call tree from a symbol — what actually runs underneath it
+    /// (add --reverse for the inbound tree: what reaches it)
+    Trace {
+        /// Function/method name, bare or qualified (Type::method)
+        name: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// How many call hops to expand
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+        /// Walk callers instead of callees
+        #[arg(long)]
+        reverse: bool,
+        #[arg(long, value_enum, default_value_t = Format::Md)]
+        format: Format,
+    },
+    /// Shortest call path between two symbols — how execution gets from A to B
+    Path {
+        /// Starting function/method
+        from: String,
+        /// Destination function/method
+        to: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, value_enum, default_value_t = Format::Md)]
+        format: Format,
+    },
     /// Coverage report: how much of the call graph resolved, and blind spots
     Doctor {
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Print the full per-name census behind the numbers: every callee
+        /// ctx could not pin, and every name it classified as external
+        #[arg(long)]
+        explain: bool,
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
     },
@@ -325,17 +356,13 @@ fn snippet_for(g: &Graph) -> String {
             s.len()
         })
         .sum();
-    let prose_pct = if all_bytes == 0 {
-        0
-    } else {
-        prose_bytes * 100 / all_bytes
-    };
+    let prose_pct = (prose_bytes * 100).checked_div(all_bytes).unwrap_or(0);
 
     let (sites, resolved): (usize, usize) = g
         .modules
         .iter()
         .fold((0, 0), |(s, r), m| (s + m.diag.call_sites, r + m.diag.resolved));
-    let resolve_pct = if sites == 0 { 0 } else { resolved * 100 / sites };
+    let resolve_pct = (resolved * 100).checked_div(sites).unwrap_or(0);
 
     let mut out = String::from("<!-- ctx:begin — regenerate with `ctx snippet` -->\n");
     out.push_str("## Codebase Discovery\n\n");
@@ -558,12 +585,37 @@ fn main() -> Result<()> {
                 query::core(&g, limit, churn_map.as_ref(), matches!(format, Format::Json))
             );
         }
-        Cmd::Doctor { path, format } => {
+        Cmd::Trace {
+            name,
+            path,
+            depth,
+            reverse,
+            format,
+        } => {
+            let g = extract::build_graph(&path)?;
+            print!(
+                "{}",
+                query::trace(&g, &name, depth, reverse, matches!(format, Format::Json))
+            );
+        }
+        Cmd::Path {
+            from,
+            to,
+            path,
+            format,
+        } => {
+            let g = extract::build_graph(&path)?;
+            print!(
+                "{}",
+                query::path(&g, &from, &to, matches!(format, Format::Json))
+            );
+        }
+        Cmd::Doctor { path, explain, format } => {
             let g = extract::build_graph(&path)?;
             let unsupported = extract::unsupported_census(&path);
             print!(
                 "{}",
-                query::coverage_report(&g, &unsupported, matches!(format, Format::Json))
+                query::coverage_report(&g, &unsupported, explain, matches!(format, Format::Json))
             );
         }
         Cmd::Changed {

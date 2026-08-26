@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, HashMap};
+
 use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
 
@@ -45,7 +47,7 @@ fn module_level_item(root: Node, src: &str) -> Option<Item> {
         {
             continue;
         }
-        raw_calls.extend(collect_calls(child, src));
+        raw_calls.extend(collect_calls(child, src, &TypeEnv::default()));
     }
     if raw_calls.is_empty() {
         return None;
@@ -60,6 +62,8 @@ fn module_level_item(root: Node, src: &str) -> Option<Item> {
         arity: None,
         name: None,
         raw_calls,
+        implements: Vec::new(),
+        field_types: BTreeMap::new(),
     })
 }
 
@@ -155,7 +159,8 @@ fn definition(
         "function_declaration" => {
             let body = decl.child_by_field_name("body");
             let sig = head(decl, body, src);
-            let calls = body.map(|b| collect_calls(b, src)).unwrap_or_default();
+            let env = fn_env(decl, src);
+            let calls = body.map(|b| collect_calls(b, src, &env)).unwrap_or_default();
             ("fn", sig, Vec::new(), calls)
         }
         "class_declaration" | "abstract_class_declaration" => {
@@ -191,7 +196,108 @@ fn definition(
     if kind == "fn" {
         it.arity = arity_from(decl);
     }
+    if matches!(kind, "class" | "interface") {
+        it.implements = heritage(decl, src);
+        if let Some(b) = decl.child_by_field_name("body") {
+            it.field_types = property_types(b, src);
+        }
+    }
     items.push(it);
+}
+
+/// `class A extends B implements C, D` / `interface A extends B` — the
+/// abstractions a call may dispatch through.
+fn heritage(decl: Node, src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut c = decl.walk();
+    for ch in decl.named_children(&mut c) {
+        if !matches!(ch.kind(), "class_heritage" | "extends_type_clause" | "implements_clause" | "extends_clause") {
+            continue;
+        }
+        let mut h = ch.walk();
+        let mut nodes: Vec<Node> = ch.named_children(&mut h).collect();
+        if nodes.is_empty() {
+            nodes = vec![ch];
+        }
+        for n in nodes {
+            let mut hh = n.walk();
+            let inner: Vec<Node> = n.named_children(&mut hh).collect();
+            let targets = if inner.is_empty() { vec![n] } else { inner };
+            for t in targets {
+                if let Some(name) = type_name(&collapse(text(t, src))) {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Declared property types of a class body: `private engine: Engine`.
+fn property_types(body: Node, src: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut c = body.walk();
+    for m in body.named_children(&mut c) {
+        if !matches!(m.kind(), "public_field_definition" | "property_signature") {
+            continue;
+        }
+        let (Some(n), Some(t)) = (
+            m.child_by_field_name("name"),
+            m.child_by_field_name("type"),
+        ) else {
+            continue;
+        };
+        if let Some(ty) = type_name(&collapse(text(t, src))) {
+            out.insert(text(n, src).to_string(), ty);
+        }
+    }
+    out
+}
+
+/// The bare class/interface name a TypeScript type annotation points at, or
+/// None when it carries no dispatch information (`string`, `Foo[]`, unions).
+fn type_name(raw: &str) -> Option<String> {
+    let t = raw.trim().trim_start_matches(':').trim();
+    let t = t.strip_prefix("readonly ").unwrap_or(t).trim();
+    // `Promise<Foo>` / `Array<Foo>` wrap a value; the receiver is the wrapper.
+    let base = t.split(['<', '|', '&', '[', '(']).next().unwrap_or(t).trim();
+    let base = base.rsplit('.').next().unwrap_or(base).trim();
+    if base.is_empty() || !base.chars().next().is_some_and(char::is_uppercase) {
+        return None;
+    }
+    Some(base.to_string())
+}
+
+/// Receiver types ctx can name inside one TypeScript body.
+#[derive(Default, Clone)]
+struct TypeEnv {
+    vars: HashMap<String, String>,
+}
+
+fn fn_env(node: Node, src: &str) -> TypeEnv {
+    let mut env = TypeEnv::default();
+    let Some(params) = node.child_by_field_name("parameters") else {
+        return env;
+    };
+    let mut c = params.walk();
+    for p in params.named_children(&mut c) {
+        let (Some(pat), Some(ty)) = (
+            p.child_by_field_name("pattern"),
+            p.child_by_field_name("type"),
+        ) else {
+            continue;
+        };
+        let name = text(pat, src).trim().to_string();
+        if name.is_empty() || name.contains(['{', '[']) {
+            continue;
+        }
+        if let Some(t) = type_name(&collapse(text(ty, src))) {
+            env.vars.insert(name, t);
+        }
+    }
+    env
 }
 
 /// `const Name = (…) => {…}` / `export const X = …`. Arrow/function values
@@ -228,7 +334,8 @@ fn lexical(
                 .child_by_field_name("parameters")
                 .map(|p| collapse(text(p, src)))
                 .unwrap_or_else(|| "()".to_string());
-            let calls = body.map(|b| collect_calls(b, src)).unwrap_or_default();
+            let env = fn_env(v, src);
+            let calls = body.map(|b| collect_calls(b, src, &env)).unwrap_or_default();
             ("fn", format!("const {name} = {params} =>"), calls)
         } else {
             ("const", format!("const {name}"), Vec::new())
@@ -261,9 +368,10 @@ fn class_members(body: Node, src: &str) -> Vec<Item> {
         if name.starts_with('#') {
             continue;
         }
+        let env = fn_env(m, src);
         let calls = m
             .child_by_field_name("body")
-            .map(|b| collect_calls(b, src))
+            .map(|b| collect_calls(b, src, &env))
             .unwrap_or_default();
         let mut it = mk("fn", head_txt, m, src, Vec::new(), Some(name));
         it.raw_calls = calls;
@@ -308,44 +416,83 @@ fn enum_sig(decl: Node, body: Option<Node>, src: &str) -> String {
     }
 }
 
-/// Collect call sites in a body: `f()` (free), `this.m()` (self), and
-/// `obj.m()` (opaque receiver).
-fn collect_calls(body: Node, src: &str) -> Vec<RawCall> {
-    let mut out = Vec::new();
+/// Collect call sites in a body: `f()` (free), `this.m()` (self),
+/// `this.field.m()` (property type), and `obj.m()` (typed if a parameter
+/// annotation, `let x: Foo`, or `new Foo()` says what `obj` is).
+fn collect_calls(body: Node, src: &str, env: &TypeEnv) -> Vec<RawCall> {
+    let mut env = env.clone();
+    let mut call_nodes: Vec<Node> = Vec::new();
     let mut stack = vec![body];
     while let Some(n) = stack.pop() {
-        if n.kind() == "call_expression" {
-            if let Some(f) = n.child_by_field_name("function") {
-                match f.kind() {
-                    "identifier" => out.push(RawCall {
-                        path: text(f, src).to_string(),
-                        recv: Receiver::Free,
-                    }),
-                    "member_expression" => {
-                        if let Some(prop) = f.child_by_field_name("property") {
-                            let is_self = f
-                                .child_by_field_name("object")
-                                .is_some_and(|o| o.kind() == "this");
-                            out.push(RawCall {
-                                path: text(prop, src).to_string(),
-                                recv: if is_self {
-                                    Receiver::SelfType
-                                } else {
-                                    Receiver::Unknown
-                                },
-                            });
-                        }
-                    }
-                    _ => {}
+        match n.kind() {
+            "variable_declarator" => {
+                if let Some((name, ty)) = declarator_binding(n, src) {
+                    env.vars.insert(name, ty);
                 }
             }
+            "call_expression" => call_nodes.push(n),
+            _ => {}
         }
         let mut c = n.walk();
         for ch in n.named_children(&mut c) {
             stack.push(ch);
         }
     }
+    call_nodes.reverse();
+    let mut out = Vec::new();
+    for n in call_nodes {
+        let Some(f) = n.child_by_field_name("function") else { continue };
+        match f.kind() {
+            "identifier" => out.push(RawCall {
+                path: text(f, src).to_string(),
+                recv: Receiver::Free,
+            }),
+            "member_expression" => {
+                let Some(prop) = f.child_by_field_name("property") else { continue };
+                let recv = match f.child_by_field_name("object") {
+                    Some(o) if o.kind() == "this" => Receiver::SelfType,
+                    // `this.field.m()`
+                    Some(o) if o.kind() == "member_expression" => {
+                        match (o.child_by_field_name("object"), o.child_by_field_name("property")) {
+                            (Some(inner), Some(fld)) if inner.kind() == "this" => {
+                                Receiver::SelfField(text(fld, src).to_string())
+                            }
+                            _ => Receiver::Unknown,
+                        }
+                    }
+                    Some(o) if o.kind() == "identifier" => env
+                        .vars
+                        .get(text(o, src))
+                        .cloned()
+                        .map_or(Receiver::Unknown, Receiver::Typed),
+                    _ => Receiver::Unknown,
+                };
+                out.push(RawCall {
+                    path: text(prop, src).to_string(),
+                    recv,
+                });
+            }
+            _ => {}
+        }
+    }
     out
+}
+
+/// `const x: Foo = ...` / `const x = new Foo()` — the declarator forms that
+/// name a type.
+fn declarator_binding(n: Node, src: &str) -> Option<(String, String)> {
+    let name = field_text(n, "name", src)?;
+    if let Some(ty) = n.child_by_field_name("type") {
+        if let Some(t) = type_name(&collapse(text(ty, src))) {
+            return Some((name, t));
+        }
+    }
+    let value = n.child_by_field_name("value")?;
+    if value.kind() != "new_expression" {
+        return None;
+    }
+    let ctor = value.child_by_field_name("constructor")?;
+    type_name(&collapse(text(ctor, src))).map(|t| (name, t))
 }
 
 /// `import D, { a, b as c } from './x'` / `import * as ns from './x'` /
@@ -516,6 +663,8 @@ fn mk(
         arity: None,
         name,
         raw_calls: Vec::new(),
+        implements: Vec::new(),
+        field_types: BTreeMap::new(),
     }
 }
 

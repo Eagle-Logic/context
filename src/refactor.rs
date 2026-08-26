@@ -31,17 +31,10 @@ pub struct ImportSite<'a> {
     pub rewritten: String,
 }
 
-fn sep(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Rust => "::",
-        Lang::Python | Lang::TypeScript | Lang::Markdown => ".",
-    }
-}
-
 /// Path form of a module name in `lang`'s import syntax.
 fn as_path(name: &str, lang: Lang) -> String {
     let from_sep = if name.contains("::") { "::" } else { "." };
-    name.split(from_sep).collect::<Vec<_>>().join(sep(lang))
+    name.split(from_sep).collect::<Vec<_>>().join(Lang::sep(lang))
 }
 
 /// Suggested on-disk destination for a module's file.

@@ -1,4 +1,14 @@
-use crate::model::{Graph, Item, Module};
+use crate::model::{Call, Graph, Item, Module};
+
+/// An edge with its confidence marker: `~` receiver-inferred, `*` one branch
+/// of a dispatch fan-out.
+pub fn edge_str(c: &Call) -> String {
+    match (c.heuristic, c.dispatch) {
+        (_, true) => format!("{}*", c.to),
+        (true, _) => format!("{}~", c.to),
+        _ => c.to.clone(),
+    }
+}
 
 pub fn markdown(g: &Graph) -> String {
     let mut out = String::new();
@@ -7,7 +17,9 @@ pub fn markdown(g: &Graph) -> String {
         "Deterministic AST skeleton: module topology and signatures only, no implementation bodies.\n",
     );
     out.push_str(
-        "Call edges: `→ name` resolved via import/path; `name~` inferred by receiver heuristic.\n",
+        "Call edges: `→ name` resolved via import/path or declared receiver type; `name~`\n\
+         inferred by receiver heuristic (trust less); `name*` one branch of a dynamic-dispatch\n\
+         fan-out (trait object / interface / bounded generic — exactly one branch runs).\n",
     );
     out.push_str(&format!(
         "root: {} | files: {} | modules: {}\n",
@@ -63,13 +75,7 @@ fn item_md(i: &Item, depth: usize, out: &mut String) {
         let edges: Vec<String> = i
             .calls
             .iter()
-            .map(|c| {
-                if c.heuristic {
-                    format!("{}~", c.to)
-                } else {
-                    c.to.clone()
-                }
-            })
+            .map(edge_str)
             .collect();
         out.push_str(&format!(" → {}", edges.join(", ")));
     }

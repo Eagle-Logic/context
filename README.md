@@ -1,88 +1,87 @@
 # context (`ctx`)
 
-Deterministic AST skeleton maps of a codebase, built for ultra-dense context
-injection into coding agents (Claude Code in particular).
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-`ctx` parses Rust, Python, TypeScript/TSX, and Markdown sources, strips every
-implementation body, and emits a compact, deterministic topology map:
+**A queryable code graph for coding agents.** Not a map you paste at boot — a
+set of queries an agent runs mid-task: *who calls this, how does execution get
+here, what breaks if I change it, what must a move touch, does my port still
+match the original.*
 
-- **Nodes** — modules, structs/enums/traits/impls, classes, functions
-  (signature + file + line).
-- **Edges** — resolved internal import edges (`deps:`) and external
-  crates/packages (`extern:`).
-
-No embeddings, no fuzzy retrieval. The map is a pure function of the source
-tree: same code in, same map out.
-
-## Usage
+One Rust binary. Tree-sitter for Rust, Python, TypeScript/TSX, and Markdown. No
+language servers, no embeddings, no index to warm. The graph is a pure function
+of the source tree — same code in, same answer out — and it builds in ~100 ms,
+so every query runs against current source.
 
 ```sh
-cargo install --path .
+$ ctx callers resolve_call
+1 caller(s) of 'resolve_call':
 
-# Strategy A: full map for session boot (small/medium repos)
-ctx map ~/projects/myrepo -o CODEBASE_MAP.md
+extract::Walk::rec  (src/extract/mod.rs:1473)  → resolve_call
 
-# Strategy B: pruned slice for large repos — one module plus its
-# immediate upstream (dependencies) and downstream (dependents)
-ctx subtree core::inference ~/projects/myrepo
-
-# Global high-level view: module list + dependency edges only
-ctx modules ~/projects/myrepo
-
-# Where is a symbol defined? (jump-to-def without knowing the module)
-ctx def SteerConfig ~/projects/myrepo
-ctx def 'Type::method' ~/projects/myrepo   # qualified to disambiguate
-
-# Who calls this? (resolved reverse call edges — the blast radius)
-ctx callers basename ~/projects/myrepo
-
-# Everything needed to edit a symbol, in one call (def + types + callees + callers)
-ctx context streamChat ~/projects/myrepo --max-tokens 4000
-
-# The modules that matter most (dependency centrality; --churn weights by volatility)
-ctx core ~/projects/myrepo
-ctx core ~/projects/myrepo --churn
-
-# Breaking-change check: public API removed/changed since a ref + who breaks
-ctx changed --api ~/projects/myrepo --since main
-ctx changed --api --strict --since main    # exit non-zero on a removal — for CI
-
-# Coverage / blind-spot report: how much resolved, where to distrust
-ctx doctor ~/projects/myrepo
-
-# Impact map of your current diff: changed modules + deps + callers
-ctx changed ~/projects/myrepo              # working tree vs HEAD
-ctx changed ~/projects/myrepo --since main # vs a ref/branch
-
-# Structural diff between two refs (review a whole branch/PR)
-ctx diff main..feature ~/projects/myrepo        # changed modules + who they break
-ctx diff main..feature ~/projects/myrepo --api  # breaking API changes across the range
-
-# Fit a map to a token budget (hard cap: reduces detail, then prunes
-# least-central modules; never truncates within a kept module)
-ctx map ~/projects/myrepo --max-tokens 8000
-
-# Cross-language parity: is the Rust port faithful to the Python source?
-ctx parity research/gate.py src/gate.rs                    # missing / arity drift / dropped calls
-ctx parity research/gate.py src/gate.rs --aliases py-rust  # bridge __init__→new etc.
-ctx parity research/gate.py src/gate.rs --strict           # exit non-zero if anything is missing
-
-# Machine-readable graph
-ctx map ~/projects/myrepo --format json
-
-# Print the recommended CLAUDE.md discovery-protocol block
-ctx snippet >> ~/projects/myrepo/CLAUDE.md
+completeness: no call site named `resolve_call` went unresolved anywhere in this
+tree — this blast radius is complete to the limit of what ctx parses.
 ```
 
-`core` ranks modules by dependency centrality — PageRank over the module
-graph, so the modules everything else leans on float to the top. It's the
-"where's the heart of this codebase" answer for an unfamiliar repo, computed
-deterministically rather than guessed.
+That last line is the whole idea. The answer travels with its own limits.
 
-`changed --api` is a pre-merge safety gate: it builds the public API surface both
-at a base ref (in a throwaway detached worktree) and in the working tree, then
-reports the public items that were **removed** or whose **signature changed** —
-each with the callers it breaks — plus additions as non-breaking.
+## Four things you won't find elsewhere
+
+### 1. Every edge tells you how much to trust it
+
+Every static analyzer guesses. `ctx` is the one that says where.
+
+An edge backed by a resolved import, a path, a `self` receiver, or a declared
+type is unmarked — rely on it. An edge inferred from an *opaque* receiver
+(`expr.method()`, where nothing in the source states the type) is marked `~`. A
+branch of a dynamic-dispatch fan-out is marked `*`. And `ctx doctor` names
+**every callee it could not pin at all**, with counts:
+
+```
+## Internal recall — the number to trust
+  1001/1040 = 96.2%   of call sites that could be internal, ctx pinned this many.
+
+## What ctx missed (callee names that exist here but went unpinned)
+grep these; every other edge in the map is one ctx could prove.
+     26  walk
+      7  context
+      2  path
+
+## Low-confidence zones (edges to distrust — grep to confirm)
+  parity                           26% heuristic (10/38 edges)
+```
+
+The recall number comes with the exact grep list for everything it doesn't
+cover. The denominator is honest too: a call into `std` or a third-party crate
+is excluded, because no internal edge could exist for it however good the
+resolver gets — and that classification is by evidence (is this name defined
+anywhere under the root?), not a hardcoded list.
+
+Heuristic method attribution is also **language-scoped**. A unique method name is
+evidence only within one language; across languages it is coincidence, so
+`tok.apply_chat_template(...)` in Python is never attributed to a Rust method of
+the same name. Before that guard, 45 of 50 reported callers of that name were
+artifacts and ~18% of module dep edges were impossible Python→Rust edges — which
+then distorted `core`'s ranking.
+
+The honest bit isn't that coverage is high. It's that the gaps are enumerable.
+
+### 2. `changed --api` — a breaking-change gate that names who breaks
+
+Builds the public API surface at a base ref (in a throwaway detached worktree)
+and in the working tree, then reports what was **removed** or whose
+**signature changed** — each with the callers it breaks.
+
+```sh
+$ ctx changed --api --since HEAD~1
+# API changes vs HEAD~1
+0 removed, 4 changed, 7 added.
+
+## Changed signature — potentially breaking
+- query::coverage_report  [fn]  (src/query.rs:1420)
+    was: pub fn coverage_report(g: &Graph, unsupported: &[(String, usize)], json_out: bool) -> String
+    now: pub fn coverage_report(g: &Graph, unsupported: &[(String, usize)], explain: bool, json_out: bool) -> String
+    callers (5): mcp::dispatch, query::tests::coverage_separates_internal_external_and_blind_spots, …
+```
 
 `--strict` turns it into a CI gate, and fails **only on removals**. That asymmetry
 is deliberate. A removal is unambiguous: nothing can call what is gone. A
@@ -95,63 +94,241 @@ changes are reported, and under `--strict` say explicitly that they were reporte
 and not failed.
 
 Treat it as a tripwire that surfaces an unintended removal in review, not as a
-semver authority — a language-specific tool with a type system (`cargo-semver-checks`,
-`apidiff`, `japicmp`) is stricter within its language. The trade ctx makes is
-breadth: one gate across Rust, Python and TypeScript in a polyglot repo.
+semver authority — a language-specific tool with a type system
+(`cargo-semver-checks`, `apidiff`, `japicmp`) is stricter within its language. The
+trade ctx makes is breadth: one gate across Rust, Python and TypeScript in a
+polyglot repo.
 
 ```yaml
 # .github/workflows/ci.yml — PR-only; fetch-depth 0, the default shallow clone
 # has no merge base.
 - uses: actions/checkout@v7
   with: { fetch-depth: 0 }
-- run: cargo install --git https://github.com/Eagle-Logic/context --locked
+- run: cargo install code-context --locked
 - run: ctx changed --api --strict --since "origin/${{ github.base_ref }}"
 ```
 
-`context` is the agent-native command: one call returns the definition, the
-type definitions referenced in its signature, its callees, and its callers —
-trimmed to `--max-tokens` — so an agent can gather the full editing context
-for a symbol without a map→def→callers→subtree dance.
+This isn't a context tool. It's CI.
 
-`doctor` is a coverage/blind-spot report — deliberately honest about what `ctx`
-does *not* model. It splits every call site into internal edges resolved
-(with the heuristic `~` share), ubiquitous std/builtin calls (never edged by
-design), and external/unpinned calls, then lists the low-confidence modules
-(high `~` ratio) and the source files it can't parse at all (`.cpp`, `.go`,
-…). Run it once on a new repo to calibrate how much to trust the map — and to
-know exactly when to fall back to grep.
+### 3. `move-plan` — a refactor oracle, not an actuator
 
-`changed` turns a diff into an impact map: it runs `git diff` (working tree
-vs HEAD, or vs `--since <ref>`, including untracked files), maps the changed
-files onto modules, and renders those modules plus their upstream
-dependencies and — the point — their **downstream callers**, i.e. everything
-a review should re-check. An unborn HEAD or a clean tree is handled without
-error.
+`move-plan <from> <to>` emits every site a module relocation must touch;
+`move-verify` checks the result. **ctx never writes source files.**
 
-`diff <A>..<B>` is `changed` between two arbitrary refs — the whole-branch /
-whole-PR view. It maps the file changes onto **B's** module graph (built in a
-throwaway worktree when B is a ref; the working tree when B is omitted, as in
-`ctx diff main`), so the topology reflects the target state. `--api` runs the
-breaking-change surface diff across the same range. `A...B` is accepted and
-treated like `A..B`.
+```sh
+ctx move-plan native::gate native::routing::gate   # file move + every import rewrite
+# ... agent applies the edits ...
+ctx move-verify native::gate native::routing::gate # exits non-zero if anything is orphaned
+```
 
-`map --max-tokens <N>` fits the output to a budget and is a **hard cap**. It
-first reduces detail, emitting the richest view at or below `--view` whose
-(~`len/4`) token count fits, and reports the view it chose on stderr. When even
-`skeleton` is over budget, detail is exhausted and the only remaining lever is
-dropping modules, so the least-central ones are pruned (PageRank, the same
-ranking `core` uses) until the map fits. The output states what was omitted, and
-dependency edges still name pruned modules — that name is what to feed
-`subtree`/`context` next.
+The reasoning: an agent can already make edits cheaply and precisely. What it
+cannot do is know it found *every* site, or prove nothing was orphaned. The
+scarce thing is ground truth, not typing — and staying read-only keeps ctx free
+of partial application and undo semantics.
 
-Items inside a kept module are never truncated: you get fewer modules, each
-still whole. Only when a single module alone exceeds the budget does `ctx` emit
-an over-budget map, and it says so on stderr. Without `--max-tokens`, nothing is
-ever pruned.
+Scope is bounded by what ctx can prove. Moves ride on import and link resolution
+— path arithmetic, deterministic, non-heuristic — which is ctx's strongest
+signal, so the site list is exact for the languages it parses. Dependents reached
+only by receiver inference have no literal string to rewrite and are listed
+separately as *unverified*, never mixed in with real sites. Rust `mod`
+declarations are not imports, so the plan names them as a required manual step
+rather than omitting them silently. Renaming a *method* is deliberately not
+offered: it would ride on receiver inference, which resolves a minority of call
+sites, and a plan built on that would silently miss some.
 
-`callers` reports its own recall, and **never claims completeness**. Reverse edges
-exist only for calls that resolved, and resolution drops rather than guesses, so
-the result is a floor. Two loss channels are knowable and are reported in band:
+### 4. `parity` — cross-language port fidelity
+
+Porting Python to Rust, or TypeScript to Python? `parity` answers "is this port
+a faithful structural copy?" Because the item model is language-neutral, a
+source module and its port are two renderings of one skeleton.
+
+```sh
+$ ctx parity research/gate.py src/gate.rs --aliases py-rust
+# ctx parity — source → port
+source 6 members · target 5 · aligned 5 (83% of source) · 1 via alias
+
+## Missing in port (1) — in source, no counterpart in target
+  fn   Gate.record                  gate.py:18
+
+## Arity drift (1)
+  fn   Gate.score               source=2 → port=1   gate.py:7
+
+## Aligned via alias (1) — matched through a rename rule, not exactly
+  fn   Gate.__init__  →  Gate.new   (via init → new)
+
+parity: 5/6 source aligned · 1 missing · 1 arity · 0 call · 0 moved
+```
+
+A dropped method, a dropped parameter, and the `__init__`→`new` rename, in one
+command. `--strict` exits non-zero on any missing member. I'm not aware of
+another tool that does this. It might be more or less useful depending on your
+specific languages and abstractions.
+
+## "How is this different from aider's repo map?"
+
+Aider's repo map — and the MCP servers that repackage it, like RepoMapper —
+compresses a repository into a **ranked blob** that gets injected at the start
+of a session, sized to a token budget. It's a good answer to "what is this
+codebase" for a model that has seen none of it.
+
+`ctx` answers a different question. Once the agent is *in* a task, it doesn't
+need the repo ranked — it needs specific facts: `trace`, `path`, `callers`,
+`context`, `changed --api`, `move-plan`, `parity`. Those are queries mid-task,
+not a blob at boot. Ranking is one small command here (`ctx core`), not the
+product.
+
+The nearer comparison is **Serena**, which does LSP-backed symbol navigation.
+Against it, `ctx` trades semantic precision for two things:
+
+| | `ctx` | LSP-based (Serena) |
+|---|---|---|
+| setup | one binary, grammars compiled in | a language server per language, configured and running |
+| startup | ~100 ms graph build, per query | server warm-up, project indexing |
+| determinism | pure function of the source tree | depends on server state, versions, build artifacts |
+| uncertainty | marked per edge (`~`, `*`) + a miss census | resolved or absent, silently |
+| coverage | 4 languages (today), one graph across all of them | as many as you install servers for |
+
+If you need type-perfect resolution inside one language, use an LSP. If you
+want the same graph across a polyglot repo with nothing to install and answers
+that state their own confidence, that's this.
+
+`ctx` does ship the boot map too (`ctx map`), so you can have it if you want it.
+But we'll say plainly what dogfooding taught us: it's the least useful thing
+here. [More on why](#maps-when-you-want-them).
+
+## Install
+
+Requires a Rust toolchain (1.85+).
+
+```sh
+cargo install code-context
+
+# or from git
+cargo install --git https://github.com/Eagle-Logic/context
+
+# or from a clone
+git clone https://github.com/Eagle-Logic/context
+cd context && cargo install --path .
+```
+
+The crate is `code-context`; the binary it installs is `ctx`. Single binary, no
+runtime dependencies — the tree-sitter grammars are compiled in.
+
+## The queries
+
+```sh
+# Everything needed to edit a symbol, in one call (def + types + callees + callers)
+ctx context streamChat --max-tokens 4000
+
+# Who calls this? (resolved reverse call edges — the blast radius)
+ctx callers basename
+
+# How does execution get here? (transitive call tree, not one hop)
+ctx trace decode_step --depth 4
+ctx trace decode_step --reverse       # everything that reaches it
+
+# The shortest call path between two symbols, hop by hop
+ctx path main flush_kv_cache
+
+# Where is a symbol defined? (jump-to-def without knowing the module)
+ctx def SteerConfig
+ctx def 'Type::method'                # qualified to disambiguate
+
+# Breaking-change gate: public API removed/changed since a ref + who breaks
+ctx changed --api --since main
+ctx changed --api --strict --since main   # exit non-zero on a removal — for CI
+
+# Plan a module move, then prove it landed
+ctx move-plan native::gate native::routing::gate
+ctx move-verify native::gate native::routing::gate
+
+# Impact map of your current diff: changed modules + deps + callers
+ctx changed                           # working tree vs HEAD
+ctx changed --since main
+
+# Structural diff between two refs (review a whole branch/PR)
+ctx diff main..feature                # changed modules + who they break
+ctx diff main..feature --api          # breaking API changes across the range
+
+# Cross-language parity: is the Rust port faithful to the Python source?
+ctx parity research/gate.py src/gate.rs
+ctx parity research/gate.py src/gate.rs --aliases py-rust   # bridge __init__→new
+ctx parity research/gate.py src/gate.rs --strict            # non-zero if missing
+
+# Coverage report: internal call-graph recall + exactly what went unpinned
+ctx doctor
+ctx doctor --explain                  # full per-name census
+
+# The modules that matter most (dependency centrality; --churn weights by volatility)
+ctx core
+ctx core --churn
+
+# Boot maps, when you do want the blob
+ctx map -o CODEBASE_MAP.md            # full map
+ctx map --view skeleton               # architecture only, cheapest
+ctx map --max-tokens 8000             # hard cap: reduces detail, then prunes
+ctx subtree core::inference           # one module + upstream + downstream
+ctx modules                           # module list + dep edges only
+
+# Scoping (global, repeatable)
+ctx map --lang code                   # Rust/Python/TypeScript only, no prose
+ctx map --exclude 'docs/archive/**'   # vendored trees, dead code
+
+# Machine-readable
+ctx map --format json
+
+# Print the CLAUDE.md discovery block, measured for this repo
+ctx snippet >> CLAUDE.md
+```
+
+Every command except `parity` takes a repo path as its last positional argument,
+defaulting to `.`; `parity` takes a source and one or more targets instead.
+
+### Scoping the scan
+
+`--exclude '<glob>'` and `--lang` are global, repeatable flags. Vendored trees,
+archived docs and dead code are usually tracked, so `.gitignore` will not exclude
+them: `--exclude 'docs/archive/**'`. And because a docs tree can dominate a *code*
+map — 78% of one 720-module repo's skeleton view — `--lang code` restricts the
+scan to Rust/Python/TypeScript, cutting that map from ~169k to ~35k tokens.
+
+Module names are unique. They derive from paths, so `src/lib.rs` and `src/main.rs`
+both want to be `crate`, and a `native/README.md` collides with the
+`src/native/mod.rs` it documents. Because resolution indexes by name, a collision
+used to make one module unreachable and silently drop its reverse edges. Code now
+keeps the bare name, prose is renamed to `name@stem`, and every rename is reported
+on stderr.
+
+### Execution tracing
+
+`callers` answers "who calls this" for exactly one hop. `trace` walks the call
+graph transitively — forward (what runs underneath a symbol) or `--reverse`
+(everything that reaches it) — cutting cycles and repeated subtrees with a
+marker instead of expanding forever. `path <from> <to>` gives the shortest route
+between two symbols:
+
+```
+$ ctx path main coverage_report
+# path: main → coverage_report  (5 hop(s))
+~ heuristic edge (verify) · * one branch of a dispatch fan-out
+
+crate::main  [src/main.rs:443]
+  → mcp::run  [src/mcp.rs:14]
+    → mcp::handle_method  [src/mcp.rs:44]
+      → mcp::tools_call  [src/mcp.rs:132]
+        → mcp::dispatch  [src/mcp.rs:146]
+          → query::coverage_report  [src/query.rs:1420]
+```
+
+"How does a request get from `main` to here" is one command rather than a grep
+chain. Both mark each hop's confidence and report call edges that leave the
+resolved graph, so a trace never quietly implies more certainty than it has.
+
+### How `callers` reports its own limits
+
+`callers` **never claims completeness**. Reverse edges exist only for calls that
+resolved, and resolution drops rather than guesses, so the result is a floor.
+Three loss channels are knowable and reported in band:
 
 - **Ambiguous name** — more than one definition, so a call through an opaque
   receiver cannot be pinned to one of them. Prints `INCOMPLETE` with the
@@ -161,78 +338,67 @@ the result is a floor. Two loss channels are knowable and are reported in band:
   never indexed, including a project-defined method that merely shares the name.
   Prints `NOT INDEXED`, because an empty result there carries no information at
   all (`suppressed_common_name` in JSON).
+- **Measured misses for this name** — the closing completeness line counts call
+  sites bearing this name that ctx could not pin, and says where. When it reports
+  none, the confirming grep can be skipped.
 
-Both set `lower_bound: true`. The absence of a flag means "no *known* reason to
-distrust this" — not a guarantee: a call made at module level, or through a
-function-local import, can still be missed. Before changing a signature, run the
-`rg` command ctx prints. This matters because `callers` is the
+The first two set `lower_bound: true`. The absence of a flag means "no *known*
+reason to distrust this" — not a guarantee: a call made at module level, or
+through a function-local import, can still be missed. Before changing a
+signature, run the `rg` command ctx prints. This matters because `callers` is the
 pre-signature-change safety check, and "no callers" reads as "safe to change".
 
-Heuristic method attribution is **language-scoped**. A unique method name is
-evidence only within one language; across languages it is coincidence, so
-`tok.apply_chat_template(...)` in Python is no longer attributed to a Rust method
-of the same name. Before this guard, 45 of 50 reported callers of that name were
-artifacts, ~18% of module dep edges were impossible Python->Rust edges, and those
-edges distorted `core`'s ranking.
+`context`, `trace`, and `path` close with the same measured completeness line.
 
-`--exclude '<glob>'` and `--lang` are global, repeatable flags for scoping the
-scan. Vendored trees, archived docs and dead code are usually tracked, so
-`.gitignore` will not exclude them: `--exclude 'docs/archive/**'`. And because a
-docs tree can dominate a *code* map — 78% of one 720-module repo's skeleton view —
-`--lang code` restricts the scan to Rust/Python/TypeScript, cutting that map from
-~169k to ~35k tokens.
+### Naming
 
-Module names are unique. They derive from paths, so `src/lib.rs` and `src/main.rs`
-both want to be `crate`, and a `native/README.md` collides with the
-`src/native/mod.rs` it documents. Because resolution indexes by name, a collision
-used to make one module unreachable and silently drop its reverse edges. Code now
-keeps the bare name, prose is renamed to `name@stem`, and every rename is reported
-on stderr.
+`def`, `callers`, `context`, `trace`, and `path` all accept a bare name
+(`to_config`) or a qualified one (`SteerOverride::to_config`, `pkg.mod.fn`); a
+bare name lists every match so overloads are disambiguated by module +
+signature. `callers` is the inverse of the per-function `→ callee` edges in
+`map`/`subtree`: it reports only *resolved* call sites, so it's precise where a
+text grep floods on a common method name. `subtree` accepts a full module name
+(`core::inference`, `pkg.utils.validation`) or any trailing suffix
+(`inference`).
 
-`move-plan <from> <to>` is an **oracle, not an actuator**: it emits every site a
-module relocation must touch, and `move-verify` checks the result. ctx never
-writes source files. An agent can already make edits cheaply and precisely; what
-it cannot do is know it found every site or prove nothing was orphaned — so the
-scarce thing is ground truth, not typing, and staying read-only keeps ctx free of
-partial application and undo semantics.
+### More on the flagship commands
 
-```sh
-ctx move-plan native::gate native::routing::gate   # file move + every import rewrite
-# ... agent applies the edits ...
-ctx move-verify native::gate native::routing::gate # exits non-zero if anything is orphaned
-```
+`context` is the agent-native one: a single call returns the definition, the
+type definitions referenced in its signature, its callees, and its callers —
+trimmed to `--max-tokens` — so an agent gathers full editing context for a
+symbol without a map→def→callers→subtree dance.
 
-Scope is bounded by what ctx can prove. Moves ride on import and link resolution
-— path arithmetic, deterministic, non-heuristic — which is ctx's strongest signal,
-so the site list is exact for the languages it parses. Dependents reached only by
-receiver inference have no literal string to rewrite and are listed separately as
-*unverified*, never mixed in with real sites. Rust `mod` declarations are not
-imports, so the plan names them as a required manual step rather than omitting
-them silently. Renaming a *method* is deliberately not offered: it would ride on
-receiver inference, which resolves a minority of call sites, and a plan built on
-that would silently miss some.
+`changed` turns a diff into an impact map: it runs `git diff` (working tree vs
+HEAD, or vs `--since <ref>`, including untracked files), maps changed files onto
+modules, and renders those modules plus their upstream dependencies and — the
+point — their **downstream callers**, i.e. everything a review should re-check.
+An unborn HEAD or a clean tree is handled without error.
 
-`parity <source> <port>...` answers "is this port a faithful structural copy?"
-across languages. Because the `Item` model is language-neutral, a source
-module and its port are two renderings of one skeleton; parity flattens each
-into a bag of members keyed by `(container, canonical-name, role)` — collapsing
-`camelCase`/`snake_case`/`PascalCase` and treating a Rust `impl Type { fn m }`
-the same as a Python `class Type: def m` — then reports what **diverged**:
-members **missing** from the port, **arity drift** (receiver-excluded param
-count), dropped **internal calls**, **moves** (name matches, container
-differs), and **additions**. Multiple targets are compared as a union (a
-Python file that split into several Rust modules). `--strict` exits non-zero
-on any missing member, for CI. It is deterministic and **structure-only** —
-never semantics — and it leans on the port preserving names, so it is a
-faithfulness check for mechanical ports, not a similarity score for rewrites.
+`diff <A>..<B>` is `changed` between two arbitrary refs — the whole-branch /
+whole-PR view. It maps the file changes onto **B's** module graph (built in a
+throwaway worktree when B is a ref; the working tree when B is omitted, as in
+`ctx diff main`), so the topology reflects the target state. `--api` runs the
+breaking-change surface diff across the same range. `A...B` is accepted and
+treated like `A..B`.
+
+`parity` flattens each side into a bag of members keyed by
+`(container, canonical-name, role)` — collapsing `camelCase`/`snake_case`/
+`PascalCase` and treating a Rust `impl Type { fn m }` the same as a Python
+`class Type: def m` — then reports members **missing** from the port, **arity
+drift** (receiver-excluded param count), dropped **internal calls**, **moves**
+(name matches, container differs), and **additions**. Multiple targets are
+compared as a union (a Python file that split into several Rust modules). It's
+deterministic and **structure-only** — never semantics — and it leans on the
+port preserving names, so it's a faithfulness check for mechanical ports, not a
+similarity score for rewrites.
 
 Because it leans on names, `canon()` alone bridges most Python↔Rust dunder
 renames for free (it strips the underscores, so `__len__`↔`len`, `__eq__`↔`eq`,
 `__hash__`↔`hash`, `__next__`↔`next` already align). For the renames it can't —
-chiefly `__init__`→`new`, plus `__str__`→`fmt`/`to_string`, `__getitem__`→
-`index`, `__iter__`→`into_iter` — pass `--aliases py-rust`. Every alias-based
-match is reported in its own **Aligned via alias** section, never silently folded
-— so the fuzz you opted into is always visible.
+chiefly `__init__`→`new`, plus `__str__`→`fmt`/`to_string`,
+`__getitem__`→`index`, `__iter__`→`into_iter` — pass `--aliases py-rust`. Every
+alias-based match is reported in its own **Aligned via alias** section, never
+silently folded, so the fuzz you opted into stays visible.
 
 **Renamed containers are inferred.** Container is part of every member key, so
 renaming a type invalidates all of its members at once — and renaming the main
@@ -245,41 +411,62 @@ container renames** — a wrong pairing must never masquerade as a clean parity
 result — and `--alias Old=New` overrides inference when the port shares too few
 names to infer from.
 
-`def` and `callers` accept a bare name (`to_config`) or a qualified name
-(`SteerOverride::to_config`, `pkg.mod.fn`); a bare name lists every match so
-overloads are disambiguated by module + signature. `callers` is the inverse of
-the per-function `→ callee` edges in `map`/`subtree`: it reports only *resolved*
-call sites, so it is precise where a text grep floods on a common method name —
-though it inherits the resolver's heuristics (a receiver `.m()` call is
-attributed to the enclosing impl when the type is unknown).
+`core` ranks modules by dependency centrality — PageRank over the module graph,
+so the modules everything else leans on float to the top. It's the "where's the
+heart of this codebase" answer for an unfamiliar repo. This is the one command
+that overlaps what other repo-map tools do, and it's deliberately a small part
+of the surface.
 
-`subtree` accepts a full module name (`core::inference`, `pkg.utils.validation`)
-or any trailing suffix (`inference`).
+## Maps, when you want them
 
-## Detail views (the budget ladder)
+**In our own use, `map` is the least useful command here — including with
+`--max-tokens`.** It ships because it's occasionally the right tool, not because
+it's the point, and it's listed last for a reason.
 
-`map` and `subtree` take `--view` to scale detail to informational need —
-each level adds a whole category, so token spend buys precision, not noise:
+The problem isn't the output; it's the shape of the transaction. A map is
+breadth paid for up front, before you know which part you'll need, and it's
+stale the moment you edit. In practice an agent spends that budget once and then
+still runs `ctx context` on the one symbol it actually touches — which would have
+answered the question on its own, current at the moment it was asked. Budget
+fitting bounds the cost but doesn't change the economics: a cheaper blob is
+still a blob.
 
-| view | contents | 720-module polyglot repo | same, `--lang code` |
-|---|---|---|---|
-| `skeleton` (default) | modules, deps, re-exports, type names | 508 KB (~169k tok) | 105 KB (~35k tok) |
-| `interface` | + public signatures, struct fields, enum variants | 839 KB (~279k tok) | — |
-| `full` | + private items and call edges | 1.05 MB (~349k tok) | — |
+Where it does earn its place: a genuine cold start on an unfamiliar repo, a
+committed `CODEBASE_MAP.md` for humans, or feeding another tool via `--format
+json`. For everything else, reach for `context`, `trace`, `callers`, or
+`subtree` — a scoped answer beats a ranked summary, which is the whole argument
+of this README.
 
-Those are the *unbudgeted* sizes, and at that scale none of them belong in a
-context window: pass `--max-tokens` (a hard cap) or `--lang code` (79% of that
-repo's skeleton map is Markdown). Token figures are `bytes / 3`, which is
-deliberately conservative — `bytes / 4` is the familiar rule of thumb but measured
-against a real tokenizer it under-counts this tool's output by 5-23%, and a cap
-that overshoots is not a cap. On a small repo (16 modules) `full` is ~10k tokens, cheap
-enough for the first turn of a session. Sizes scale with the repo, not with the
-view alone — measure before reading. Rust visibility is `pub`-based; Python uses the
-underscore convention (dunders like `__init__` count as public); TypeScript
-uses the `export` keyword (public class methods are interface, `private`/`#`
-members are dropped). Trait methods and trait impls are always interface.
+`map` and `subtree` take `--view` to scale detail to informational need — each
+level adds a whole category, so token spend buys precision, not noise:
 
-## Output shape
+| view | contents | a 419-module Rust workspace |
+|---|---|---|
+| `skeleton` | modules, deps, re-exports, type names | 79 KB (~19k tok) |
+| `interface` | + public signatures, struct fields, enum variants | 301 KB (~75k tok) |
+| `full` (default) | + private items and call edges | 451 KB (~112k tok) |
+
+On a mid-size repo (70 files) skeleton is ~3k tokens, which is cheap enough that
+the cost isn't the objection — the objection is that it's the wrong shape.
+Rust visibility is `pub`-based; Python uses the underscore convention (dunders
+like `__init__` count as public); TypeScript uses the `export` keyword (public
+class methods are interface, `private`/`#` members are dropped). Trait methods
+and trait impls are always interface.
+
+`map --max-tokens <N>` is a **hard cap**. It first reduces detail, emitting the
+richest view at or below `--view` whose (~`len/4`) token count fits, and reports
+the view it chose on stderr. When even `skeleton` is over budget, detail is
+exhausted and the only remaining lever is dropping modules, so the least-central
+ones are pruned (PageRank, the same ranking `core` uses) until the map fits. The
+output states what was omitted, and dependency edges still name pruned modules —
+that name is what to feed `subtree`/`context` next.
+
+Items inside a kept module are never truncated: you get fewer modules, each
+still whole. Only when a single module alone exceeds the budget does `ctx` emit
+an over-budget map, and it says so on stderr. Without `--max-tokens`, nothing is
+ever pruned.
+
+### Output shape
 
 ```markdown
 ## prelude  (src/prelude.rs)
@@ -294,10 +481,14 @@ deps: encode
   - fn step(&mut self, action: Action) -> Percept  [L56]
 - impl Agent  [L192]
   - pub fn observe(&mut self, action: Option<Action>, p: &Percept)  [L204] → Agent::register_type, dist, encode::cosine
+  - pub fn drive(&mut self, env: &mut dyn Environment)  [L221] → world::Grid::step*, sim::Replay::step*
 ```
 
-A 71-file Rust repo renders to ~65 KB (~16k tokens) in under half a second —
-the entire architecture fits in one context window with room to spare.
+Two markers qualify an edge. A trailing `~` means the target was inferred from a
+receiver whose type is not written in the source — trust it less. A trailing `*`
+means the edge is one branch of a dynamic-dispatch fan-out (`dyn Trait`, `impl
+Trait`, a bounded generic, a TS `interface`, a Python base class): every
+implementation that could run is listed, and exactly one of them does.
 
 Each item also carries the first line of its doc comment (Rust `///`, Python
 docstring) as a trailing `— summary`, so a signature map doubles as a labeled
@@ -307,47 +498,43 @@ one at negligible token cost:
 - pub fn to_config(&self, n_predict: i32) -> SteerConfig  [L317] → NativeSteerInstruction::to_config  — Build a SteerConfig from the explicit knobs (gate bypassed).
 ```
 
-## Claude Code integration
+## Agent integration
 
-`ctx snippet` prints the discovery block to paste into a repo's `CLAUDE.md`
-(`ctx snippet >> CLAUDE.md`). It is the one artifact ctx emits that gets *copied*
-somewhere else, so it is the one that can go stale — a generic block telling every
-agent to "load the topology" is fine at 20 modules and catastrophic at 720, and it
-sits wrong in a repo long after the tool has learned better.
+### MCP server
 
-So the block **measures the repo it is generated for**: module count, real map
-cost, prose share, and the internal call-resolution rate, with the advice derived
-from those numbers rather than asserted. A repo whose map costs 348k tokens is
-told never to run one unbudgeted and handed the `--lang code` flag; a repo whose
-map is 258 tokens is told to just read it. It is also **delimited** by
-`<!-- ctx:begin -->` / `<!-- ctx:end -->`, so regenerating replaces it in place
-instead of appending a second, contradictory copy.
+`ctx mcp` runs a minimal MCP server over stdio (newline-delimited JSON-RPC, no
+dependencies) exposing the read-only commands as typed tools, so an agent calls
+them structured, without shelling out or a permission prompt.
 
-It stays short — a CLAUDE.md block is resident in every session forever, so
-anything reachable from `ctx <cmd> --help` on demand is left out. What remains is
-what an agent cannot derive: this repo's scale, and where ctx's own output is not
-trustworthy (1.5 KB, down from 4.3 KB).
+```sh
+claude mcp add ctx -- ctx mcp
+```
 
-**Don't commit the map.** A `CODEBASE_MAP.md` is a derived artifact — a pure
-function of the source tree, generated in well under a second — so it belongs in
-`.gitignore`, and sessions should regenerate it on demand
-(`ctx map . -o CODEBASE_MAP.md`). Committing it buys nothing, costs a ~1 MB diff
-whenever sources move, and leaves a stale copy lying around that reads as
-authoritative.
+Each tool takes a `path` argument (default `.`); `def`/`callers`/`context` also
+take `name`, and `subtree` takes `module`. The server builds the graph per call
+(~100 ms), so results are always current.
 
-Gitignoring it is also load-bearing for correctness: ctx honors `.gitignore`, so
-an ignored map is excluded from its own parse. A *tracked* map is Markdown in the
-tree, so ctx reads it back as a module of its own headings — each run then
-describes the previous run's output and generation never reaches a fixed point.
-If you must keep one tracked, list it in a `.ignore` file (honored by
-ripgrep-family tools, invisible to git) to restore idempotency.
+### Claude Code
 
-### Markdown as a graph
+`ctx snippet` prints a "Codebase Discovery" block **measured for this repo** —
+its module count, token cost, and call-resolution rate are read off your actual
+source, so the guidance is derived rather than asserted. Append it to the target
+repo's `CLAUDE.md` (`ctx snippet >> CLAUDE.md`); the block is fenced by markers,
+so regenerating replaces it in place instead of appending a second, contradictory
+copy.
+
+It teaches a query-first protocol: run `ctx context <name>` when you're about to
+touch a symbol, `ctx callers` before changing a signature, `ctx trace`/`ctx path`
+to follow control flow instead of grepping, and only read raw source for
+implementation bodies. Reaching for a whole-repo map is the exception, not the
+opening move.
+
+## Markdown as a graph
 
 A docs tree is a graph too — and unlike JSON/XML (which are trees, no
-cross-references), Markdown has both halves of ctx's model: **headings are
-the nested items** and **links are the edges**. So the same commands answer
-doc questions:
+cross-references), Markdown has both halves of ctx's model: **headings are the
+nested items** and **links are the edges**. So the same commands answer doc
+questions:
 
 - `ctx map docs/ --view skeleton` — the heading outline of the whole corpus,
   each section labelled with its first sentence.
@@ -359,77 +546,153 @@ doc questions:
 
 Files are modules (`README.md`/`index.md` collapse to their directory like an
 index file); links resolve relative to the linking file (`./x.md#section`,
-`../y.md`, `[[WikiPage]]`, and reference-style `[text][ref]` / `[ref]`)
-against GitHub-style heading slugs. A link whose file or heading doesn't exist
-is a **broken link**; external URLs are left external. `ctx doctor` lists every
-broken link (file:line → target) in its own section — an out-of-scope `../`
-link is only flagged when its target is genuinely absent from disk, not merely
-outside the scanned subtree. Prose→code resolution is not yet modelled.
-
-### MCP server
-
-`ctx mcp` runs a minimal MCP server over stdio (newline-delimited JSON-RPC,
-no dependencies) exposing the read-only commands as typed tools — `map`,
-`modules`, `subtree`, `def`, `callers`, `context`, `core`, `doctor` — so an
-agent calls them structured, without shelling out or a permission prompt.
-Register it once with Claude Code:
-
-```sh
-claude mcp add ctx -- ctx mcp
-```
-
-Each tool takes a `path` argument (default `.`); `def`/`callers`/`context`
-also take `name`, and `subtree` takes `module`. The server builds the graph
-per call (~100 ms), so results are always current.
+`../y.md`, `[[WikiPage]]`, and reference-style `[text][ref]` / `[ref]`) against
+GitHub-style heading slugs. A link whose file or heading doesn't exist is a
+**broken link**; external URLs are left external. `ctx doctor` lists every broken
+link (file:line → target) in its own section — an out-of-scope `../` link is only
+flagged when its target is genuinely absent from disk, not merely outside the
+scanned subtree. Prose→code resolution is not yet modelled.
 
 ## Design notes
 
-- **Parsing**: tree-sitter (`tree-sitter-rust`, `tree-sitter-python`). Bodies
-  are dropped by slicing each definition node up to its `body` field; struct
-  fields and enum variants are kept inline because they carry architectural
-  signal at negligible token cost.
+- **Parsing**: tree-sitter (`tree-sitter-rust`, `tree-sitter-python`,
+  `tree-sitter-typescript`); Markdown is parsed directly. Bodies are dropped by
+  slicing each definition node up to its `body` field; struct fields and enum
+  variants are kept inline because they carry architectural signal at negligible
+  token cost.
 - **Module names** are path-derived: `src/` components are dropped,
   `mod.rs`/`lib.rs`/`main.rs`/`__init__.py`/`index.ts`/`index.tsx` collapse into
-  their directory. TypeScript import specifiers are resolved as paths —
-  relative `./x`/`../y` against the importing file's directory, bare names
-  (`react`, `@/…` aliases) as external. In
-  workspaces, components before `src/` become the crate prefix
-  (`crates/foo/src/bar.rs` → `crates::foo::bar`), and `crate::` paths resolve
-  against that prefix.
+  their directory. TypeScript import specifiers are resolved as paths — relative
+  `./x`/`../y` against the importing file's directory, bare names (`react`,
+  `@/…` aliases) as external. In workspaces, components before `src/` become the
+  crate prefix (`crates/foo/src/bar.rs` → `crates::foo::bar`), and `crate::`
+  paths resolve against that prefix. Name collisions rename prose to `name@stem`
+  and report it, so resolution never silently loses a module.
 - **Edge resolution** is heuristic but deterministic: `use`/`import` paths are
   expanded (brace groups, aliases, globs), normalized (`crate`/`self`/`super`,
-  leading dots in Python), and prefix-matched against the module index,
-  longest name first. Unresolvable crate-relative paths are dropped rather
-  than misreported; `std`/`core`/`alloc` are suppressed.
-- **Re-export chasing**: an import that lands on a facade (Rust `pub use`
-  in a prelude/lib, Python `__init__.py` imports) is chased through the
-  binding — including aliases and glob re-exports — so the dep edge points
-  at the module that actually defines the symbol, not the facade. Facade
-  modules render their own `reexports:` line, and a symbol that can't be
-  proven through a glob keeps its edge on the facade rather than guessing.
-- **Call-graph edges**: every call site inside a function body is collected
-  and resolved through the same machinery as imports (bindings, aliases,
-  `crate`/`super`/dots, re-export chase), then rendered on the function's
-  line (`→ callee, ...`) and folded into module `deps:` — which also catches
-  fully-qualified calls (`crate::foo::bar()`) that have no `use`. Receiver
-  method calls (`.steer()`, `obj.method()`) resolve to the enclosing
-  impl/class first, else through a global method index **only when the name
-  is unique codebase-wide and not a ubiquitous std method** (`push`, `get`,
-  `items`, ...). Ambiguous or unresolvable calls are dropped, never guessed.
-- **Edge confidence**: an edge backed by a resolved import, path, or
-  `self`/`Self` receiver is trusted. An edge attributed from an *opaque*
-  receiver (`expr.method()`, where the type is unknown) — whether matched to
-  the enclosing impl or a unique method name — is a heuristic guess and is
-  marked with a trailing `~` in `map`/`subtree`/`callers` (and `heuristic:
-  true` in JSON). This surfaces exactly the calls a type-blind resolver can
-  get wrong, so a `~`-free edge can be relied on and a `~` edge invites a
-  glance at the source.
-- **Not captured (yet)**: trait-impl resolution (calls through `dyn Trait` /
-  generic bounds stay unresolved unless the method name is unique), calls
-  inside nested functions are attributed to the enclosing item.
+  leading dots in Python), and prefix-matched against the module index, longest
+  name first. Unresolvable crate-relative paths are dropped rather than
+  misreported; `std`/`core`/`alloc` are suppressed.
+- **Re-export chasing**: an import that lands on a facade (Rust `pub use` in a
+  prelude/lib, Python `__init__.py` imports) is chased through the binding —
+  including aliases and glob re-exports — so the dep edge points at the module
+  that actually defines the symbol, not the facade. Facade modules render their
+  own `reexports:` line, and a symbol that can't be proven through a glob keeps
+  its edge on the facade rather than guessing.
+- **Call-graph edges**: every call site inside a function body is collected and
+  resolved through the same machinery as imports (bindings, aliases,
+  `crate`/`super`/dots, re-export chase), then rendered on the function's line
+  (`→ callee, ...`) and folded into module `deps:` — which also catches
+  fully-qualified calls (`crate::foo::bar()`) that have no `use`. Receiver method
+  calls resolve in confidence order: a `self`/`this` receiver against the
+  enclosing impl/class; a receiver whose type is **written in the source**
+  (parameter annotation, `let`/`const` binding, constructor call, or declared
+  field/property type) against that type; and only then, for a receiver with no
+  type at all, through a global method index **when the name is unique
+  codebase-wide, not a ubiquitous std method** (`push`, `get`, `items`, …), and
+  **in the same language**. Ambiguous or unresolvable calls are dropped, never
+  guessed.
+- **Dynamic dispatch**: a call through a trait object, `impl Trait`, a bounded
+  generic, `<T as Trait>::f`, a TypeScript `interface`/`implements`, or a Python
+  base class fans out to **every implementation that defines the method**, each
+  edge marked `*`. Exactly one branch runs at a time, so this is an
+  over-approximation — but a visible over-approximation beats a dropped edge when
+  the question is "what could run here". The declaring abstraction is a target
+  only when nothing overrides the method, i.e. when its default body is what
+  actually executes. Fan-outs wider than 12 collapse to the abstraction with an
+  `[N impls]` annotation.
+- **Nested callables**: functions declared inside a function body, `let`-bound
+  closures, and types declared inside a body are all lifted to child items. Their
+  calls are attributed to them rather than smeared onto the enclosing function,
+  and calls *to* them resolve lexically (`outer::helper`).
+- **Edge confidence**: an edge backed by a resolved import, path, `self`/`Self`
+  receiver, or a declared receiver type is trusted. An edge attributed from an
+  *opaque* receiver (`expr.method()`, where nothing in the source says the type)
+  is a heuristic guess, marked with a trailing `~` in
+  `map`/`subtree`/`callers`/`trace` (and `heuristic: true` in JSON). A dispatch
+  branch is marked `*` (`dispatch: true` in JSON). Deps that exist *solely* via
+  receiver inference are tracked separately as soft, so an import-derived dep is
+  never diluted by a guess.
+- **Not captured (yet)**: receivers whose type comes from an expression ctx does
+  not evaluate — `for` bindings, iterator chains, and results of calls that are
+  not associated constructors — still fall back to the unique-name heuristic.
+  `doctor` names every such miss rather than hiding it.
 
-Adding a language = one extractor file producing a `FileFacts` (items,
-imports, re-export bindings, defined names) plus the tree-sitter grammar
-crate — and, for a language that resolves imports by path rather than by name
-(as TypeScript does), a `candidates()` branch that maps a specifier to
-absolute module segments.
+## Adding a language
+
+Everything downstream of extraction — resolution, the call graph, `core`,
+`parity`, `move-plan`, `diff`, the MCP server — consumes one language-neutral
+struct and never asks what produced it. So a new language is one extractor file
+plus a grammar crate, wired in at a handful of places the compiler will point
+you at.
+
+**1. The contract.** Add `src/extract/<lang>.rs` exposing:
+
+```rust
+pub fn extract(src: &str) -> Result<FileFacts>
+```
+
+`FileFacts` (`src/model.rs`) is four fields: `items`, `imports`, `reexports`,
+`defined`. The work is in populating `Item` — and specifically in `raw_calls`,
+where each `RawCall` carries a `Receiver` (`Free`, `SelfType`, `SelfField`,
+`Typed`, `Dyn`, `Unknown`). **`Receiver` is where edge confidence comes from.**
+An extractor that returns `Unknown` everywhere compiles and runs, and produces a
+map in which every edge is marked `~`. Getting `Typed` and `Dyn` right is most of
+the value. `src/extract/python.rs` is the smallest complete example and the
+template worth copying; note that `TypeEnv` (local-binding type tracking) is
+deliberately per-language, not shared, so that part is written fresh each time.
+
+**2. Add the `Lang` variant**, then run `cargo check`. Eight exhaustive matches
+will fail to compile, and each is a real decision:
+
+| site | decision |
+|---|---|
+| `extract/mod.rs` `build_graph` | call your `extract()` |
+| `extract/mod.rs` `module_name` stem collapse | which filename collapses to its directory (`mod`/`lib`/`main`, `__init__`, `index`) |
+| `extract/mod.rs` `module_name` root | the name of the root module (`crate` vs `root`) |
+| `extract/mod.rs` `candidates()` | import string → absolute module segments — by name (Rust/Python) or by path (TypeScript) |
+| `extract/mod.rs` `filter_note()` | how `--lang` describes your language |
+| `model.rs` `Lang::name()` | display string |
+| `model.rs` `Lang::sep()` | path separator (`::` vs `.`) |
+| `view.rs` `is_public()` | what "public" means: a keyword, a naming convention, an `export` |
+
+Only `candidates()` and the visibility rule are real design work.
+
+**3. Four places the compiler will _not_ catch** — each has a `_` fallback, so
+missing one fails silently rather than loudly:
+
+- the extension allowlist in `build_graph` — miss it and your files are never
+  walked, and the map is simply empty
+- the extension → `Lang` mapping (`_ => continue`)
+- `is_package` (`_ => false`)
+- `UNSUPPORTED_SOURCE_EXTS` — remove your extension, or `ctx doctor` keeps
+  reporting the language as a blind spot after you've added it
+
+Grammars are compiled into the binary, so a new grammar crate is a real
+binary-size decision, not just a dependency.
+
+## Contributing
+
+Issues and pull requests are welcome. `cargo test` covers the extractors, the
+resolver, and every query command; `cargo clippy` should stay clean.
+
+Two properties are load-bearing, and a change that breaks either needs a good
+reason:
+
+- **Determinism.** The map is a pure function of the source tree. No clocks, no
+  hash-order iteration, no network.
+- **No guessing.** An edge is proven, marked heuristic with `~`, marked as a
+  dispatch branch with `*`, or absent. A dropped edge is reported by name in
+  `ctx doctor`, never silently swallowed — the honest bit is not that coverage is
+  high, it is that the gaps are enumerable. A change that raises coverage by
+  guessing, or that reclassifies a miss as "external" without evidence that the
+  name is defined nowhere in the tree, is a regression.
+
+`ctx` is used against its own source, so `ctx doctor .` and `ctx diff main` are a
+reasonable first review of any patch. Watch internal recall and the miss census
+rather than the raw edge count: more edges at the cost of more `~` is not an
+improvement.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
