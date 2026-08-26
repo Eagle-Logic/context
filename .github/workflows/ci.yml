@@ -30,7 +30,7 @@ jobs:
         # are a real risk, not a formality. macOS covers the aarch64 build.
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets --locked
@@ -39,7 +39,7 @@ jobs:
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -51,10 +51,17 @@ jobs:
     name: msrv (1.85)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Keep in sync with `rust-version` in Cargo.toml. README promises 1.85+,
       # and nothing else checks that promise.
-      - uses: dtolnay/rust-toolchain@1.85
+      #
+      # The version is an INPUT, not the action ref. Pinned as `@1.85` it looks
+      # to Dependabot like an action version, and it duly "upgraded" it to
+      # @1.100 — a Rust release that does not exist, so the job 404'd instead of
+      # checking anything.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --locked
 
@@ -65,7 +72,7 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -77,7 +84,7 @@ jobs:
     name: dogfood (ctx on ctx)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # changed --api builds the base ref in a worktree, so it needs
           # history — the default shallow clone has no merge base.
