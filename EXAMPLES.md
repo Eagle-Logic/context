@@ -3,7 +3,7 @@
 Every command below was run against **this repository** with `ctx 0.20.0`, and
 every block is verbatim output — nothing edited for effect.
 
-The repo under analysis: **14 Rust files, 2 Markdown files, 16 modules, 4,748
+The repo under analysis: **14 Rust files, 2 Markdown files, 16 modules, 4,958
 call sites.** Small enough to read in a sitting, which makes it a fair place to
 check whether the answers are actually right.
 
@@ -27,11 +27,11 @@ it is precise where a text grep floods.
 $ ctx callers coverage_report
 5 caller(s) of 'coverage_report':
 
-mcp::dispatch  (src/mcp.rs:361)  → query::coverage_report
-query::tests::coverage_separates_internal_external_and_blind_spots  (src/query.rs:2856)  → coverage_report
-query::tests::doctor_names_what_it_could_not_pin  (src/query.rs:2194)  → coverage_report
-query::tests::doctor_recall_excludes_provably_external_calls  (src/query.rs:2169)  → coverage_report
-query::tests::markdown_links_resolve_headings_and_flag_broken  (src/query.rs:2829)  → coverage_report
+mcp::dispatch  (src/mcp.rs:427-551  #4b4d6e1833c4)  → query::coverage_report
+query::tests::coverage_separates_internal_external_and_blind_spots  (src/query.rs:2901-2912  #adf073f295c1)  → coverage_report
+query::tests::doctor_names_what_it_could_not_pin  (src/query.rs:2239-2248  #6cd4660b675e)  → coverage_report
+query::tests::doctor_recall_excludes_provably_external_calls  (src/query.rs:2214-2226  #6c3b7200040d)  → coverage_report
+query::tests::markdown_links_resolve_headings_and_flag_broken  (src/query.rs:2874-2898  #839e24537089)  → coverage_report
 
 completeness: no call site named `coverage_report` went unresolved anywhere in this tree —
 this blast radius is complete to the limit of what ctx parses.
@@ -52,12 +52,12 @@ $ ctx path main coverage_report
 # path: main → coverage_report  (5 hop(s))
 ~ heuristic edge (verify) · * one branch of a dispatch fan-out
 
-crate::main  [src/main.rs:439]
-  → mcp::run  [src/mcp.rs:14]
-    → mcp::handle_method  [src/mcp.rs:54]
-      → mcp::tools_call  [src/mcp.rs:163]
-        → mcp::dispatch  [src/mcp.rs:177]
-          → query::coverage_report  [src/query.rs:1548]
+crate::main  [src/main.rs:451]
+  → mcp::run  [src/mcp.rs:191]
+    → mcp::handle_method  [src/mcp.rs:260]
+      → mcp::tools_call  [src/mcp.rs:411]
+        → mcp::dispatch  [src/mcp.rs:427]
+          → query::coverage_report  [src/query.rs:1593]
 ```
 
 ---
@@ -72,44 +72,44 @@ $ ctx trace build_graph --depth 2
 # call tree from 'build_graph'  (depth 2)
 ~ heuristic edge (verify) · * one branch of a dispatch fan-out
 
-extract::build_graph  [src/extract/mod.rs:115]  [+1 outside graph]
-├─ extract::disambiguate_module_names  [src/extract/mod.rs:248]
-├─ extract::lang_selected  [src/extract/mod.rs:110]
-│  └─ extract::filter  [src/extract/mod.rs:53]
+extract::build_graph  [src/extract/mod.rs:185]  [+1 outside graph]
+├─ extract::disambiguate_module_names  [src/extract/mod.rs:286]
 ├─ extract::markdown::extract  [src/extract/markdown.rs:45]  [+1 outside graph]
-│  ├─ extract::markdown::assign_lines  [src/extract/markdown.rs:136]  (depth limit)
-│  ├─ extract::markdown::atx_heading  [src/extract/markdown.rs:198]
-│  ├─ extract::markdown::clip  [src/extract/markdown.rs:433]
-│  ├─ extract::markdown::collect_link_defs  [src/extract/markdown.rs:381]  (depth limit)
-│  ├─ extract::markdown::extract_links  [src/extract/markdown.rs:310]  (depth limit)
-│  ├─ extract::markdown::fence_open  [src/extract/markdown.rs:286]
-│  ├─ extract::markdown::frontmatter_lines  [src/extract/markdown.rs:218]
-│  ├─ extract::markdown::is_structural  [src/extract/markdown.rs:297]
-│  ├─ extract::markdown::link_def  [src/extract/markdown.rs:393]
-│  ├─ extract::markdown::nest  [src/extract/markdown.rs:177]  (depth limit)
-│  ├─ extract::markdown::setext_heading  [src/extract/markdown.rs:267]
+│  ├─ extract::markdown::assign_lines  [src/extract/markdown.rs:139]  (depth limit)
+│  ├─ extract::markdown::assign_spans  [src/extract/markdown.rs:184]  (depth limit)
+│  ├─ extract::markdown::atx_heading  [src/extract/markdown.rs:227]
+│  ├─ extract::markdown::clip  [src/extract/markdown.rs:462]
+│  ├─ extract::markdown::collect_link_defs  [src/extract/markdown.rs:410]  (depth limit)
+│  ├─ extract::markdown::extract_links  [src/extract/markdown.rs:339]  (depth limit)
+│  ├─ extract::markdown::fence_open  [src/extract/markdown.rs:315]
+│  ├─ extract::markdown::frontmatter_lines  [src/extract/markdown.rs:247]
+│  ├─ extract::markdown::is_structural  [src/extract/markdown.rs:326]
+│  ├─ extract::markdown::link_def  [src/extract/markdown.rs:422]
+│  ├─ extract::markdown::nest  [src/extract/markdown.rs:206]  (depth limit)
+│  ├─ extract::markdown::setext_heading  [src/extract/markdown.rs:296]
 │  ├─ extract::markdown::slug  [src/extract/markdown.rs:13]
-│  └─ extract::markdown::strip_inline  [src/extract/markdown.rs:429]
-├─ extract::module_name  [src/extract/mod.rs:453]
+│  └─ extract::markdown::strip_inline  [src/extract/markdown.rs:458]
+├─ extract::module_name  [src/extract/mod.rs:491]
 │  └─ model::Lang::sep  [src/model.rs:143]
 ├─ extract::python::extract  [src/extract/python.rs:8]  [+1 outside graph]
 │  ├─ extract::python::module_level_item  [src/extract/python.rs:34]  (depth limit)
-│  └─ extract::python::visit  [src/extract/python.rs:70]  (depth limit)
-├─ extract::resolve_deps  [src/extract/mod.rs:513]
-│  ├─ extract::apply_calls  [src/extract/mod.rs:1850]  (depth limit)
-│  ├─ extract::build_universe  [src/extract/mod.rs:1047]  (depth limit)
-│  ├─ extract::compute_calls  [src/extract/mod.rs:1703]  (depth limit)
-│  ├─ extract::display_reexport  [src/extract/mod.rs:1857]  (depth limit)
-│  ├─ model::Module::resolve_segs~  [src/model.rs:250]  (depth limit)
-│  └─ extract::resolve_from  [src/extract/mod.rs:720]  (depth limit)
+│  └─ extract::python::visit  [src/extract/python.rs:72]  (depth limit)
+├─ extract::resolve_deps  [src/extract/mod.rs:551]
+│  ├─ extract::apply_calls  [src/extract/mod.rs:1888]  (depth limit)
+│  ├─ extract::build_universe  [src/extract/mod.rs:1085]  (depth limit)
+│  ├─ extract::compute_calls  [src/extract/mod.rs:1741]  (depth limit)
+│  ├─ extract::display_reexport  [src/extract/mod.rs:1895]  (depth limit)
+│  ├─ model::Module::resolve_segs~  [src/model.rs:274]  (depth limit)
+│  └─ extract::resolve_from  [src/extract/mod.rs:758]  (depth limit)
 ├─ extract::rust::extract  [src/extract/rust.rs:8]  [+1 outside graph]
 │  └─ extract::rust::visit  [src/extract/rust.rs:24]  (depth limit)
-├─ extract::slash_path  [src/extract/mod.rs:443]
-├─ extract::typescript::extract  [src/extract/typescript.rs:11]  [+1 outside graph]
-│  ├─ extract::typescript::module_level_item  [src/extract/typescript.rs:42]  (depth limit)
-│  └─ extract::typescript::visit  [src/extract/typescript.rs:81]  (depth limit)
-└─ extract::walker  [src/extract/mod.rs:88]
-   └─ extract::filter  [src/extract/mod.rs:53]
+├─ extract::slash_path  [src/extract/mod.rs:481]
+├─ extract::source_files  [src/extract/mod.rs:121]
+│  ├─ extract::lang_selected  [src/extract/mod.rs:110]  (depth limit)
+│  └─ extract::walker  [src/extract/mod.rs:88]  (depth limit)
+└─ extract::typescript::extract  [src/extract/typescript.rs:11]  [+1 outside graph]
+   ├─ extract::typescript::module_level_item  [src/extract/typescript.rs:42]  (depth limit)
+   └─ extract::typescript::visit  [src/extract/typescript.rs:83]  (depth limit)
 ```
 
 Three annotations carry the honesty:
@@ -223,20 +223,20 @@ The differentiator. Every tool guesses; this one tells you where.
 $ ctx doctor
 # ctx coverage report — /home/steve/projects/context
 
-Modules: 16  (markdown 2, rust 14)
+Modules: 17  (markdown 3, rust 14)
 
 ## Internal recall — the number to trust
-  1023/1065 = 96.1%   of call sites that could be internal, ctx pinned this many.
+  1058/1100 = 96.2%   of call sites that could be internal, ctx pinned this many.
 
 A call site is "could be internal" when the callee name is defined somewhere
 under this root. Calls into std or a third-party crate are excluded, because no
 internal edge could exist for them however good the resolver gets.
 
 ## Every call site, bucketed
-call sites:            4748
-  internal edges:      1023   [15 heuristic (~), 0 dispatch fan-out (*)]
-  external (provable): 3683   (77.6%)  callee defined nowhere here — std/extern
-  unresolved internal: 42     (0.9%)  the real misses — see below
+call sites:            4958
+  internal edges:      1058   [15 heuristic (~), 0 dispatch fan-out (*)]
+  external (provable): 3858   (77.8%)  callee defined nowhere here — std/extern
+  unresolved internal: 42     (0.8%)  the real misses — see below
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
@@ -253,23 +253,23 @@ grep these; every other edge in the map is one ctx could prove.
 ## Where the misses are
   extract::rust                      11 unresolved   (module recall 93%)
   extract::typescript                11 unresolved   (module recall 90%)
-  extract::python                    10 unresolved   (module recall 84%)
-  mcp                                 5 unresolved   (module recall 91%)
+  extract::python                    10 unresolved   (module recall 85%)
+  mcp                                 5 unresolved   (module recall 92%)
   extract                             3 unresolved   (module recall 98%)
   git                                 1 unresolved   (module recall 97%)
-  query                               1 unresolved   (module recall 99%)
+  query                               1 unresolved   (module recall 100%)
 
 ## Low-confidence zones (edges to distrust — grep to confirm)
   parity                           18% heuristic (11/61 edges)
-  extract                          1% heuristic (2/165 edges)
+  extract                          1% heuristic (2/172 edges)
   crate                            1% heuristic (1/147 edges)
-  query                            1% heuristic (1/190 edges)
+  query                            0% heuristic (1/204 edges)
 ```
 
-96.1% recall comes with **the exact grep list for the other 3.9%** — eight
+96.2% recall comes with **the exact grep list for the other 3.8%** — eight
 names, with counts and the modules they live in.
 
-The denominator is honest too. 3,683 of 4,748 call sites go into `std` or a
+The denominator is honest too. 3,858 of 4,958 call sites go into `std` or a
 third-party crate, where no internal edge could ever exist, so they're excluded
 rather than quietly inflating the percentage. That classification is by evidence
 — *is this name defined anywhere under the root?* — not a hardcoded list.
@@ -293,14 +293,14 @@ $ ctx core --limit 8
 Ranked by dependency centrality (PageRank); higher = more depended-upon.
 
   score    in  out  module
-  0.3060    11    0  model  [18 items]
-  0.1606    10    1  extract  [67 items]
-  0.0694     4    2  render  [8 items]
-  0.0559     1    0  EXAMPLES  [11 items]
-  0.0541     3    3  view  [11 items]
-  0.0519     2    4  query  [120 items]
-  0.0302     0    4  crate  [46 items]
-  0.0302     0    2  extract::markdown  [31 items]
+  0.3002    12    0  model  [19 items]
+  0.1544    10    1  extract  [74 items]
+  0.0657     4    2  render  [8 items]
+  0.0546     1    0  EXAMPLES  [11 items]
+  0.0512     3    3  view  [11 items]
+  0.0491     2    4  query  [126 items]
+  0.0295     0    0  SECURITY  [6 items]
+  0.0295     0    4  crate  [46 items]
 ```
 
 `model` on top with 11 inbound and 0 outbound is the right answer: it's the
@@ -321,7 +321,7 @@ Jump-to-def without knowing the file, across languages.
 $ ctx def Universe
 1 definition(s) of 'Universe':
 
-extract::Universe   [struct]   src/extract/mod.rs:1028
+extract::Universe   [struct]   src/extract/mod.rs:1066-1083  #85eadbaee90b
     struct Universe { methods: MethodIndex, all_names: BTreeSet<String>, module_segs: BTreeSet<String>, implementors: HashMap<String, BTreeSet<(String, String)>>, fields: HashMap<String, BTreeMap<String, String>> }  — Whole-tree symbol evidence, built once and shared by every module's
 ```
 

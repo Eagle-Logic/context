@@ -47,11 +47,33 @@ fn segments(s: &str) -> Vec<&str> {
 
 // ---- def -------------------------------------------------------------------
 
+/// `file:12-48  #a1b2c3d4e5f6` — where an item is, how far it runs, and what
+/// it contained when ctx looked.
+///
+/// The end line is the point: with only a start an agent reads the file and
+/// guesses where to stop, which is how a 30-line function turns into a
+/// 2,000-line read. The hash lets it skip the read entirely when it already
+/// has that span.
+fn span(file: &str, line: usize, end_line: usize, hash: &str) -> String {
+    let range = if end_line > line {
+        format!("{line}-{end_line}")
+    } else {
+        format!("{line}")
+    };
+    if hash.is_empty() {
+        format!("{file}:{range}")
+    } else {
+        format!("{file}:{range}  #{hash}")
+    }
+}
+
 struct Def {
     qualname: String,
     kind: String,
     file: String,
     line: usize,
+    end_line: usize,
+    hash: String,
     signature: String,
     doc: Option<String>,
 }
@@ -76,6 +98,8 @@ fn collect_defs(
                 kind: it.kind.clone(),
                 file: m.file.clone(),
                 line: it.line,
+                end_line: it.end_line,
+                hash: it.hash.clone(),
                 signature: it.signature.clone(),
                 doc: it.doc.clone(),
             });
@@ -115,6 +139,8 @@ pub fn def(g: &Graph, query: &str, json_out: bool) -> String {
                     "kind": h.kind,
                     "file": h.file,
                     "line": h.line,
+                    "end_line": h.end_line,
+                    "hash": h.hash,
                     "signature": h.signature,
                     "doc": h.doc,
                 })
@@ -131,8 +157,10 @@ pub fn def(g: &Graph, query: &str, json_out: bool) -> String {
     let mut out = format!("{} definition(s) of '{}':\n", hits.len(), query);
     for h in &hits {
         out.push_str(&format!(
-            "\n{}   [{}]   {}:{}\n",
-            h.qualname, h.kind, h.file, h.line
+            "\n{}   [{}]   {}\n",
+            h.qualname,
+            h.kind,
+            span(&h.file, h.line, h.end_line, &h.hash)
         ));
         let doc = h
             .doc
@@ -158,6 +186,8 @@ struct Caller {
     qualname: String,
     file: String,
     line: usize,
+    end_line: usize,
+    hash: String,
     edges: Vec<Call>,
 }
 
@@ -190,6 +220,8 @@ fn collect_callers(
                 qualname,
                 file: m.file.clone(),
                 line: it.line,
+                end_line: it.end_line,
+                hash: it.hash.clone(),
                 edges,
             });
         }
@@ -316,6 +348,8 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
                     "caller": c.qualname,
                     "file": c.file,
                     "line": c.line,
+                    "end_line": c.end_line,
+                    "hash": c.hash,
                     "edges": c.edges,
                 })
             })
@@ -348,6 +382,8 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
                     "module": m.name,
                     "file": m.file,
                     "line": it.line,
+                    "end_line": it.end_line,
+                    "hash": it.hash,
                     "kind": it.kind,
                     "signature": it.signature,
                 }))
@@ -414,10 +450,9 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
     for c in &found {
         let edges: Vec<String> = c.edges.iter().map(edge_str).collect();
         out.push_str(&format!(
-            "{}  ({}:{})  → {}\n",
+            "{}  ({})  → {}\n",
             c.qualname,
-            c.file,
-            c.line,
+            span(&c.file, c.line, c.end_line, &c.hash),
             edges.join(", ")
         ));
     }
@@ -1022,6 +1057,8 @@ struct DefLite {
     kind: String,
     file: String,
     line: usize,
+    end_line: usize,
+    hash: String,
     doc: Option<String>,
 }
 
@@ -1047,6 +1084,8 @@ fn def_index(g: &Graph) -> HashMap<String, DefLite> {
                         kind: it.kind.clone(),
                         file: m.file.clone(),
                         line: it.line,
+                        end_line: it.end_line,
+                        hash: it.hash.clone(),
                         doc: it.doc.clone(),
                     }
                 });
@@ -1236,14 +1275,14 @@ pub fn context(g: &Graph, query: &str, max_tokens: usize, json_out: bool) -> Str
                 let types: Vec<_> = signature_types(&it.signature, last, &idx)
                     .iter()
                     .map(|d| {
-                        json!({"name": d.qualname, "kind": d.kind, "file": d.file, "line": d.line})
+                        json!({"name": d.qualname, "kind": d.kind, "file": d.file, "line": d.line, "end_line": d.end_line, "hash": d.hash})
                     })
                     .collect();
                 json!({
-                    "definition": {"qualname": qual, "kind": it.kind, "file": m.file, "line": it.line, "signature": it.signature, "doc": it.doc},
+                    "definition": {"qualname": qual, "kind": it.kind, "file": m.file, "line": it.line, "end_line": it.end_line, "hash": it.hash, "signature": it.signature, "doc": it.doc},
                     "signature_types": types,
                     "calls": it.calls.iter().map(|c| json!({"to": c.to, "heuristic": c.heuristic, "dispatch": c.dispatch})).collect::<Vec<_>>(),
-                    "callers": callers.iter().map(|c| json!({"caller": c.qualname, "file": c.file, "line": c.line})).collect::<Vec<_>>(),
+                    "callers": callers.iter().map(|c| json!({"caller": c.qualname, "file": c.file, "line": c.line, "end_line": c.end_line, "hash": c.hash})).collect::<Vec<_>>(),
                 })
             })
             .collect();
@@ -1273,8 +1312,9 @@ pub fn context(g: &Graph, query: &str, max_tokens: usize, json_out: bool) -> Str
     for (qual, container, it, m) in targets.iter().take(3) {
         out.push_str(&format!("\n# Context: {qual}\n\n"));
         out.push_str(&format!(
-            "## Definition\n{qual}   [{}]   {}:{}\n",
-            it.kind, m.file, it.line
+            "## Definition\n{qual}   [{}]   {}\n",
+            it.kind,
+            span(&m.file, it.line, it.end_line, &it.hash)
         ));
         let doc = it
             .doc
@@ -1294,8 +1334,11 @@ pub fn context(g: &Graph, query: &str, max_tokens: usize, json_out: bool) -> Str
                     .map(|s| format!("  — {s}"))
                     .unwrap_or_default();
                 out.push_str(&format!(
-                    "- {} [{}]  {}:{}{}\n",
-                    d.qualname, d.kind, d.file, d.line, doc
+                    "- {} [{}]  {}{}\n",
+                    d.qualname,
+                    d.kind,
+                    span(&d.file, d.line, d.end_line, &d.hash),
+                    doc
                 ));
             }
         }
@@ -1321,9 +1364,13 @@ pub fn context(g: &Graph, query: &str, max_tokens: usize, json_out: bool) -> Str
             out.push_str(&format!("\n## Callers ({})\n", callers.len()));
             append_capped(
                 &mut out,
-                callers
-                    .iter()
-                    .map(|c| format!("- {}  ({}:{})", c.qualname, c.file, c.line)),
+                callers.iter().map(|c| {
+                    format!(
+                        "- {}  ({})",
+                        c.qualname,
+                        span(&c.file, c.line, c.end_line, &c.hash)
+                    )
+                }),
                 30,
                 budget,
             );
@@ -2864,5 +2911,79 @@ export function run(s: S): number { return s.step(); }
         assert!(out.contains("unresolved internal: 0"), "{out}");
         assert!(out.contains(".cpp"), "{out}"); // blind spot listed
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn def_reports_a_span_and_a_content_hash() {
+        let (g, _d) = graph(&[(
+            "src/lib.rs",
+            "pub struct Thing {\n    pub a: u8,\n    pub b: u8,\n}\n",
+        )]);
+        let out = def(&g, "Thing", false);
+        // The span must END where the definition does, not at the start line.
+        assert!(out.contains("src/lib.rs:1-4"), "{out}");
+        assert!(out.contains("  #"), "a content hash must be present: {out}");
+    }
+
+    #[test]
+    fn the_hash_tracks_content_not_position() {
+        // Same body, different offset in the file: the hash must match, or an
+        // agent re-reads a span it already holds every time anything above it
+        // moves.
+        let (a, _da) = graph(&[("src/a.rs", "fn f() {\n    let x = 1;\n}\n")]);
+        let (b, _db) = graph(&[(
+            "src/a.rs",
+            "// a leading comment\n// and another\nfn f() {\n    let x = 1;\n}\n",
+        )]);
+        let ha = hash_in(&def(&a, "f", false));
+        let hb = hash_in(&def(&b, "f", false));
+        assert_eq!(
+            ha, hb,
+            "identical bodies must hash the same regardless of position"
+        );
+
+        // And a real edit must change it, or the hash is worthless as a
+        // staleness check.
+        let (c, _dc) = graph(&[("src/a.rs", "fn f() {\n    let x = 2;\n}\n")]);
+        assert_ne!(
+            ha,
+            hash_in(&def(&c, "f", false)),
+            "an edit must change the hash"
+        );
+    }
+
+    #[test]
+    fn callers_and_context_carry_the_span_too() {
+        let (g, _d) = graph(&[(
+            "src/lib.rs",
+            "fn target() {}\nfn caller() {\n    target();\n}\n",
+        )]);
+        let c = callers(&g, "target", false);
+        assert!(
+            c.contains("src/lib.rs:2-4"),
+            "callers needs the caller's span: {c}"
+        );
+        assert!(c.contains("  #"), "{c}");
+
+        let ctx = context(&g, "target", 4000, false);
+        assert!(ctx.contains("src/lib.rs:1"), "{ctx}");
+        assert!(ctx.contains("  #"), "context needs the hash: {ctx}");
+    }
+
+    #[test]
+    fn a_one_line_item_reports_a_bare_line_not_a_degenerate_range() {
+        let (g, _d) = graph(&[("src/lib.rs", "fn f() {}\n")]);
+        let out = def(&g, "f", false);
+        assert!(
+            out.contains("src/lib.rs:1  #"),
+            "expected `:1`, not `:1-1`: {out}"
+        );
+    }
+
+    fn hash_in(s: &str) -> String {
+        s.split("  #")
+            .nth(1)
+            .map(|t| t.split_whitespace().next().unwrap_or("").to_string())
+            .unwrap_or_default()
     }
 }
