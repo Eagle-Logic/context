@@ -203,6 +203,71 @@ that state their own confidence, that's this.
 But we'll say plainly what dogfooding taught us: it's the least useful thing
 here. [More on why](#maps-when-you-want-them).
 
+## "Why not just grep?"
+
+Often you should. Here is the measurement, including where grep wins.
+
+The grep below is the one a competent agent would actually write — call syntax,
+language-filtered, skipping the same directories ctx skips — not a bare
+`grep -rn name`:
+
+```sh
+grep -rn --include='*.py' --include='*.rs' --include='*.ts' \
+  --exclude-dir={.git,node_modules,target,__pycache__,.venv,venv,dist,build} \
+  '\bload(' .
+```
+
+**On a small repo, grep wins.** This repository, 14 source files, "who calls
+`coverage_report`": grep 194 tokens, `ctx callers` 215. Jump-to-definition is
+worse for ctx — grep 14 tokens against 124. At this size the graph is overhead
+and you should use grep.
+
+**On a large repo it inverts.** A 14,073-file tree:
+
+| "who calls X" | `ctx callers` | fair grep | grep lines | callers ctx found |
+|---|---|---|---|---|
+| `load` | **4,014** | 32,994 | 784 | 90 |
+| `run` | **441** | 11,017 | 242 | 8 |
+| `boot` | **1,693** | 4,744 | 98 | 31 |
+
+8× to 25× fewer tokens, because grep's cost scales with how common the *string*
+is and ctx's scales with how many *call edges* actually exist. `run` appears on
+242 matching lines and is genuinely called from 8 places.
+
+**But the size difference is not really the point** — the two answer different
+questions. Same task, same repo:
+
+```
+grep:  src/mcp.rs:475:    query::coverage_report(&g, &unsupported, barg("explain"), false),
+       src/query.rs:1548:pub fn coverage_report(
+       src/query.rs:2177:        let out = coverage_report(&g, &[], false, false);
+
+ctx:   mcp::dispatch  (src/mcp.rs:361)  → query::coverage_report
+       query::tests::coverage_separates_internal_external_and_blind_spots  (src/query.rs:2856)
+       query::tests::doctor_names_what_it_could_not_pin  (src/query.rs:2194)
+```
+
+grep returns lines containing the text — including the definition itself, mixed
+in with the calls. ctx returns **the functions that call it**. "What breaks if I
+change this signature" is answered by a list of callers, not a list of lines, so
+grep's output needs a second pass to read around each hit and work out which
+function it lands in. That pass is the part ctx has already done.
+
+**And grep is complete where ctx is not.** ctx only reports edges it could
+resolve, so it undercounts — which is why every answer carries its own error
+bar:
+
+```
+completeness: 240 call site(s) named `load` could not be pinned
+(scripts.regress 10, api 6, tests::progressive_integration 6, ...) —
+this blast radius may be incomplete; grep `load` to confirm.
+```
+
+**So: grep is complete and imprecise; ctx is precise and tells you where it
+isn't.** They compose. ctx narrows 242 lines to 8 callers and then names the
+places you still need grep — which is a better division of labour than either
+tool doing the whole job.
+
 ## Install
 
 **No Rust toolchain required** — prebuilt binaries for macOS, Linux and Windows:
@@ -241,6 +306,11 @@ musl, so it drops into a distroless or scratch container), and `x86_64` Windows.
 > quarantine attribute and is unaffected.
 
 ## The queries
+
+**Start here:** `ctx core` to orient, `ctx def` to find a symbol, `ctx context`
+to work on it. That sequence is the tool. Everything below is a specialisation
+of it, and the whole-repo map at the bottom is measured at
+[42× the cost of `core`](#measuring-what-it-costs) for the same orientation job.
 
 ```sh
 # Everything needed to edit a symbol, in one call (def + types + callees + callers)
@@ -289,12 +359,13 @@ ctx doctor --explain                  # full per-name census
 ctx core
 ctx core --churn
 
-# Boot maps, when you do want the blob
-ctx map -o CODEBASE_MAP.md            # full map
-ctx map --view skeleton               # architecture only, cheapest
-ctx map --max-tokens 8000             # hard cap: reduces detail, then prunes
+# Wider views. `subtree` is the one to reach for; `map` is a cold-start or
+# human-reader tool, not an agent's opening move — see "Maps, when you want them"
 ctx subtree core::inference           # one module + upstream + downstream
 ctx modules                           # module list + dep edges only
+ctx map --view skeleton               # whole repo, architecture only
+ctx map --max-tokens 8000             # hard cap: reduces detail, then prunes
+ctx map -o CODEBASE_MAP.md            # write it out (goes stale on the next edit)
 
 # Scoping (global, repeatable)
 ctx map --lang code                   # Rust/Python/TypeScript only, no prose
@@ -568,18 +639,31 @@ total when the client disconnects. `-` writes to stderr. It is off by default
 and never touches a tool's response, so enabling it cannot change what the model
 sees.
 
-It exists because "query instead of loading a map" is an argument until someone
-counts. On a 14,073-file repo, orienting and then working one symbol:
+It exists because "query instead of loading a map" was an argument until someone
+counted. Measured on a 14,073-file repo, the claim is narrower and sharper than
+"queries are cheaper than maps":
 
-| session | tokens |
+**A boot-time map is a 42× more expensive way to orient than `ctx core`, and it
+does not answer the questions you then have to ask anyway.**
+
+Both are orientation steps — "what is this codebase, where do I start":
+
+| orientation step | tokens |
 |---|---|
-| `core` → `def` → `context` → `callers` → `trace` | **9,286** |
-| `map` → the same four queries | **33,682** |
+| `ctx core` | **596** |
+| `ctx map` (budgeted; unbudgeted it is 306,383) | **24,992** |
 
-The map alone is 24,992 of that, and the agent still ran all four queries
-afterwards — the map answered none of them. Swap it for `ctx core` as the
-orientation step and that 24,992 becomes 596: a **42×** cheaper way to answer
-"where am I", and 3.6× cheaper over the session.
+The second half matters more than the ratio. After loading that map, the same
+session still ran `def`, `context`, `callers` and `trace` on the symbol it was
+actually there to change — 8,690 tokens that were needed either way. The map
+answered none of them. It was breadth bought before knowing which part was
+needed, and the specific answers were bought again afterwards at full price.
+
+For the record, the whole sessions were 9,286 tokens without the map and 33,682
+with it. That is a with/without comparison and it flatters the argument: of
+course dropping a 24,992-token step is cheaper. The load-bearing number is the
+596-vs-24,992 orientation cost and the fact that the map bought nothing the
+queries did not have to buy again.
 
 ```sh
 ctx mcp --metrics /tmp/ctx.jsonl
