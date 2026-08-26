@@ -203,7 +203,7 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
             resolve_name: String::new(),
             heuristic_deps: Vec::new(),
             import_sites: Vec::new(),
-            file: rel.display().to_string(),
+            file: slash_path(rel),
             lang,
             deps: Vec::new(),
             extern_deps: Vec::new(),
@@ -427,6 +427,24 @@ pub fn unsupported_census(root: &Path) -> Vec<(String, usize)> {
         ));
     }
     v
+}
+
+/// Render a relative path with `/` separators on every platform.
+///
+/// `Path::display()` uses the OS separator, so the same source tree would
+/// print `src/model.rs` on Unix and `src\model.rs` on Windows — and
+/// `move-plan` would emit a single line mixing both, because destination
+/// paths are built by joining with `/`. ctx's contract is that the output is
+/// a pure function of the source tree, which has to hold across platforms
+/// too, so paths are normalized here at the one place they enter the graph.
+///
+/// Joins components rather than replacing `\`, because a backslash is a legal
+/// character in a Unix filename and replacing it would corrupt the path.
+fn slash_path(rel: &Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Derive a stable module name from the file path. "src" components are
@@ -1849,5 +1867,25 @@ fn display_reexport(b: &Binding, m: &Module, ctx: &Ctx) -> String {
         target
     } else {
         format!("{target} as {}", b.name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Paths must render with `/` on every platform.
+    ///
+    /// Regression: on Windows `Path::display()` yields `pkg\gate.py`, while
+    /// `move-plan` builds its destination by joining with `/` — so a single
+    /// line of output read `pkg\gate.py  →  pkg/routing/gate.py`. Beyond being
+    /// ugly, it broke ctx's determinism contract: identical source produced
+    /// different output per platform. Caught by CI's Windows job.
+    #[test]
+    fn paths_render_with_forward_slashes_on_every_platform() {
+        let p: PathBuf = ["pkg", "sub", "gate.py"].iter().collect();
+        assert_eq!(slash_path(&p), "pkg/sub/gate.py");
+        assert_eq!(slash_path(Path::new("gate.py")), "gate.py");
+        assert_eq!(slash_path(Path::new("")), "");
     }
 }
