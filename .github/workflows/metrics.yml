@@ -1,0 +1,119 @@
+name: Metrics snapshot
+
+# GitHub's traffic API retains only 14 days. Anything not captured before it
+# rolls off is gone for good — there is no backfill — so this runs daily and
+# appends to a log rather than reading the API on demand.
+on:
+  schedule:
+    - cron: "17 6 * * *"   # 06:17 UTC daily; off the hour to dodge the cron stampede
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: metrics-snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Traffic endpoints need push-level auth. If that ever stops working
+          # the job must still record the rest rather than failing silently, so
+          # each block degrades to null instead of aborting the run.
+          views=$(gh api "repos/$REPO/traffic/views" 2>/dev/null || echo 'null')
+          clones=$(gh api "repos/$REPO/traffic/clones" 2>/dev/null || echo 'null')
+          refs=$(gh api "repos/$REPO/traffic/popular/referrers" 2>/dev/null || echo 'null')
+          paths=$(gh api "repos/$REPO/traffic/popular/paths" 2>/dev/null || echo 'null')
+          repo=$(gh api "repos/$REPO" 2>/dev/null || echo 'null')
+          releases=$(gh api "repos/$REPO/releases?per_page=100" 2>/dev/null || echo 'null')
+          # crates.io rejects requests without a User-Agent.
+          crate=$(curl -sS -H 'User-Agent: ctx-metrics (github.com/Eagle-Logic/context)' \
+                    https://crates.io/api/v1/crates/code-context 2>/dev/null || echo 'null')
+
+          export VIEWS="$views" CLONES="$clones" REFS="$refs" PATHS="$paths" \
+                 REPO_JSON="$repo" RELEASES="$releases" CRATE="$crate"
+          python3 - <<'PY' > snapshot.json
+          import json, os, datetime
+
+          def load(k):
+              try:
+                  v = json.loads(os.environ.get(k) or "null")
+                  return v
+              except Exception:
+                  return None
+
+          repo     = load("REPO_JSON") or {}
+          views    = load("VIEWS") or {}
+          clones   = load("CLONES") or {}
+          crate    = load("CRATE") or {}
+          releases = load("RELEASES") or []
+
+          # Per-platform asset counts are the point: they say whether the
+          # six-target build matrix was worth having, and which platforms to
+          # lead with in the README.
+          assets = {}
+          for r in releases if isinstance(releases, list) else []:
+              for a in r.get("assets", []):
+                  if a["name"].endswith(".sha256"):
+                      continue
+                  assets[f'{r.get("tag_name")}/{a["name"]}'] = a.get("download_count", 0)
+
+          c = crate.get("crate") or {}
+          out = {
+              "date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"),
+              "stars": repo.get("stargazers_count"),
+              "watchers": repo.get("subscribers_count"),
+              "forks": repo.get("forks_count"),
+              "open_issues": repo.get("open_issues_count"),
+              # `uniques` is the number that means something; `count` inflates
+              # with refreshes.
+              "views_14d": views.get("count"),
+              "view_uniques_14d": views.get("uniques"),
+              "clones_14d": clones.get("count"),
+              "clone_uniques_14d": clones.get("uniques"),
+              "referrers": load("REFS"),
+              "popular_paths": load("PATHS"),
+              "crate_downloads_total": c.get("downloads"),
+              "crate_downloads_recent": c.get("recent_downloads"),
+              "crate_versions": {v["num"]: v["downloads"] for v in (crate.get("versions") or [])},
+              "release_assets": assets,
+          }
+          print(json.dumps(out, sort_keys=True))
+          PY
+          cat snapshot.json
+
+      - name: Append to the metrics branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # A dedicated branch, because `main` is protected and a daily bot
+          # commit has no business in the project's history anyway.
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin metrics --depth=1 2>/dev/null && git checkout metrics \
+            || git checkout --orphan metrics
+          git rm -rq --cached . 2>/dev/null || true
+          [ -f metrics.jsonl ] || : > metrics.jsonl
+          # One line per day. A re-run replaces that day rather than duplicating.
+          day=$(python3 -c "import json;print(json.load(open('snapshot.json'))['date'])")
+          grep -v "\"date\": \"$day\"" metrics.jsonl > tmp.jsonl || true
+          cat tmp.jsonl > metrics.jsonl && rm -f tmp.jsonl
+          python3 -c "
+          import json
+          line = json.dumps(json.load(open('snapshot.json')), sort_keys=True)
+          open('metrics.jsonl','a').write(line + '\n')
+          "
+          rm -f snapshot.json
+          git add metrics.jsonl
+          git commit -qm "metrics: $day" || { echo "nothing changed"; exit 0; }
+          git push -q origin metrics
