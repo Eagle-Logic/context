@@ -19,6 +19,12 @@ jobs:
   snapshot:
     runs-on: ubuntu-latest
     steps:
+      # Needed for the append step: without a checkout the workspace is not a
+      # git repo at all, and `git` fails with "not in a git directory".
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
       - name: Collect
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
