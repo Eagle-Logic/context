@@ -27,7 +27,12 @@ jobs:
 
       - name: Collect
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Traffic endpoints require push-level auth, which the default
+          # GITHUB_TOKEN does not grant — it returns 403 and the traffic
+          # fields land as null. METRICS_TOKEN is a PAT with read access to
+          # this repo; without it everything else is still captured, but the
+          # views/clones/referrers numbers (the ones that expire) are lost.
+          GH_TOKEN: ${{ secrets.METRICS_TOKEN || secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -41,7 +46,16 @@ jobs:
           # Responses go to FILES, not environment variables: the releases
           # payload alone is tens of KB and passing it through the environment
           # overflows the exec argument limit ("Argument list too long").
-          fetch () { gh api "$1" > "raw/$2" 2>/dev/null || echo 'null' > "raw/$2"; }
+          # Degrade to null rather than aborting, but say so — a silent null
+          # here is indistinguishable from a genuine zero, and these numbers
+          # cannot be backfilled.
+          fetch () {
+            if gh api "$1" > "raw/$2" 2>raw/err; then
+              return 0
+            fi
+            echo "::warning::could not fetch $1 — recording null. $(head -c 200 raw/err)"
+            echo 'null' > "raw/$2"
+          }
           fetch "repos/$REPO/traffic/views"            views.json
           fetch "repos/$REPO/traffic/clones"           clones.json
           fetch "repos/$REPO/traffic/popular/referrers" refs.json
@@ -103,6 +117,14 @@ jobs:
           PY
           rm -rf raw
           cat snapshot.json
+          python3 -c "
+          import json
+          d = json.load(open('snapshot.json'))
+          if d.get('view_uniques_14d') is None:
+              print('::warning::traffic data is null — set a METRICS_TOKEN secret '
+                    '(a PAT with read access to this repo) or the 14-day view/clone '
+                    'numbers will expire uncaptured')
+          "
 
       - name: Append to the metrics branch
         env:
