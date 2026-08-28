@@ -177,6 +177,11 @@ jobs:
               for r in rows:
                   f.write(json.dumps(r, sort_keys=True) + "\n")
           PY
+          # Read the date BEFORE snapshot.json is removed. The previous version
+          # of this step set `day` earlier and the rewrite dropped that line
+          # while leaving the reference below, so `set -u` killed the job after
+          # the data had already been collected.
+          day=$(python3 -c "import json;print(json.load(open('snapshot.json'))['date'])")
           rm -f snapshot.json
           git add metrics.jsonl
           git commit -qm "metrics: $day" || { echo "nothing changed"; exit 0; }
