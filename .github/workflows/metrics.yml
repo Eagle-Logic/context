@@ -139,15 +139,44 @@ jobs:
             || git checkout --orphan metrics
           git rm -rq --cached . 2>/dev/null || true
           [ -f metrics.jsonl ] || : > metrics.jsonl
-          # One line per day. A re-run replaces that day rather than duplicating.
-          day=$(python3 -c "import json;print(json.load(open('snapshot.json'))['date'])")
-          grep -v "\"date\": \"$day\"" metrics.jsonl > tmp.jsonl || true
-          cat tmp.jsonl > metrics.jsonl && rm -f tmp.jsonl
-          python3 -c "
-          import json
-          line = json.dumps(json.load(open('snapshot.json')), sort_keys=True)
-          open('metrics.jsonl','a').write(line + '\n')
-          "
+          # One line per day. A re-run replaces that day — but only if it is
+          # not throwing away data.
+          #
+          # Learned the hard way: a run without traffic auth writes nulls, and
+          # unconditional replacement let one of those silently destroy a
+          # hand-seeded row that had real numbers in it. Traffic cannot be
+          # backfilled, so that loss was permanent and invisible. A replacement
+          # now has to be at least as complete as what it overwrites.
+          python3 - <<'PY'
+          import json, os
+
+          new = json.load(open("snapshot.json"))
+          rows = []
+          if os.path.exists("metrics.jsonl"):
+              with open("metrics.jsonl") as f:
+                  rows = [json.loads(l) for l in f if l.strip()]
+
+          TRAFFIC = ("views_14d", "view_uniques_14d", "clones_14d", "clone_uniques_14d")
+          def filled(r):
+              return sum(1 for k in TRAFFIC if r.get(k) is not None)
+
+          prior = next((r for r in rows if r.get("date") == new["date"]), None)
+          if prior is not None and filled(prior) > filled(new):
+              # Keep the richer row, but carry over anything the new run did
+              # learn that the old one lacked.
+              for k, v in new.items():
+                  if v is not None and prior.get(k) is None:
+                      prior[k] = v
+              print(f"::warning::keeping existing {new['date']} row — it has traffic data "
+                    f"this run could not fetch; merged in the non-traffic fields")
+              new = prior
+
+          rows = [r for r in rows if r.get("date") != new["date"]] + [new]
+          rows.sort(key=lambda r: r.get("date") or "")
+          with open("metrics.jsonl", "w") as f:
+              for r in rows:
+                  f.write(json.dumps(r, sort_keys=True) + "\n")
+          PY
           rm -f snapshot.json
           git add metrics.jsonl
           git commit -qm "metrics: $day" || { echo "nothing changed"; exit 0; }
