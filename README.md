@@ -684,12 +684,18 @@ turn whether or not a tool is ever called:
 | | resident tokens |
 |---|---|
 | `ctx snippet` block | **616** |
-| MCP tool definitions (10 tools) | **1,654** |
+| MCP tool definitions (10 tools) | **1,326** |
 
-2.7x, before either has answered anything. An MCP tool list is itself a blob
+2.2x, before either has answered anything. An MCP tool list is itself a blob
 injected at boot — the shape this project objects to — so the honest advice is
 to use MCP when you want structured calls and no shell permission prompts, and
 the CLI when you want the cheapest possible standing cost.
+
+The tool schemas are deliberately terse for this reason. They say what a tool
+is for and what it takes, and nothing about how to read the result — every
+command's output already carries its own legend, so explaining markers up front
+would mean paying for that explanation in every turn instead of only in the
+turns where a tool was actually called.
 
 The graph is reused across calls while the source it was built from is
 unchanged. Staleness is checked by re-walking for mtime and length — a stat per
