@@ -390,8 +390,8 @@ ctx map --exclude 'docs/archive/**'   # vendored trees, dead code
 # Machine-readable
 ctx map --format json
 
-# Print the CLAUDE.md discovery block, measured for this repo
-ctx snippet >> CLAUDE.md
+# Print the agent instructions block, measured for this repo
+ctx snippet >> AGENTS.md              # or CLAUDE.md, .cursorrules, …
 ```
 
 Every command except `parity` takes a repo path as its last positional argument,
@@ -638,18 +638,58 @@ one at negligible token cost:
 
 ## Agent integration
 
-### MCP server
+Two ways in. **The CLI is the one to reach for first**, and it is what this
+project's author uses exclusively.
+
+### The CLI, via an instructions file
+
+`ctx snippet` prints a "Codebase Discovery" block **measured for this repo** —
+its module count, token cost, and call-resolution rate are read off your actual
+source, so the guidance is derived rather than asserted. Append it to whatever
+file your agent reads:
+
+```sh
+ctx snippet >> AGENTS.md        # or CLAUDE.md, .cursorrules, .windsurfrules …
+```
+
+The block names no vendor. It describes commands and a protocol, so it works
+with any agent that can read a file and run a shell command. The block is fenced
+by markers, so regenerating replaces it in place instead of appending a second,
+contradictory copy.
+
+It teaches a query-first protocol: run `ctx context <name>` when you're about to
+touch a symbol, `ctx callers` before changing a signature, `ctx trace`/`ctx path`
+to follow control flow instead of grepping, and only read raw source for
+implementation bodies. Reaching for a whole-repo map is the exception, not the
+opening move.
+
+### MCP server, if you want typed tools
 
 `ctx mcp` runs a minimal MCP server over stdio (newline-delimited JSON-RPC, no
 dependencies) exposing the read-only commands as typed tools, so an agent calls
-them structured, without shelling out or a permission prompt.
+them structured, without shelling out or a permission prompt. It speaks the
+standard protocol, so any MCP client works:
 
 ```sh
-claude mcp add ctx -- ctx mcp
+claude mcp add ctx -- ctx mcp     # or your client's equivalent
 ```
 
 Each tool takes a `path` argument (default `.`); `def`/`callers`/`context` also
 take `name`, and `subtree` takes `module`.
+
+**It costs more standing context than the CLI**, which is worth knowing given
+what the rest of this README argues. Tool definitions are resident in every
+turn whether or not a tool is ever called:
+
+| | resident tokens |
+|---|---|
+| `ctx snippet` block | **616** |
+| MCP tool definitions (10 tools) | **1,654** |
+
+2.7x, before either has answered anything. An MCP tool list is itself a blob
+injected at boot — the shape this project objects to — so the honest advice is
+to use MCP when you want structured calls and no shell permission prompts, and
+the CLI when you want the cheapest possible standing cost.
 
 The graph is reused across calls while the source it was built from is
 unchanged. Staleness is checked by re-walking for mtime and length — a stat per
@@ -729,21 +769,6 @@ ctx mcp --metrics /tmp/ctx.jsonl
 jq -s 'map(select(.summary|not)) | group_by(.tool)
        | map({tool: .[0].tool, calls: length, tokens: (map(.output_tokens)|add)})' /tmp/ctx.jsonl
 ```
-
-### Claude Code
-
-`ctx snippet` prints a "Codebase Discovery" block **measured for this repo** —
-its module count, token cost, and call-resolution rate are read off your actual
-source, so the guidance is derived rather than asserted. Append it to the target
-repo's `CLAUDE.md` (`ctx snippet >> CLAUDE.md`); the block is fenced by markers,
-so regenerating replaces it in place instead of appending a second, contradictory
-copy.
-
-It teaches a query-first protocol: run `ctx context <name>` when you're about to
-touch a symbol, `ctx callers` before changing a signature, `ctx trace`/`ctx path`
-to follow control flow instead of grepping, and only read raw source for
-implementation bodies. Reaching for a whole-repo map is the exception, not the
-opening move.
 
 ## Markdown as a graph
 
