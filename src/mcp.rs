@@ -311,97 +311,103 @@ fn clamp(text: String, budget: Option<usize>, what: &str) -> String {
     )
 }
 
+/// Repeated in every tool's schema, so each word here is paid ten times over
+/// in standing context. Keep it to what disambiguates the argument.
 fn path_prop() -> Value {
-    json!({ "type": "string", "description": "Path to the repo (default \".\")" })
+    json!({ "type": "string", "description": "Repo path (default \".\")" })
 }
 
 fn budget_prop(desc: &str) -> Value {
     json!({ "type": "integer", "description": desc })
 }
 
+/// One budget description, shared. The truncation behaviour is announced in
+/// the output itself when it happens, so paying to describe it up front — in
+/// every turn, whether or not a budget is ever hit — is the wrong trade.
+const BUDGET_DESC: &str = "Max output tokens (default 25000)";
+
 fn tools() -> Vec<Value> {
-    let name_prop =
-        json!({ "type": "string", "description": "Symbol name, bare or qualified (Type::method)" });
+    let name_prop = json!({ "type": "string", "description": "Symbol name, bare or qualified" });
     vec![
         tool(
             "map",
-            "Deterministic topology map of the codebase (modules, deps, signatures, call edges). \
-             Output scales with repo size and can exceed 100k tokens unbudgeted — pass max_tokens \
-             to get a guaranteed-size map (it reduces detail, then keeps the most central modules).",
+            "Whole-repo structural map. Expensive and rarely the right first move — \
+             prefer context/callers/subtree for a specific question.",
             json!({
                 "path": path_prop(),
-                "view": {"type": "string", "enum": ["skeleton", "interface", "full"], "description": "Detail level (default skeleton)"},
-                "max_tokens": budget_prop("Hard cap on output size (default 25000). Reduces detail, then keeps the most central modules."),
+                "view": {"type": "string", "enum": ["skeleton", "interface", "full"], "description": "Default skeleton"},
+                "max_tokens": budget_prop(BUDGET_DESC),
             }),
             &[],
         ),
         tool(
             "modules",
-            "One line per module with dependency edges. Scales with repo size; pass max_tokens to raise the default cap.",
+            "One line per module with dependency edges.",
             json!({
                 "path": path_prop(),
-                "max_tokens": budget_prop("Hard cap on output size (default 25000). Truncates on a line boundary and says so."),
+                "max_tokens": budget_prop(BUDGET_DESC),
             }),
             &[],
         ),
         tool(
             "subtree",
-            "A module plus its immediate upstream dependencies and downstream dependents.",
+            "One module plus its immediate dependencies and dependents.",
             json!({
                 "path": path_prop(),
                 "module": {"type": "string", "description": "Module name or suffix"},
-                "view": {"type": "string", "enum": ["skeleton", "interface", "full"], "description": "Detail level (default full)"},
-                "max_tokens": budget_prop("Hard cap on output size (default 25000). Reduces detail, then drops the least-central neighbors; the target module is always kept."),
+                "view": {"type": "string", "enum": ["skeleton", "interface", "full"], "description": "Default full"},
+                "max_tokens": budget_prop(BUDGET_DESC),
             }),
             &["module"],
         ),
         tool(
             "def",
-            "Where a symbol is defined: module, kind, line, signature, doc.",
+            "Where a symbol is defined: file, span, signature.",
             json!({ "path": path_prop(), "name": name_prop }),
             &["name"],
         ),
         tool(
             "callers",
-            "Every function that calls the given function/method (resolved reverse call edges).",
+            "Every function that calls this — the blast radius before a signature change.",
             json!({
                 "path": path_prop(),
                 "name": name_prop,
-                "max_tokens": budget_prop("Hard cap on output size (default 25000). Truncates on a line boundary and says so."),
+                "max_tokens": budget_prop(BUDGET_DESC),
             }),
             &["name"],
         ),
         tool(
             "context",
-            "Everything needed to edit a symbol: definition, signature types, callees, callers.",
-            json!({ "path": path_prop(), "name": name_prop, "max_tokens": {"type": "integer", "description": "Approx token budget (default 4000)"} }),
+            "Definition, signature types, callees and callers for one symbol. \
+             Usually enough to edit without opening the file.",
+            json!({ "path": path_prop(), "name": name_prop, "max_tokens": {"type": "integer", "description": "Max output tokens (default 4000)"} }),
             &["name"],
         ),
         tool(
             "core",
-            "Modules ranked by dependency centrality — the heart of the codebase.",
-            json!({ "path": path_prop(), "limit": {"type": "integer", "description": "How many to show (default 30)"} }),
+            "Modules ranked by dependency centrality.",
+            json!({ "path": path_prop(), "limit": {"type": "integer", "description": "Default 30"} }),
             &[],
         ),
         tool(
             "trace",
-            "Transitive call tree from a symbol: what actually runs underneath it. Set reverse=true for the inbound tree (what reaches it).",
-            json!({ "path": path_prop(), "name": name_prop, "depth": {"type": "integer", "description": "Call hops to expand (default 3)"}, "reverse": {"type": "boolean", "description": "Walk callers instead of callees"} }),
+            "Transitive call tree from a symbol; reverse=true for what reaches it.",
+            json!({ "path": path_prop(), "name": name_prop, "depth": {"type": "integer", "description": "Default 3"}, "reverse": {"type": "boolean", "description": "Inbound tree"} }),
             &["name"],
         ),
         tool(
             "path",
-            "Shortest call path between two symbols — how execution gets from one to the other.",
-            json!({ "path": path_prop(), "from": {"type": "string", "description": "Starting function/method"}, "to": {"type": "string", "description": "Destination function/method"} }),
+            "Shortest call path between two symbols.",
+            json!({ "path": path_prop(), "from": {"type": "string", "description": "From symbol"}, "to": {"type": "string", "description": "To symbol"} }),
             &["from", "to"],
         ),
         tool(
             "doctor",
-            "Coverage report: internal call-graph recall, the callee names ctx could not pin, and what it cannot model. Set explain=true for the full per-name census.",
+            "Coverage report: what resolved, and the callee names it could not pin.",
             json!({
                 "path": path_prop(),
-                "explain": {"type": "boolean", "description": "Print the full per-name census"},
-                "max_tokens": budget_prop("Hard cap on output size (default 25000). Truncates on a line boundary and says so."),
+                "explain": {"type": "boolean", "description": "Full per-name census"},
+                "max_tokens": budget_prop(BUDGET_DESC),
             }),
             &[],
         ),
