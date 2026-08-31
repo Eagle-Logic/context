@@ -306,20 +306,23 @@ enum Cmd {
         #[arg(long)]
         metrics: Option<PathBuf>,
     },
-    /// Print the CLAUDE.md discovery block, measured for this repo
+    /// Print the agent instructions block, measured for this repo
+    ///
+    /// Append it to whatever file your agent reads: AGENTS.md, CLAUDE.md,
+    /// .cursorrules, or any other. The block itself names no vendor.
     Snippet {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
 }
 
-/// Build the CLAUDE.md discovery block for a specific repo.
+/// Build the agent instructions block for a specific repo.
 ///
 /// This is the one artifact ctx emits that gets *copied* somewhere else, so it is
 /// the one that can go stale. The previous block was generic prose telling every
 /// agent to "run `ctx map --view skeleton` to load the topology" — advice that is
 /// fine at 20 modules and catastrophic at 720, and which sat wrong in a repo's
-/// CLAUDE.md long after the tool had learned better.
+/// an instructions file long after the tool had learned better.
 ///
 /// Two changes make staleness self-correcting rather than inevitable:
 ///
@@ -329,7 +332,7 @@ enum Cmd {
 /// 2. **It is delimited.** The block is fenced by markers so regenerating
 ///    replaces it in place instead of appending a second, contradictory copy.
 ///
-/// It is also short. A CLAUDE.md block is resident in every session forever, so
+/// It is also short. This block is resident in every session forever, so
 /// anything an agent can get from `--help` on demand does not belong here — only
 /// what it cannot derive: this repo's scale, and where ctx's output is not
 /// trustworthy.
