@@ -3,6 +3,7 @@
 //! the graph `build_graph` already produces — no extra extraction.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::Path;
 
 use serde_json::json;
 
@@ -1060,6 +1061,12 @@ struct DefLite {
     end_line: usize,
     hash: String,
     doc: Option<String>,
+    /// The rendered signature — for a struct or enum this already carries the
+    /// fields or variants, which is the authoritative set of cases a reader
+    /// needs and the thing a model otherwise invents.
+    signature: String,
+    /// Language of the defining module, for fencing a materialized span.
+    lang: Lang,
 }
 
 /// Index every named item by bare name (first definition wins) for resolving
@@ -1087,6 +1094,8 @@ fn def_index(g: &Graph) -> HashMap<String, DefLite> {
                         end_line: it.end_line,
                         hash: it.hash.clone(),
                         doc: it.doc.clone(),
+                        signature: it.signature.clone(),
+                        lang: m.lang,
                     }
                 });
             }
@@ -1243,9 +1252,47 @@ fn completeness_note(g: &Graph, name: &str, subject: &str) -> String {
     )
 }
 
+/// Read the source lines a span covers, fenced for Markdown display.
+///
+/// `ctx` never keeps source text after extraction — the graph is a skeleton by
+/// design — so materializing a span means going back to disk. That is cheap
+/// (one read per distinct file, for a handful of files) and it is what turns a
+/// pointer into an answer: a model that is handed an enum's variants cannot
+/// invent a seventh one.
+///
+/// Returns `None` when the file is gone or the span no longer covers it, which
+/// is the honest outcome for a graph built from a tree that has since changed.
+fn source_span(root: &str, file: &str, line: usize, end_line: usize, lang: Lang) -> Option<String> {
+    let text = std::fs::read_to_string(Path::new(root).join(file)).ok()?;
+    let lines: Vec<&str> = text.lines().collect();
+    let (from, to) = (line.checked_sub(1)?, end_line.min(lines.len()));
+    if from >= to {
+        return None;
+    }
+    let fence = match lang {
+        Lang::Rust => "rust",
+        Lang::Python => "python",
+        Lang::TypeScript => "typescript",
+        Lang::Markdown => "markdown",
+    };
+    Some(format!("```{fence}\n{}\n```\n", lines[from..to].join("\n")))
+}
+
 /// Assemble everything needed to edit a symbol — definition, the types in its
 /// signature, what it calls, and what calls it — trimmed to a token budget.
-pub fn context(g: &Graph, query: &str, max_tokens: usize, json_out: bool) -> String {
+///
+/// With `include_source`, the definition's own source and the full body of every
+/// type in its signature are materialized inline, so the result stands on its
+/// own: a model can answer from it without opening a file. Callees and callers
+/// stay pointers deliberately — inlining them would spend the budget on the
+/// least relevant material in the bundle.
+pub fn context(
+    g: &Graph,
+    query: &str,
+    max_tokens: usize,
+    include_source: bool,
+    json_out: bool,
+) -> String {
     let q = segments(query);
     let Some(&last) = q.last() else {
         return "empty query\n".to_string();
@@ -1260,29 +1307,53 @@ pub fn context(g: &Graph, query: &str, max_tokens: usize, json_out: bool) -> Str
         return format!("no definition found for '{query}'\n");
     }
     let idx = def_index(g);
-    let budget = max_tokens.saturating_mul(4).max(400);
+    // The crate's estimator, not a local guess. This used to multiply by 4
+    // while `est_tokens` divided by 3, so a 4000-token budget authorized ~5300
+    // tokens of output — a cap that overshoots is not a cap, and it matters
+    // more now that `--include-source` can put real bulk behind it.
+    let budget = max_tokens.saturating_mul(crate::BYTES_PER_TOKEN).max(400);
 
     if json_out {
+        // The text path has always capped its lists; this one returned every
+        // caller and callee of every target. An unbudgeted JSON branch behind a
+        // `--max-tokens` flag is a cap that only applies to the humans.
+        // The text path opens with "5 definitions match (showing up to 3)".
+        // This one returned three blocks and said nothing, so a consumer with
+        // five overloads saw three and believed that was all of them.
+        let mut truncated = targets.len() > TARGET_CAP;
         let blocks: Vec<_> = targets
             .iter()
-            .take(3)
+            .take(TARGET_CAP)
             .map(|(qual, container, it, m)| {
                 let q_caller: Vec<&str> = match container {
                     Some(c) => vec![c.as_str(), last],
                     None => vec![last],
                 };
                 let callers = callers_of(g, &q_caller);
+                truncated |= it.calls.len() > LIST_CAP || callers.len() > LIST_CAP;
                 let types: Vec<_> = signature_types(&it.signature, last, &idx)
                     .iter()
                     .map(|d| {
-                        json!({"name": d.qualname, "kind": d.kind, "file": d.file, "line": d.line, "end_line": d.end_line, "hash": d.hash})
+                        json!({"name": d.qualname, "kind": d.kind, "signature": d.signature, "file": d.file, "line": d.line, "end_line": d.end_line, "hash": d.hash,
+                               "source": include_source.then(|| source_span(&g.root, &d.file, d.line, d.end_line, d.lang)).flatten()})
                     })
                     .collect();
+                let refs: Vec<_> = if is_type_kind(&it.kind) {
+                    type_references(g, last)
+                        .iter()
+                        .map(|(rm, ri)| json!({"module": rm.name, "file": rm.file, "line": ri.line, "signature": ri.signature}))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 json!({
-                    "definition": {"qualname": qual, "kind": it.kind, "file": m.file, "line": it.line, "end_line": it.end_line, "hash": it.hash, "signature": it.signature, "doc": it.doc},
+                    "definition": {"qualname": qual, "kind": it.kind, "file": m.file, "line": it.line, "end_line": it.end_line, "hash": it.hash, "signature": it.signature, "doc": it.doc,
+                                   "source": include_source.then(|| source_span(&g.root, &m.file, it.line, it.end_line, m.lang)).flatten()},
                     "signature_types": types,
-                    "calls": it.calls.iter().map(|c| json!({"to": c.to, "heuristic": c.heuristic, "dispatch": c.dispatch})).collect::<Vec<_>>(),
-                    "callers": callers.iter().map(|c| json!({"caller": c.qualname, "file": c.file, "line": c.line, "end_line": c.end_line, "hash": c.hash})).collect::<Vec<_>>(),
+                    "calls": it.calls.iter().take(LIST_CAP).map(|c| json!({"to": c.to, "heuristic": c.heuristic, "dispatch": c.dispatch, "sites": c.sites})).collect::<Vec<_>>(),
+                    "callers": callers.iter().take(LIST_CAP).map(|c| json!({"caller": c.qualname, "file": c.file, "line": c.line, "end_line": c.end_line, "hash": c.hash,
+                                   "edges": c.edges.iter().map(|e| json!({"to": e.to, "heuristic": e.heuristic, "dispatch": e.dispatch, "sites": e.sites})).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+                    "signature_references": refs,
                 })
             })
             .collect();
@@ -1290,6 +1361,8 @@ pub fn context(g: &Graph, query: &str, max_tokens: usize, json_out: bool) -> Str
         return serde_json::to_string_pretty(&json!({
             "query": query,
             "context": blocks,
+            "matches": targets.len(),
+            "truncated": truncated,
             "completeness": {
                 "unresolved_call_sites_with_this_name": unresolved,
                 "external_call_sites_with_this_name": external,
@@ -1304,12 +1377,14 @@ pub fn context(g: &Graph, query: &str, max_tokens: usize, json_out: bool) -> Str
     let mut out = String::new();
     if targets.len() > 1 {
         out.push_str(&format!(
-            "{} definitions match '{}' (showing up to 3; qualify to narrow):\n",
+            "{} definitions match '{}' (showing up to {TARGET_CAP}; qualify to narrow):\n",
             targets.len(),
             query
         ));
     }
-    for (qual, container, it, m) in targets.iter().take(3) {
+    let mut marked_heuristic = false;
+    let mut marked_dispatch = false;
+    for (qual, container, it, m) in targets.iter().take(TARGET_CAP) {
         out.push_str(&format!("\n# Context: {qual}\n\n"));
         out.push_str(&format!(
             "## Definition\n{qual}   [{}]   {}\n",
@@ -1322,11 +1397,20 @@ pub fn context(g: &Graph, query: &str, max_tokens: usize, json_out: bool) -> Str
             .map(|d| format!("  — {d}"))
             .unwrap_or_default();
         out.push_str(&format!("    {}{}\n", it.signature, doc));
+        // The definition's own source comes first and is never dropped: it is
+        // the answer, and everything after it is context for the answer.
+        if include_source {
+            if let Some(src) = source_span(&g.root, &m.file, it.line, it.end_line, m.lang) {
+                out.push('\n');
+                out.push_str(&src);
+            }
+        }
 
-        // Signature types.
+        // Signature types — dependencies of the signature itself.
         let types = signature_types(&it.signature, last, &idx);
         if !types.is_empty() {
             out.push_str("\n## Signature types\n");
+            let mut omitted = 0usize;
             for d in types {
                 let doc = d
                     .doc
@@ -1340,45 +1424,154 @@ pub fn context(g: &Graph, query: &str, max_tokens: usize, json_out: bool) -> Str
                     span(&d.file, d.line, d.end_line, &d.hash),
                     doc
                 ));
+                // The signature was always computed and never printed. For a
+                // struct or enum it carries the fields or variants — the
+                // authoritative set of cases, and the cheapest possible guard
+                // against a model inventing a variant that does not exist.
+                out.push_str(&format!("    {}\n", d.signature));
+                if include_source {
+                    match source_span(&g.root, &d.file, d.line, d.end_line, d.lang) {
+                        Some(src) if out.len() + src.len() < budget => {
+                            out.push_str(&src);
+                        }
+                        Some(_) => omitted += 1,
+                        None => {}
+                    }
+                }
+            }
+            if omitted > 0 {
+                out.push_str(&format!(
+                    "(source omitted for {omitted} type(s): over --max-tokens)\n"
+                ));
             }
         }
 
-        // Callees.
+        // Dependencies: what this symbol needs to do its job.
         if !it.calls.is_empty() {
-            out.push_str(&format!("\n## Calls ({})\n", it.calls.len()));
+            out.push_str(&format!(
+                "\n## Calls — dependencies ({}, sites in {})\n",
+                it.calls.len(),
+                m.file
+            ));
+            marked_heuristic |= it.calls.iter().any(|c| c.heuristic);
+            marked_dispatch |= it.calls.iter().any(|c| c.dispatch);
             append_capped(
                 &mut out,
-                it.calls.iter().map(|c| format!("- {}", edge_str(c))),
-                30,
+                it.calls.iter().map(|c| {
+                    if c.sites.is_empty() {
+                        format!("- {}", edge_str(c))
+                    } else {
+                        format!(
+                            "- {}  @ {}",
+                            edge_str(c),
+                            crate::render::sites_str(&c.sites)
+                        )
+                    }
+                }),
+                LIST_CAP,
                 budget,
             );
         }
 
-        // Callers (blast radius).
+        // Dependents: the blast radius of changing it.
         let q_caller: Vec<&str> = match container {
             Some(c) => vec![c.as_str(), last],
             None => vec![last],
         };
         let callers = callers_of(g, &q_caller);
         if !callers.is_empty() {
-            out.push_str(&format!("\n## Callers ({})\n", callers.len()));
+            out.push_str(&format!("\n## Callers — dependents ({})\n", callers.len()));
+            marked_heuristic |= callers.iter().any(|c| c.edges.iter().any(|e| e.heuristic));
+            marked_dispatch |= callers.iter().any(|c| c.edges.iter().any(|e| e.dispatch));
             append_capped(
                 &mut out,
                 callers.iter().map(|c| {
+                    // `callers` renders `→ callee` because the callee is what
+                    // that command is about. Here the callee is the symbol in
+                    // the heading, so repeating it on every line buys nothing.
+                    // What is worth the bytes is the half `context` used to
+                    // drop: the confidence mark — without which a guessed edge
+                    // read exactly like a proven one — and the sites.
+                    let mark = match (
+                        c.edges.iter().any(|e| e.dispatch),
+                        c.edges.iter().any(|e| e.heuristic),
+                    ) {
+                        (true, _) => "  *",
+                        (_, true) => "  ~",
+                        _ => "",
+                    };
+                    let mut sites: Vec<(usize, usize)> = c
+                        .edges
+                        .iter()
+                        .flat_map(|e| e.sites.iter().copied())
+                        .collect();
+                    sites.sort_unstable();
+                    sites.dedup();
+                    let at = if sites.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  @ {}", crate::render::sites_str(&sites))
+                    };
                     format!(
-                        "- {}  ({})",
+                        "- {}  ({}){}{}",
                         c.qualname,
-                        span(&c.file, c.line, c.end_line, &c.hash)
+                        span(&c.file, c.line, c.end_line, &c.hash),
+                        mark,
+                        at
                     )
                 }),
-                30,
+                LIST_CAP,
                 budget,
             );
         }
+
+        // A type has no call edges at all, so `context` on one used to stop at
+        // the definition — the least useful answer for the most common breaking
+        // change there is. `callers` already computes this; reuse it.
+        if is_type_kind(&it.kind) {
+            let refs = type_references(g, last);
+            if !refs.is_empty() {
+                out.push_str(&format!(
+                    "\n## Referenced by — dependents ({} signature(s))\n",
+                    refs.len()
+                ));
+                append_capped(
+                    &mut out,
+                    refs.iter().map(|(rm, ri)| {
+                        format!(
+                            "- {}  ({}:{})\n    {}",
+                            rm.name, rm.file, ri.line, ri.signature
+                        )
+                    }),
+                    LIST_CAP,
+                    budget,
+                );
+                out.push_str(
+                    "Signature references only: uses inside function BODIES are not indexed.\n",
+                );
+            }
+        }
+    }
+    if marked_heuristic {
+        out.push_str("\n(~ = heuristic edge: attributed by receiver inference, not import/path)\n");
+    }
+    if marked_dispatch {
+        out.push_str("(* = dispatch edge: one branch of a trait/interface fan-out)\n");
     }
     out.push_str(&completeness_note(g, last, "caller list"));
     out
 }
+
+/// Most definitions a `context` bundle renders when a bare name is ambiguous.
+///
+/// Past this the answer is "qualify your query", not more bundles.
+const TARGET_CAP: usize = 3;
+
+/// Most entries any one list in a `context` bundle will show.
+///
+/// A cap on lines as well as bytes: 200 callers inside budget is still 200
+/// lines of one section crowding out the three that make the bundle useful.
+const LIST_CAP: usize = 30;
 
 /// Push up to `cap` lines, stopping early if the byte budget is hit; notes
 /// how many were elided.
@@ -2763,6 +2956,175 @@ export function run(s: S): number { return s.step(); }
     }
 
     #[test]
+    fn one_edge_carries_every_call_site() {
+        // Edges dedup by callee, so three calls to `helper` are one edge. The
+        // whole point of `sites` is that the other two are not lost.
+        let (g, dir) = graph(&[(
+            "src/a.rs",
+            "pub fn helper() {}\n\
+             pub fn run() {\n\
+             \x20   helper();\n\
+             \x20   helper();\n\
+             \x20   helper();\n\
+             }\n",
+        )]);
+        let out = context(&g, "run", 4000, false, false);
+        assert!(out.contains("@ 3, 4, 5"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_multi_line_call_reports_its_whole_span() {
+        // A call is a range to read, not a point to guess from: reporting only
+        // the opening line sends a reader to the middle of an expression.
+        let (g, dir) = graph(&[(
+            "src/a.rs",
+            "pub fn helper(_a: i32, _b: i32) {}\n\
+             pub fn run() {\n\
+             \x20   helper(\n\
+             \x20       1,\n\
+             \x20       2,\n\
+             \x20   );\n\
+             }\n",
+        )]);
+        let out = context(&g, "run", 4000, false, false);
+        assert!(out.contains("@ 3-6"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn context_prints_the_variants_of_an_enum_in_its_signature() {
+        // A model shown `Mode` without its variants invents a seventh one. The
+        // signature was always computed here and never printed.
+        let (g, dir) = graph(&[(
+            "src/a.rs",
+            "pub enum Mode { Fast, Slow }\n\
+             pub fn pick(m: Mode) -> Mode { m }\n",
+        )]);
+        let out = context(&g, "pick", 4000, false, false);
+        assert!(out.contains("## Signature types"), "{out}");
+        assert!(out.contains("Fast"), "{out}");
+        assert!(out.contains("Slow"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn include_source_materializes_the_definition_and_its_types() {
+        // The variant payloads survive only in the source: the rendered
+        // signature collapses `Fast(u8)` to `Fast`.
+        let (g, dir) = graph(&[(
+            "src/a.rs",
+            "pub enum Mode { Fast(u8), Slow }\n\
+             pub fn pick(m: Mode) -> Mode { m }\n",
+        )]);
+        let plain = context(&g, "pick", 4000, false, false);
+        assert!(!plain.contains("```"), "source is opt-in:\n{plain}");
+        let out = context(&g, "pick", 4000, true, false);
+        assert!(out.contains("```rust"), "{out}");
+        assert!(out.contains("Fast(u8)"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn context_marks_a_heuristic_caller_edge() {
+        // `context` used to render every caller identically, so an edge ctx
+        // guessed read exactly like one it proved.
+        let (g, dir) = graph(&[
+            (
+                "src/a.rs",
+                "pub struct A;\nimpl A { pub fn uniquely_named_thing(&self) {} }\n",
+            ),
+            // A `for` binding: the README names it as a receiver ctx does not
+            // type, so this lands on the unique-name heuristic.
+            (
+                "src/b.rs",
+                "pub fn go(v: Vec<crate::a::A>) { for y in v { y.uniquely_named_thing(); } }\n",
+            ),
+        ]);
+        let out = context(&g, "uniquely_named_thing", 4000, false, false);
+        assert!(out.contains("b::go"), "{out}");
+        assert!(out.contains('~'), "a guessed edge must be marked:\n{out}");
+        assert!(
+            out.contains("heuristic edge"),
+            "and the legend named:\n{out}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn context_on_a_type_reports_its_signature_references() {
+        // A type has no call edges, so this used to stop at the definition —
+        // the least useful answer for the most common breaking change there is.
+        let (g, dir) = graph(&[
+            ("src/a.rs", "pub struct Widget { pub n: i32 }\n"),
+            (
+                "src/b.rs",
+                "use crate::a::Widget;\npub fn take(w: Widget) -> Widget { w }\n",
+            ),
+        ]);
+        let out = context(&g, "Widget", 4000, false, false);
+        assert!(out.contains("Referenced by"), "{out}");
+        assert!(out.contains("b::take") || out.contains("fn take"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn context_json_is_budgeted_and_says_when_it_cut() {
+        // The JSON path used to return early, before the budget existed — a cap
+        // that applied only to the humans reading the text form.
+        let mut src = String::from("pub fn target() {}\n");
+        for i in 0..(LIST_CAP + 5) {
+            src.push_str(&format!("pub fn c{i}() {{ target(); }}\n"));
+        }
+        let (g, dir) = graph(&[("src/a.rs", &src)]);
+        let out = context(&g, "target", 4000, false, true);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["truncated"], serde_json::json!(true), "{out}");
+        let callers = v["context"][0]["callers"].as_array().unwrap();
+        assert_eq!(callers.len(), LIST_CAP, "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn context_json_reports_definitions_it_did_not_render() {
+        // The text form opens with "5 definitions match (showing up to 3)".
+        // JSON returned three blocks and said nothing, so a consumer with five
+        // overloads saw three and had no way to know.
+        let files: Vec<(String, String)> = (1..=5)
+            .map(|i| {
+                (
+                    format!("src/m{i}.rs"),
+                    format!("pub struct T{i};\nimpl T{i} {{ pub fn overloaded(&self) {{}} }}\n"),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let (g, dir) = graph(&refs);
+        let out = context(&g, "overloaded", 4000, false, true);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["matches"], serde_json::json!(5), "{out}");
+        assert_eq!(v["truncated"], serde_json::json!(true), "{out}");
+        assert_eq!(v["context"].as_array().unwrap().len(), TARGET_CAP, "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn context_sites_are_stable_across_runs() {
+        // Determinism is load-bearing: the same tree must render the same bytes.
+        let (g, dir) = graph(&[(
+            "src/a.rs",
+            "pub fn helper() {}\npub fn run() { helper(); helper(); }\n",
+        )]);
+        let a = context(&g, "run", 4000, true, true);
+        let b = context(&g, "run", 4000, true, true);
+        assert_eq!(a, b);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn typescript_relative_import_resolves_module_and_callers() {
         let (g, dir) = graph(&[
             ("src/api/client.ts", "export function apiGet() {}\n"),
@@ -2800,11 +3162,11 @@ export function run(s: S): number { return s.step(); }
                 "use crate::a::helper;\npub fn run() { helper(); }\n",
             ),
         ]);
-        let out = context(&g, "run", 4000, false);
+        let out = context(&g, "run", 4000, false, false);
         assert!(out.contains("# Context: b::run"), "{out}");
         assert!(out.contains("## Calls"), "{out}");
         assert!(out.contains("a::helper"), "{out}");
-        let out2 = context(&g, "helper", 4000, false);
+        let out2 = context(&g, "helper", 4000, false, false);
         assert!(out2.contains("## Callers"), "{out2}");
         assert!(out2.contains("b::run"), "{out2}");
         let _ = fs::remove_dir_all(dir);
@@ -2815,7 +3177,7 @@ export function run(s: S): number { return s.step(); }
         let src = "pub struct Widget { n: i32 }\n\
                    pub fn make(count: i32, w: Widget) -> Widget { w }\n";
         let (g, dir) = graph(&[("src/a.rs", src)]);
-        let out = context(&g, "make", 4000, false);
+        let out = context(&g, "make", 4000, false, false);
         // `Widget` is a type ref; `count`/`w`/`i32` must not appear as types.
         assert!(out.contains("a::Widget [struct]"), "{out}");
         assert!(!out.contains("## Signature types\n- a::count"), "{out}");
@@ -2900,6 +3262,21 @@ export function run(s: S): number { return s.step(); }
     }
 
     #[test]
+    fn a_broken_link_reports_its_own_line_not_its_headings() {
+        // The line was the enclosing heading's, because that was the only one a
+        // link had available to push. A dead link four lines under a heading
+        // sent the reader to the heading.
+        let (g, dir) = graph(&[(
+            "guide.md",
+            "# Guide\n\nsome prose\n\nmore prose\n\n[ghost](./ghost.md)\n",
+        )]);
+        let cov = coverage_report(&g, &[], false, false);
+        assert!(cov.contains("guide.md:7"), "{cov}");
+        assert!(!cov.contains("guide.md:1"), "{cov}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn coverage_separates_internal_external_and_blind_spots() {
         let src = "pub fn helper() {}\n\
                    pub fn run() { helper(); let v: Vec<i32> = Vec::new(); v.len(); }\n";
@@ -2965,7 +3342,7 @@ export function run(s: S): number { return s.step(); }
         );
         assert!(c.contains("  #"), "{c}");
 
-        let ctx = context(&g, "target", 4000, false);
+        let ctx = context(&g, "target", 4000, false, false);
         assert!(ctx.contains("src/lib.rs:1"), "{ctx}");
         assert!(ctx.contains("  #"), "context needs the hash: {ctx}");
     }

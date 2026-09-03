@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
 
+use super::span_of;
 use crate::model::{Binding, FileFacts, Item, RawCall, Receiver};
 
 pub fn extract(src: &str) -> Result<FileFacts> {
@@ -355,7 +356,7 @@ fn body_facts(
     let mut out = Vec::new();
     for n in call_nodes {
         if let Some(f) = n.child_by_field_name("function") {
-            push_callee(f, src, &env, &mut out);
+            push_callee(f, src, &env, span_of(n), &mut out);
         }
     }
     (out, nested)
@@ -383,11 +384,13 @@ fn assign_binding(n: Node, src: &str) -> Option<(String, String)> {
     Some((name, t))
 }
 
-fn push_callee(f: Node, src: &str, env: &TypeEnv, out: &mut Vec<RawCall>) {
+fn push_callee(f: Node, src: &str, env: &TypeEnv, at: (usize, usize), out: &mut Vec<RawCall>) {
     match f.kind() {
         "identifier" => out.push(RawCall {
             path: text(f, src).to_string(),
             recv: Receiver::Free,
+            line: at.0,
+            end_line: at.1,
         }),
         "attribute" => {
             let t = collapse(text(f, src));
@@ -399,6 +402,8 @@ fn push_callee(f: Node, src: &str, env: &TypeEnv, out: &mut Vec<RawCall>) {
                     out.push(RawCall {
                         path: rest.to_string(),
                         recv: Receiver::SelfType,
+                        line: at.0,
+                        end_line: at.1,
                     });
                 } else if let Some((field, method)) = rest.split_once('.') {
                     // `self.engine.step()` — resolved against the attribute's
@@ -407,6 +412,8 @@ fn push_callee(f: Node, src: &str, env: &TypeEnv, out: &mut Vec<RawCall>) {
                         out.push(RawCall {
                             path: method.to_string(),
                             recv: Receiver::SelfField(field.to_string()),
+                            line: at.0,
+                            end_line: at.1,
                         });
                     }
                 }
@@ -419,6 +426,8 @@ fn push_callee(f: Node, src: &str, env: &TypeEnv, out: &mut Vec<RawCall>) {
                     out.push(RawCall {
                         path: method.to_string(),
                         recv: Receiver::Typed(ty.clone()),
+                        line: at.0,
+                        end_line: at.1,
                     });
                     return;
                 }
@@ -428,6 +437,8 @@ fn push_callee(f: Node, src: &str, env: &TypeEnv, out: &mut Vec<RawCall>) {
             out.push(RawCall {
                 path: t,
                 recv: Receiver::Free,
+                line: at.0,
+                end_line: at.1,
             });
         }
         _ => {}

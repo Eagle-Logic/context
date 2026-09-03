@@ -25,6 +25,25 @@ const SKIP_DIRS: &[&str] = &[
 
 const CHASE_DEPTH: usize = 8;
 
+/// One deduped outgoing edge, mid-accumulation.
+///
+/// Confidence narrows as sites are folded in — an edge proven at any one site
+/// is a proven edge — while sites only ever accumulate.
+struct EdgeAcc {
+    heuristic: bool,
+    dispatch: bool,
+    sites: Vec<(usize, usize)>,
+}
+
+/// The 1-based inclusive line span of a tree-sitter node.
+///
+/// Shared by the three tree-sitter extractors so a call site and an item span
+/// are measured the same way — a call is a range, not a point, because a call
+/// spanning four lines is four lines an agent has to read.
+pub(crate) fn span_of(n: tree_sitter::Node) -> (usize, usize) {
+    (n.start_position().row + 1, n.end_position().row + 1)
+}
+
 /// What to scan. Empty means "everything ctx supports".
 ///
 /// Vendored trees, archived docs and dead code are the bulk of a large repo's
@@ -1774,8 +1793,11 @@ fn compute_calls(
                 // refer to.
                 let scope = extend_locals(locals, it, fn_path, self.m);
                 // Dedup by target; if the same edge resolves both ways, the
-                // trusted (non-heuristic) resolution wins.
-                let mut calls: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+                // trusted (non-heuristic) resolution wins. The third slot
+                // accumulates every call site behind the edge, because
+                // collapsing three calls to `foo()` into one edge would
+                // otherwise throw away two of the three places to look.
+                let mut calls: BTreeMap<String, EdgeAcc> = BTreeMap::new();
                 for rc in &it.raw_calls {
                     self.diag.call_sites += 1;
                     match resolve_call(rc, container, self.m, self.ctx, self.uni, &scope) {
@@ -1791,10 +1813,15 @@ fn compute_calls(
                                 calls
                                     .entry(e.display)
                                     .and_modify(|v| {
-                                        v.0 = v.0 && e.heuristic;
-                                        v.1 = v.1 && e.dispatch;
+                                        v.heuristic = v.heuristic && e.heuristic;
+                                        v.dispatch = v.dispatch && e.dispatch;
+                                        v.sites.push((rc.line, rc.end_line));
                                     })
-                                    .or_insert((e.heuristic, e.dispatch));
+                                    .or_insert_with(|| EdgeAcc {
+                                        heuristic: e.heuristic,
+                                        dispatch: e.dispatch,
+                                        sites: vec![(rc.line, rc.end_line)],
+                                    });
                                 if let Some(d) = e.dep {
                                     if e.heuristic {
                                         self.soft_deps.insert(d.clone());
@@ -1812,7 +1839,7 @@ fn compute_calls(
                             *self.diag.unresolved_names.entry(name).or_default() += 1;
                             // For markdown, an unresolved link is a dead link.
                             if self.m.lang == Lang::Markdown {
-                                self.diag.broken_links.push((it.line, rc.path.clone()));
+                                self.diag.broken_links.push((rc.line, rc.path.clone()));
                             }
                         }
                     }
@@ -1820,10 +1847,18 @@ fn compute_calls(
                 self.per_item.push(
                     calls
                         .into_iter()
-                        .map(|(to, (heuristic, dispatch))| Call {
-                            to,
-                            heuristic,
-                            dispatch,
+                        .map(|(to, mut acc)| {
+                            // Determinism is load-bearing: the same tree must
+                            // render the same bytes, and a dispatch fan-out can
+                            // reach one target from one site more than once.
+                            acc.sites.sort_unstable();
+                            acc.sites.dedup();
+                            Call {
+                                to,
+                                heuristic: acc.heuristic,
+                                dispatch: acc.dispatch,
+                                sites: acc.sites,
+                            }
                         })
                         .collect(),
                 );

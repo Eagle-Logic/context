@@ -35,6 +35,10 @@ struct Cli {
     /// supported language except Markdown — useful when prose dominates a map.
     #[arg(long, value_enum, global = true)]
     lang: Vec<LangArg>,
+    /// Append each call edge's call sites (`callee@37, 40-43`) in map, subtree
+    /// and callers. `ctx context` always shows them.
+    #[arg(long, global = true)]
+    verbose_edges: bool,
 }
 
 /// Language selector for `--lang`.
@@ -147,6 +151,10 @@ enum Cmd {
         /// Approximate token budget for the assembled context
         #[arg(long, default_value_t = 4000)]
         max_tokens: usize,
+        /// Inline the source of the definition and of every type in its
+        /// signature, so the result answers without a follow-up file read
+        #[arg(long)]
+        include_source: bool,
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
     },
@@ -454,6 +462,7 @@ fn snippet_for(g: &Graph) -> String {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // Scan scope is fixed by argv, so install it before any graph is built.
+    render::set_verbose_edges(cli.verbose_edges);
     extract::set_filter(extract::Filter {
         exclude: cli.exclude.clone(),
         langs: cli.lang.iter().flat_map(|l| l.expand()).collect(),
@@ -563,12 +572,19 @@ fn main() -> Result<()> {
             name,
             path,
             max_tokens,
+            include_source,
             format,
         } => {
             let g = extract::build_graph(&path)?;
             print!(
                 "{}",
-                query::context(&g, &name, max_tokens, matches!(format, Format::Json))
+                query::context(
+                    &g,
+                    &name,
+                    max_tokens,
+                    include_source,
+                    matches!(format, Format::Json)
+                )
             );
         }
         Cmd::Core {

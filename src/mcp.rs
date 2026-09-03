@@ -380,7 +380,8 @@ fn tools() -> Vec<Value> {
             "context",
             "Definition, signature types, callees and callers for one symbol. \
              Usually enough to edit without opening the file.",
-            json!({ "path": path_prop(), "name": name_prop, "max_tokens": {"type": "integer", "description": "Max output tokens (default 4000)"} }),
+            json!({ "path": path_prop(), "name": name_prop, "max_tokens": {"type": "integer", "description": "Max output tokens (default 4000)"},
+                    "include_source": {"type": "boolean", "description": "Inline the definition and its signature types' source"} }),
             &["name"],
         ),
         tool(
@@ -526,7 +527,20 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
             None => ("missing required argument 'name'".into(), true),
         },
         "context" => match sarg("name") {
-            Some(n) => (query::context(g, n, uarg("max_tokens", 4000), false), false),
+            // The only budget-advertising tool that never clamped: its internal
+            // budget caps two lists, not the whole bundle, and `include_source`
+            // puts real bulk outside those lists. A ceiling that leaks is not one.
+            Some(n) => {
+                let cap = uarg("max_tokens", 4000);
+                (
+                    clamp(
+                        query::context(g, n, cap, barg("include_source"), false),
+                        Some(cap),
+                        "ctx context",
+                    ),
+                    false,
+                )
+            }
             None => ("missing required argument 'name'".into(), true),
         },
         "core" => (query::core(g, uarg("limit", 30), None, false), false),
@@ -663,6 +677,22 @@ mod tests {
                 "{tool} must be budgeted: {text}"
             );
         }
+    }
+
+    #[test]
+    fn context_is_clamped_like_every_other_budgeted_tool() {
+        // It advertised `max_tokens` and never enforced a ceiling: its internal
+        // budget caps two of its lists, not the bundle, and `include_source`
+        // puts real bulk outside those lists.
+        let args =
+            json!({"path": ".", "name": "build_graph", "max_tokens": 20, "include_source": true});
+        let (text, is_error) = dispatch("context", &args);
+        assert!(!is_error, "{text}");
+        assert!(text.contains("[ctx] TRUNCATED"), "{text}");
+        assert!(
+            crate::est_tokens(&text) < 400,
+            "cut, not merely noted: {text}"
+        );
     }
 
     #[test]

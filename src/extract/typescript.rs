@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
 
+use super::span_of;
 use crate::model::{Binding, FileFacts, Item, RawCall, Receiver};
 
 /// Extract a TypeScript (or TSX) source file. Module resolution treats import
@@ -473,10 +474,13 @@ fn collect_calls(body: Node, src: &str, env: &TypeEnv) -> Vec<RawCall> {
         let Some(f) = n.child_by_field_name("function") else {
             continue;
         };
+        let at = span_of(n);
         match f.kind() {
             "identifier" => out.push(RawCall {
                 path: text(f, src).to_string(),
                 recv: Receiver::Free,
+                line: at.0,
+                end_line: at.1,
             }),
             "member_expression" => {
                 let Some(prop) = f.child_by_field_name("property") else {
@@ -506,6 +510,8 @@ fn collect_calls(body: Node, src: &str, env: &TypeEnv) -> Vec<RawCall> {
                 out.push(RawCall {
                     path: text(prop, src).to_string(),
                     recv,
+                    line: at.0,
+                    end_line: at.1,
                 });
             }
             _ => {}

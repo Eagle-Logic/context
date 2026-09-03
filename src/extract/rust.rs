@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
 
+use super::span_of;
 use crate::model::{Binding, FileFacts, Item, RawCall, Receiver};
 
 pub fn extract(src: &str) -> Result<FileFacts> {
@@ -412,7 +413,7 @@ fn body_facts(body: Node, src: &str, env: &TypeEnv) -> (Vec<RawCall>, Vec<Item>)
     let mut out = Vec::new();
     for n in call_nodes {
         if let Some(f) = n.child_by_field_name("function") {
-            push_callee(f, src, &env, &mut out);
+            push_callee(f, src, &env, span_of(n), &mut out);
         }
     }
     (out, nested)
@@ -498,11 +499,13 @@ fn let_binding(n: Node, src: &str, env: &TypeEnv) -> Option<(String, Receiver)> 
     Some((name, r))
 }
 
-fn push_callee(f: Node, src: &str, env: &TypeEnv, out: &mut Vec<RawCall>) {
+fn push_callee(f: Node, src: &str, env: &TypeEnv, at: (usize, usize), out: &mut Vec<RawCall>) {
     match f.kind() {
         "identifier" => out.push(RawCall {
             path: text(f, src).to_string(),
             recv: Receiver::Free,
+            line: at.0,
+            end_line: at.1,
         }),
         "scoped_identifier" => {
             let t = strip_turbofish(&collapse(text(f, src)));
@@ -514,6 +517,8 @@ fn push_callee(f: Node, src: &str, env: &TypeEnv, out: &mut Vec<RawCall>) {
                         out.push(RawCall {
                             path: method.trim().to_string(),
                             recv: Receiver::Dyn(last_seg(&strip_generics(tr.trim()))),
+                            line: at.0,
+                            end_line: at.1,
                         });
                     }
                 }
@@ -523,17 +528,21 @@ fn push_callee(f: Node, src: &str, env: &TypeEnv, out: &mut Vec<RawCall>) {
                 out.push(RawCall {
                     path: rest.to_string(),
                     recv: Receiver::SelfType,
+                    line: at.0,
+                    end_line: at.1,
                 });
             } else {
                 out.push(RawCall {
                     path: t,
                     recv: Receiver::Free,
+                    line: at.0,
+                    end_line: at.1,
                 });
             }
         }
         "generic_function" => {
             if let Some(inner) = f.child_by_field_name("function") {
-                push_callee(inner, src, env, out);
+                push_callee(inner, src, env, at, out);
             }
         }
         "field_expression" => {
@@ -545,6 +554,8 @@ fn push_callee(f: Node, src: &str, env: &TypeEnv, out: &mut Vec<RawCall>) {
                 out.push(RawCall {
                     path: text(field, src).to_string(),
                     recv,
+                    line: at.0,
+                    end_line: at.1,
                 });
             }
         }
