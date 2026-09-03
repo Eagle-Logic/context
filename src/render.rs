@@ -1,12 +1,34 @@
 use crate::model::{Call, Graph, Item, Module};
 
+/// Whether edges render their call sites.
+///
+/// Off by default and process-wide, set once from argv like the scan filter.
+/// A map already spends most of its budget on edges, so putting a line list on
+/// every one of them would make the default view materially more expensive to
+/// answer a question most map readers are not asking. `ctx context` renders
+/// sites unconditionally because locating the call *is* the question there.
+static VERBOSE_EDGES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub fn set_verbose_edges(on: bool) {
+    let _ = VERBOSE_EDGES.set(on);
+}
+
+fn verbose_edges() -> bool {
+    *VERBOSE_EDGES.get().unwrap_or(&false)
+}
+
 /// An edge with its confidence marker: `~` receiver-inferred, `*` one branch
-/// of a dispatch fan-out.
+/// of a dispatch fan-out — plus its call sites under `--verbose-edges`.
 pub fn edge_str(c: &Call) -> String {
-    match (c.heuristic, c.dispatch) {
+    let marked = match (c.heuristic, c.dispatch) {
         (_, true) => format!("{}*", c.to),
         (true, _) => format!("{}~", c.to),
         _ => c.to.clone(),
+    };
+    if verbose_edges() && !c.sites.is_empty() {
+        format!("{marked}@{}", crate::query::sites_str(&c.sites))
+    } else {
+        marked
     }
 }
 

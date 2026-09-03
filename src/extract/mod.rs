@@ -25,6 +25,16 @@ const SKIP_DIRS: &[&str] = &[
 
 const CHASE_DEPTH: usize = 8;
 
+/// One deduped outgoing edge, mid-accumulation.
+///
+/// Confidence narrows as sites are folded in — an edge proven at any one site
+/// is a proven edge — while sites only ever accumulate.
+struct EdgeAcc {
+    heuristic: bool,
+    dispatch: bool,
+    sites: Vec<(usize, usize)>,
+}
+
 /// The 1-based inclusive line span of a tree-sitter node.
 ///
 /// Shared by the three tree-sitter extractors so a call site and an item span
@@ -1787,7 +1797,7 @@ fn compute_calls(
                 // accumulates every call site behind the edge, because
                 // collapsing three calls to `foo()` into one edge would
                 // otherwise throw away two of the three places to look.
-                let mut calls: BTreeMap<String, (bool, bool, Vec<(usize, usize)>)> = BTreeMap::new();
+                let mut calls: BTreeMap<String, EdgeAcc> = BTreeMap::new();
                 for rc in &it.raw_calls {
                     self.diag.call_sites += 1;
                     match resolve_call(rc, container, self.m, self.ctx, self.uni, &scope) {
@@ -1803,12 +1813,14 @@ fn compute_calls(
                                 calls
                                     .entry(e.display)
                                     .and_modify(|v| {
-                                        v.0 = v.0 && e.heuristic;
-                                        v.1 = v.1 && e.dispatch;
-                                        v.2.push((rc.line, rc.end_line));
+                                        v.heuristic = v.heuristic && e.heuristic;
+                                        v.dispatch = v.dispatch && e.dispatch;
+                                        v.sites.push((rc.line, rc.end_line));
                                     })
-                                    .or_insert_with(|| {
-                                        (e.heuristic, e.dispatch, vec![(rc.line, rc.end_line)])
+                                    .or_insert_with(|| EdgeAcc {
+                                        heuristic: e.heuristic,
+                                        dispatch: e.dispatch,
+                                        sites: vec![(rc.line, rc.end_line)],
                                     });
                                 if let Some(d) = e.dep {
                                     if e.heuristic {
@@ -1835,17 +1847,17 @@ fn compute_calls(
                 self.per_item.push(
                     calls
                         .into_iter()
-                        .map(|(to, (heuristic, dispatch, mut sites))| {
+                        .map(|(to, mut acc)| {
                             // Determinism is load-bearing: the same tree must
                             // render the same bytes, and a dispatch fan-out can
                             // reach one target from one site more than once.
-                            sites.sort_unstable();
-                            sites.dedup();
+                            acc.sites.sort_unstable();
+                            acc.sites.dedup();
                             Call {
                                 to,
-                                heuristic,
-                                dispatch,
-                                sites,
+                                heuristic: acc.heuristic,
+                                dispatch: acc.dispatch,
+                                sites: acc.sites,
                             }
                         })
                         .collect(),
