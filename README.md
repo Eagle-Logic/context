@@ -531,9 +531,9 @@ sixteen places in one function does not need sixteen line numbers to be found.
 The `~` is the same confidence mark the rest of the tool uses; `context` used to
 drop it, which made a guessed edge read exactly like a proven one.
 
-Sites cost about 25% of a bundle's tokens (2,547 → 3,186 across eight symbols in
-this repo, `len/3`). That is the whole of the increase, it is the thing being
-paid for, and it is confined to this command: `map`, `subtree`, `callers`,
+Sites cost about 23% of a bundle's tokens (2,902 → 3,587 across eight symbols in
+this repo, `len/3`, same tree through both renderers). That is the whole of the
+increase, it is the thing being paid for, and it is confined to this command: `map`, `subtree`, `callers`,
 `trace`, `core`, `modules` and `def` are byte-for-byte unchanged, and show sites
 only under the global `--verbose-edges`.
 
