@@ -26,9 +26,41 @@ pub fn edge_str(c: &Call) -> String {
         _ => c.to.clone(),
     };
     if verbose_edges() && !c.sites.is_empty() {
-        format!("{marked}@{}", crate::query::sites_str(&c.sites))
+        format!("{marked}@{}", sites_str(&c.sites))
     } else {
         marked
+    }
+}
+
+/// Most call sites shown for one edge before the rest become a count.
+///
+/// A symbol called from sixteen places in one function does not need sixteen
+/// line numbers: the first few say where to look and the count says how much
+/// there is. Past that the list is paying full price for a shrinking return —
+/// and this list is on every edge of every bundle.
+const SITE_CAP: usize = 4;
+
+/// Render an edge's call sites as a compact line list: `12, 40-43, 88 (+3)`.
+///
+/// Lines only — the file is the caller's own, named once by the section rather
+/// than repeated on every edge.
+pub fn sites_str(sites: &[(usize, usize)]) -> String {
+    let shown: Vec<String> = sites
+        .iter()
+        .take(SITE_CAP)
+        .map(|&(a, b)| {
+            if b > a {
+                format!("{a}-{b}")
+            } else {
+                a.to_string()
+            }
+        })
+        .collect();
+    let rest = sites.len().saturating_sub(SITE_CAP);
+    if rest == 0 {
+        shown.join(", ")
+    } else {
+        format!("{} (+{rest})", shown.join(", "))
     }
 }
 

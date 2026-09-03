@@ -1278,38 +1278,6 @@ fn source_span(root: &str, file: &str, line: usize, end_line: usize, lang: Lang)
     Some(format!("```{fence}\n{}\n```\n", lines[from..to].join("\n")))
 }
 
-/// Most call sites shown for one edge before the rest become a count.
-///
-/// A symbol called from sixteen places in one function does not need sixteen
-/// line numbers: the first few say where to look and the count says how much
-/// there is. Past that the list is paying full price for a shrinking return —
-/// and this list is on every edge of every bundle.
-const SITE_CAP: usize = 4;
-
-/// Render an edge's call sites as a compact line list: `12, 40-43, 88 (+3)`.
-///
-/// Lines only — the file is the caller's own, named once by the section rather
-/// than repeated on every edge.
-pub fn sites_str(sites: &[(usize, usize)]) -> String {
-    let shown: Vec<String> = sites
-        .iter()
-        .take(SITE_CAP)
-        .map(|&(a, b)| {
-            if b > a {
-                format!("{a}-{b}")
-            } else {
-                a.to_string()
-            }
-        })
-        .collect();
-    let rest = sites.len().saturating_sub(SITE_CAP);
-    if rest == 0 {
-        shown.join(", ")
-    } else {
-        format!("{} (+{rest})", shown.join(", "))
-    }
-}
-
 /// Assemble everything needed to edit a symbol — definition, the types in its
 /// signature, what it calls, and what calls it — trimmed to a token budget.
 ///
@@ -1349,10 +1317,13 @@ pub fn context(
         // The text path has always capped its lists; this one returned every
         // caller and callee of every target. An unbudgeted JSON branch behind a
         // `--max-tokens` flag is a cap that only applies to the humans.
-        let mut truncated = false;
+        // The text path opens with "5 definitions match (showing up to 3)".
+        // This one returned three blocks and said nothing, so a consumer with
+        // five overloads saw three and believed that was all of them.
+        let mut truncated = targets.len() > TARGET_CAP;
         let blocks: Vec<_> = targets
             .iter()
-            .take(3)
+            .take(TARGET_CAP)
             .map(|(qual, container, it, m)| {
                 let q_caller: Vec<&str> = match container {
                     Some(c) => vec![c.as_str(), last],
@@ -1390,6 +1361,7 @@ pub fn context(
         return serde_json::to_string_pretty(&json!({
             "query": query,
             "context": blocks,
+            "matches": targets.len(),
             "truncated": truncated,
             "completeness": {
                 "unresolved_call_sites_with_this_name": unresolved,
@@ -1405,14 +1377,14 @@ pub fn context(
     let mut out = String::new();
     if targets.len() > 1 {
         out.push_str(&format!(
-            "{} definitions match '{}' (showing up to 3; qualify to narrow):\n",
+            "{} definitions match '{}' (showing up to {TARGET_CAP}; qualify to narrow):\n",
             targets.len(),
             query
         ));
     }
     let mut marked_heuristic = false;
     let mut marked_dispatch = false;
-    for (qual, container, it, m) in targets.iter().take(3) {
+    for (qual, container, it, m) in targets.iter().take(TARGET_CAP) {
         out.push_str(&format!("\n# Context: {qual}\n\n"));
         out.push_str(&format!(
             "## Definition\n{qual}   [{}]   {}\n",
@@ -1489,7 +1461,11 @@ pub fn context(
                     if c.sites.is_empty() {
                         format!("- {}", edge_str(c))
                     } else {
-                        format!("- {}  @ {}", edge_str(c), sites_str(&c.sites))
+                        format!(
+                            "- {}  @ {}",
+                            edge_str(c),
+                            crate::render::sites_str(&c.sites)
+                        )
                     }
                 }),
                 LIST_CAP,
@@ -1534,7 +1510,7 @@ pub fn context(
                     let at = if sites.is_empty() {
                         String::new()
                     } else {
-                        format!("  @ {}", sites_str(&sites))
+                        format!("  @ {}", crate::render::sites_str(&sites))
                     };
                     format!(
                         "- {}  ({}){}{}",
@@ -1585,6 +1561,11 @@ pub fn context(
     out.push_str(&completeness_note(g, last, "caller list"));
     out
 }
+
+/// Most definitions a `context` bundle renders when a bare name is ambiguous.
+///
+/// Past this the answer is "qualify your query", not more bundles.
+const TARGET_CAP: usize = 3;
 
 /// Most entries any one list in a `context` bundle will show.
 ///
@@ -3101,6 +3082,32 @@ export function run(s: S): number { return s.step(); }
         assert_eq!(v["truncated"], serde_json::json!(true), "{out}");
         let callers = v["context"][0]["callers"].as_array().unwrap();
         assert_eq!(callers.len(), LIST_CAP, "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn context_json_reports_definitions_it_did_not_render() {
+        // The text form opens with "5 definitions match (showing up to 3)".
+        // JSON returned three blocks and said nothing, so a consumer with five
+        // overloads saw three and had no way to know.
+        let files: Vec<(String, String)> = (1..=5)
+            .map(|i| {
+                (
+                    format!("src/m{i}.rs"),
+                    format!("pub struct T{i};\nimpl T{i} {{ pub fn overloaded(&self) {{}} }}\n"),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let (g, dir) = graph(&refs);
+        let out = context(&g, "overloaded", 4000, false, true);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["matches"], serde_json::json!(5), "{out}");
+        assert_eq!(v["truncated"], serde_json::json!(true), "{out}");
+        assert_eq!(v["context"].as_array().unwrap().len(), TARGET_CAP, "{out}");
         let _ = fs::remove_dir_all(dir);
     }
 
