@@ -104,7 +104,7 @@ pub fn extract(src: &str) -> Result<FileFacts> {
                 name: Some(s),
                 raw_calls: Vec::new(),
             };
-            extract_links(&text, &defs, &mut item.raw_calls); // links in the heading itself
+            extract_links(&text, i + 1, &defs, &mut item.raw_calls); // links in the heading itself
             item.line = flat.len(); // placeholder; real line assigned next pass
             flat.push(Heading { level, item });
             prev_line = Some(line);
@@ -117,7 +117,7 @@ pub fn extract(src: &str) -> Result<FileFacts> {
             // A `[label]: url` definition line is metadata, not prose or a link
             // use — don't harvest it and don't let it become the section doc.
             if link_def(line).is_none() {
-                extract_links(line, &defs, &mut h.item.raw_calls);
+                extract_links(line, i + 1, &defs, &mut h.item.raw_calls);
                 if h.item.doc.is_none() && !trimmed.is_empty() && !is_structural(trimmed) {
                     h.item.doc = Some(clip(&strip_inline(trimmed)));
                 }
@@ -336,7 +336,7 @@ fn is_structural(t: &str) -> bool {
 /// Extract link targets from a line: inline `[t](url)`, images `![t](url)`,
 /// wiki `[[Page]]`, and reference-style `[t][ref]` / `[t][]` / `[ref]`
 /// resolved against `defs`. Inline code spans are skipped.
-fn extract_links(line: &str, defs: &HashMap<String, String>, out: &mut Vec<RawCall>) {
+fn extract_links(line: &str, at: usize, defs: &HashMap<String, String>, out: &mut Vec<RawCall>) {
     let b: Vec<char> = line.chars().collect();
     let mut i = 0;
     let mut in_code = false;
@@ -352,7 +352,7 @@ fn extract_links(line: &str, defs: &HashMap<String, String>, out: &mut Vec<RawCa
                     let inner: String = b[i + 2..close].iter().collect();
                     let target = inner.split('|').next().unwrap_or("").trim();
                     if !target.is_empty() {
-                        push_link(&format!("[[{target}]]"), out);
+                        push_link(&format!("[[{target}]]"), at, out);
                     }
                     i = close + 2;
                 } else {
@@ -361,7 +361,7 @@ fn extract_links(line: &str, defs: &HashMap<String, String>, out: &mut Vec<RawCa
             }
             '[' => {
                 if let Some((url, next)) = bracket_link(&b, i, defs) {
-                    push_link(&url, out);
+                    push_link(&url, at, out);
                     i = next;
                 } else {
                     i += 1;
@@ -436,12 +436,14 @@ fn link_def(line: &str) -> Option<(String, String)> {
     Some((label.to_string(), url.to_string()))
 }
 
-fn push_link(url: &str, out: &mut Vec<RawCall>) {
+fn push_link(url: &str, at: usize, out: &mut Vec<RawCall>) {
     let url = url.trim();
     if !url.is_empty() {
         out.push(RawCall {
             path: url.to_string(),
             recv: Receiver::Free,
+            line: at,
+            end_line: at,
         });
     }
 }

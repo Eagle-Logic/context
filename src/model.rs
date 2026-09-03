@@ -224,6 +224,14 @@ pub struct Call {
     /// construction — exactly one sibling `dispatch` edge runs at a time.
     #[serde(skip_serializing_if = "is_false")]
     pub dispatch: bool,
+    /// Every site in the caller's body that produced this edge, as
+    /// `(line, end_line)` of the whole call expression.
+    ///
+    /// Plural because edges dedup by callee: three calls to `foo()` in one
+    /// function are one edge with three sites. A multi-line call reports its
+    /// full span, so the pair is a range to read, not a point to guess from.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sites: Vec<(usize, usize)>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -255,11 +263,16 @@ pub enum Receiver {
 }
 
 /// One call site: `path` is the callee as written (`build`, `helpers::go`,
-/// `a.b.f`); `recv` records how the receiver was expressed.
+/// `a.b.f`); `recv` records how the receiver was expressed; `line`/`end_line`
+/// span the whole call expression, so a multi-line call is a range.
 #[derive(Clone)]
 pub struct RawCall {
     pub path: String,
     pub recv: Receiver,
+    /// First line of the call expression (1-based).
+    pub line: usize,
+    /// Last line of the call expression, inclusive.
+    pub end_line: usize,
 }
 
 impl Module {
