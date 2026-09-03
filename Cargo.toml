@@ -1,6 +1,6 @@
 [package]
 name = "code-context"
-version = "0.22.0"
+version = "0.22.1"
 edition = "2021"
 rust-version = "1.88"
 description = "ctx — a queryable code graph for coding agents: call graphs, blast radius, API breakage, cross-language port parity"
