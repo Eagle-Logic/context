@@ -28,7 +28,7 @@ tree — this blast radius is complete to the limit of what ctx parses.
 
 That last line is the whole idea. The answer travels with its own limits.
 
-**→ [EXAMPLES.md](EXAMPLES.md)** — nine commands run against this repo, verbatim
+**→ [EXAMPLES.md](EXAMPLES.md)** — ten commands run against this repo, verbatim
 output, including the parts where `ctx` reports its own limits.
 
 ## Four things you won't find elsewhere
@@ -331,6 +331,7 @@ of it, and the whole-repo map at the bottom is measured at
 ```sh
 # Everything needed to edit a symbol, in one call (def + types + callees + callers)
 ctx context streamChat --max-tokens 4000
+ctx context streamChat --include-source   # + the source, so it answers alone
 
 # Who calls this? (resolved reverse call edges — the blast radius)
 ctx callers basename
@@ -386,6 +387,9 @@ ctx map -o CODEBASE_MAP.md            # write it out (goes stale on the next edi
 # Scoping (global, repeatable)
 ctx map --lang code                   # Rust/Python/TypeScript only, no prose
 ctx map --exclude 'docs/archive/**'   # vendored trees, dead code
+
+# Show each edge's call sites in map/subtree/callers (context always shows them)
+ctx callers basename --verbose-edges
 
 # Machine-readable
 ctx map --format json
@@ -505,6 +509,61 @@ text grep floods on a common method name. `subtree` accepts a full module name
 type definitions referenced in its signature, its callees, and its callers —
 trimmed to `--max-tokens` — so an agent gathers full editing context for a
 symbol without a map→def→callers→subtree dance.
+
+Every edge in it carries **where the call happens**, and the two directions are
+named rather than left to be inferred:
+
+```
+## Calls — dependencies (5, sites in src/query.rs)
+- Totals::add  @ 1775
+- coverage_report::pct  @ 1795, 1796
+- Resolution::one  @ 1316, 1321, 1345-1349
+
+## Callers — dependents (3)
+- extract::build_universe  (src/extract/mod.rs:1094-1164  #b2e4439cb24a)  ~  @ 1153
+- extract::candidates  (src/extract/mod.rs:641-741  #5bd2160c79a5)  @ 652, 686, 722
+```
+
+A site is a **span**, not a line — `1345-1349` is a call spread over five lines,
+and the reader needs all five. Edges dedup by callee, so one edge lists every
+site behind it; past four the rest become a count, because a symbol called from
+sixteen places in one function does not need sixteen line numbers to be found.
+The `~` is the same confidence mark the rest of the tool uses; `context` used to
+drop it, which made a guessed edge read exactly like a proven one.
+
+Sites cost about 25% of a bundle's tokens (2,547 → 3,186 across eight symbols in
+this repo, `len/3`). That is the whole of the increase, it is the thing being
+paid for, and it is confined to this command: `map`, `subtree`, `callers`,
+`trace`, `core`, `modules` and `def` are byte-for-byte unchanged, and show sites
+only under the global `--verbose-edges`.
+
+**`--include-source`** goes one further and inlines the definition's own source
+plus the **full body of every type in its signature**, so the bundle answers on
+its own rather than telling an agent which file to open next:
+
+~~~
+$ ctx context pick --include-source
+## Signature types
+- a::Mode [enum]  src/a.rs:1  #ff2c9d1e4b70
+    pub enum Mode { Fast | Slow }
+```rust
+pub enum Mode { Fast(u8), Slow }
+```
+~~~
+
+The enum is the case that matters. A model shown `Mode` with no variants will
+invent a third one; shown two, it cannot. Note that the *payload* (`Fast(u8)`)
+survives only in the materialized source — the rendered signature collapses it —
+which is exactly the gap the flag exists to close.
+
+Callees and callers stay pointers under the flag, deliberately: inlining them
+would spend the budget on the least relevant material in the bundle, and their
+spans already say what to read if you want it. When a type's source will not fit
+the budget, the omission is stated in band rather than made silently.
+
+This is also the shape for using `ctx` **without** an agent — one query before
+you paste a question into a model, instead of dumping files and hoping it picks
+the relevant part. That is worth more the smaller the model.
 
 `changed` turns a diff into an impact map: it runs `git diff` (working tree vs
 HEAD, or vs `--since <ref>`, including untracked files), maps changed files onto
@@ -684,7 +743,7 @@ turn whether or not a tool is ever called:
 | | resident tokens |
 |---|---|
 | `ctx snippet` block | **616** |
-| MCP tool definitions (10 tools) | **1,326** |
+| MCP tool definitions (10 tools) | **1,363** |
 
 2.2x, before either has answered anything. An MCP tool list is itself a blob
 injected at boot — the shape this project objects to — so the honest advice is
@@ -723,7 +782,10 @@ person to see the cost before it's paid:
   tokens (4,000 for `context`). `map` and `subtree` degrade instead of cutting:
   less detail, then fewer modules. The flat reports cut on a line boundary and
   say so in band. Pass `max_tokens` to raise it. `map` also defaults to the
-  `skeleton` view rather than the CLI's `full`.
+  `skeleton` view rather than the CLI's `full`. `context` additionally takes
+  `include_source`, and is clamped like the other flat reports — it advertised a
+  budget and enforced it only over two of its lists, which `include_source`
+  would have made a much larger hole.
 - **The server only reads its own root**, which defaults to the working
   directory it was started in. A `path` that resolves outside it — absolute,
   `../..`, or through a symlink — is refused with a message naming the root.
@@ -838,7 +900,10 @@ scanned subtree. Prose→code resolution is not yet modelled.
   type at all, through a global method index **when the name is unique
   codebase-wide, not a ubiquitous std method** (`push`, `get`, `items`, …), and
   **in the same language**. Ambiguous or unresolvable calls are dropped, never
-  guessed.
+  guessed. Each edge also carries the **span of every call expression** behind
+  it — a span rather than a line, because a call can run over several — which is
+  what `ctx context` renders as `@ 37, 40-43` and what `--verbose-edges` adds
+  elsewhere. Edges dedup by callee, so one edge can have many sites.
 - **Dynamic dispatch**: a call through a trait object, `impl Trait`, a bounded
   generic, `<T as Trait>::f`, a TypeScript `interface`/`implements`, or a Python
   base class fans out to **every implementation that defines the method**, each
