@@ -1278,6 +1278,19 @@ fn source_span(root: &str, file: &str, line: usize, end_line: usize, lang: Lang)
     Some(format!("```{fence}\n{}\n```\n", lines[from..to].join("\n")))
 }
 
+/// Whether `d` is the thing `it` lives inside — same file, and a span that
+/// contains it.
+///
+/// A method that returns its own container (`-> Self`, `-> "NativeBackend"`,
+/// every builder and fluent API) lists that container as a signature type,
+/// which is fine. Materializing it is not: the container's body *contains* the
+/// definition already printed above, so the bundle pays for the whole class to
+/// re-say what it just said. Measured on a real 234-line class, that made
+/// `--include-source` cost more than reading the file it was meant to replace.
+fn encloses(d: &DefLite, file: &str, line: usize, end_line: usize) -> bool {
+    d.file == file && d.line <= line && d.end_line >= end_line
+}
+
 /// Assemble everything needed to edit a symbol — definition, the types in its
 /// signature, what it calls, and what calls it — trimmed to a token budget.
 ///
@@ -1335,7 +1348,7 @@ pub fn context(
                     .iter()
                     .map(|d| {
                         json!({"name": d.qualname, "kind": d.kind, "signature": d.signature, "file": d.file, "line": d.line, "end_line": d.end_line, "hash": d.hash,
-                               "source": include_source.then(|| source_span(&g.root, &d.file, d.line, d.end_line, d.lang)).flatten()})
+                               "source": (include_source && !encloses(d, &m.file, it.line, it.end_line)).then(|| source_span(&g.root, &d.file, d.line, d.end_line, d.lang)).flatten()})
                     })
                     .collect();
                 let refs: Vec<_> = if is_type_kind(&it.kind) {
@@ -1411,6 +1424,7 @@ pub fn context(
         if !types.is_empty() {
             out.push_str("\n## Signature types\n");
             let mut omitted = 0usize;
+            let mut enclosing = 0usize;
             for d in types {
                 let doc = d
                     .doc
@@ -1430,14 +1444,24 @@ pub fn context(
                 // against a model inventing a variant that does not exist.
                 out.push_str(&format!("    {}\n", d.signature));
                 if include_source {
-                    match source_span(&g.root, &d.file, d.line, d.end_line, d.lang) {
-                        Some(src) if out.len() + src.len() < budget => {
-                            out.push_str(&src);
+                    if encloses(d, &m.file, it.line, it.end_line) {
+                        enclosing += 1;
+                    } else {
+                        match source_span(&g.root, &d.file, d.line, d.end_line, d.lang) {
+                            Some(src) if out.len() + src.len() < budget => {
+                                out.push_str(&src);
+                            }
+                            Some(_) => omitted += 1,
+                            None => {}
                         }
-                        Some(_) => omitted += 1,
-                        None => {}
                     }
                 }
+            }
+            if enclosing > 0 {
+                out.push_str(&format!(
+                    "(source omitted for {enclosing} type(s): encloses this definition, \
+                     whose source is above)\n"
+                ));
             }
             if omitted > 0 {
                 out.push_str(&format!(
@@ -3022,6 +3046,34 @@ export function run(s: S): number { return s.step(); }
         let out = context(&g, "pick", 4000, true, false);
         assert!(out.contains("```rust"), "{out}");
         assert!(out.contains("Fast(u8)"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn include_source_skips_a_type_that_encloses_the_definition() {
+        // `-> Self` / `-> "Cls"` / every builder: the return type is the
+        // enclosing container, whose body already contains the definition
+        // printed above it. Materializing it made `--include-source` cost more
+        // than reading the file it was meant to replace (measured: 3,514 vs
+        // 2,926 tokens on a real 234-line Python class).
+        let (g, dir) = graph(&[(
+            "src/a.py",
+            "class Builder:\n\
+             \x20   def step(self) -> \"Builder\":\n\
+             \x20       return self\n",
+        )]);
+        let out = context(&g, "step", 4000, true, false);
+        assert!(out.contains("## Signature types"), "{out}");
+        assert!(
+            out.contains("a.Builder"),
+            "the type is still listed:\n{out}"
+        );
+        assert!(
+            out.contains("encloses this definition"),
+            "and says why:\n{out}"
+        );
+        // Exactly one fenced block: the definition's own source, not the class's.
+        assert_eq!(out.matches("```").count(), 2, "{out}");
         let _ = fs::remove_dir_all(dir);
     }
 

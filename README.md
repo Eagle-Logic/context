@@ -558,8 +558,10 @@ which is exactly the gap the flag exists to close.
 
 Callees and callers stay pointers under the flag, deliberately: inlining them
 would spend the budget on the least relevant material in the bundle, and their
-spans already say what to read if you want it. When a type's source will not fit
-the budget, the omission is stated in band rather than made silently.
+spans already say what to read if you want it. A type that *encloses* the
+definition is listed but not materialized — a method returning `Self`, or any
+builder, names its own container, whose body already contains the definition
+printed above it. Either omission is stated in band rather than made silently.
 
 This is also the shape for using `ctx` **without** an agent — one query before
 you paste a question into a model, instead of dumping files and hoping it picks

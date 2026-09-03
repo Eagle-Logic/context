@@ -11,7 +11,7 @@ tree they were run against, so a version string dates them without making them
 current — this file had drifted a whole minor version before anyone noticed.
 Regenerate it in the release commit instead.
 
-The repo under analysis: **14 Rust files, 3 Markdown files, 17 modules, 5,096
+The repo under analysis: **14 Rust files, 3 Markdown files, 17 modules, 5,101
 call sites.** Small enough to read in a sitting, which makes it a fair place to
 check whether the answers are actually right.
 
@@ -36,11 +36,11 @@ $ ctx callers coverage_report
 6 caller(s) of 'coverage_report':
 
 mcp::dispatch  (src/mcp.rs:434-571  #94ff6095218b)  → query::coverage_report
-query::tests::a_broken_link_reports_its_own_line_not_its_headings  (src/query.rs:3265-3277  #f94b64f4da35)  → coverage_report
-query::tests::coverage_separates_internal_external_and_blind_spots  (src/query.rs:3280-3291  #adf073f295c1)  → coverage_report
-query::tests::doctor_names_what_it_could_not_pin  (src/query.rs:2434-2443  #6cd4660b675e)  → coverage_report
-query::tests::doctor_recall_excludes_provably_external_calls  (src/query.rs:2409-2421  #6c3b7200040d)  → coverage_report
-query::tests::markdown_links_resolve_headings_and_flag_broken  (src/query.rs:3238-3262  #839e24537089)  → coverage_report
+query::tests::a_broken_link_reports_its_own_line_not_its_headings  (src/query.rs:3317-3329  #f94b64f4da35)  → coverage_report
+query::tests::coverage_separates_internal_external_and_blind_spots  (src/query.rs:3332-3343  #adf073f295c1)  → coverage_report
+query::tests::doctor_names_what_it_could_not_pin  (src/query.rs:2458-2467  #6cd4660b675e)  → coverage_report
+query::tests::doctor_recall_excludes_provably_external_calls  (src/query.rs:2433-2445  #6c3b7200040d)  → coverage_report
+query::tests::markdown_links_resolve_headings_and_flag_broken  (src/query.rs:3290-3314  #839e24537089)  → coverage_report
 
 completeness: no call site named `coverage_report` went unresolved anywhere in this tree —
 this blast radius is complete to the limit of what ctx parses.
@@ -66,7 +66,7 @@ crate::main  [src/main.rs:462]
     → mcp::handle_method  [src/mcp.rs:260]
       → mcp::tools_call  [src/mcp.rs:418]
         → mcp::dispatch  [src/mcp.rs:434]
-          → query::coverage_report  [src/query.rs:1788]
+          → query::coverage_report  [src/query.rs:1812]
 ```
 
 ---
@@ -244,16 +244,16 @@ $ ctx doctor
 Modules: 17  (markdown 3, rust 14)
 
 ## Internal recall — the number to trust
-  1095/1137 = 96.3%   of call sites that could be internal, ctx pinned this many.
+  1098/1140 = 96.3%   of call sites that could be internal, ctx pinned this many.
 
 A call site is "could be internal" when the callee name is defined somewhere
 under this root. Calls into std or a third-party crate are excluded, because no
 internal edge could exist for them however good the resolver gets.
 
 ## Every call site, bucketed
-call sites:            5096
-  internal edges:      1095   [15 heuristic (~), 0 dispatch fan-out (*)]
-  external (provable): 3959   (77.7%)  callee defined nowhere here — std/extern
+call sites:            5101
+  internal edges:      1098   [15 heuristic (~), 0 dispatch fan-out (*)]
+  external (provable): 3961   (77.7%)  callee defined nowhere here — std/extern
   unresolved internal: 42     (0.8%)  the real misses — see below
 
 ## What ctx missed (callee names that exist here but went unpinned)
@@ -281,7 +281,7 @@ grep these; every other edge in the map is one ctx could prove.
   parity                           18% heuristic (11/61 edges)
   extract                          1% heuristic (2/172 edges)
   crate                            1% heuristic (1/148 edges)
-  query                            0% heuristic (1/233 edges)
+  query                            0% heuristic (1/236 edges)
 
 ## Not modeled (blind spots)
   none — every source file under this root is a supported language
@@ -320,7 +320,7 @@ Ranked by dependency centrality (PageRank); higher = more depended-upon.
   0.0657     4    2  render  [13 items]
   0.0546     1    0  EXAMPLES  [13 items]
   0.0512     3    3  view  [11 items]
-  0.0491     2    4  query  [139 items]
+  0.0491     2    4  query  [141 items]
   0.0295     0    0  SECURITY  [6 items]
   0.0295     0    4  crate  [46 items]
 ```
@@ -374,7 +374,7 @@ query::signature_types   [fn]   src/query.rs:1179-1198  #4ac8c94b6d61
 - identifiers  @ 1184
 
 ## Callers — dependents (1)
-- query::context  (src/query.rs:1289-1563  #3e2659929648)  @ 1334, 1410
+- query::context  (src/query.rs:1302-1587  #b0710a0017d0)  @ 1347, 1423
 
 completeness: no call site named `signature_types` went unresolved anywhere in this tree —
 this caller list is complete to the limit of what ctx parses.
@@ -398,6 +398,46 @@ $ ctx context Receiver --include-source
 model::Receiver   [enum]   src/model.rs:244-263  #fe75ad1b13f7
     pub enum Receiver { Free | SelfType | SelfField | Typed | Dyn | Unknown }  — How a callee was referenced — governs how confidently a receiver method
 
+```rust
+pub enum Receiver {
+    /// A free function or fully-pathed call: `foo()`, `a::b::foo()`.
+    Free,
+    /// An explicit self/Self receiver (`self.f()`, `Self::f()`): the
+    /// enclosing impl/class is the correct container.
+    SelfType,
+    /// `self.field.method()` — the receiver is a field of the enclosing type,
+    /// resolved against that type's declared field types.
+    SelfField(String),
+    /// A receiver whose concrete type is known from a local binding, a
+    /// parameter annotation, or a field declaration: `let e: Engine`, then
+    /// `e.step()`. The attribution is backed by a type written in the source.
+    Typed(String),
+    /// A receiver that is a trait object, `impl Trait`, a bounded generic, or
+    /// an interface-typed value: the call dispatches over every implementation.
+    Dyn(String),
+    /// An opaque receiver (`expr.f()`): the type is unknown, so any
+    /// attribution is a heuristic guess.
+    Unknown,
+}
+```
+
+## Referenced by — dependents (6 signature(s))
+- extract  (src/extract/mod.rs:1392)
+    fn field_receiver(ty: &str, uni: &Universe) -> Receiver
+- extract::rust  (src/extract/rust.rs:133)
+    struct TypeEnv { vars: HashMap<String, Receiver> }
+- extract::rust  (src/extract/rust.rs:237)
+    fn classify_type(raw: &str, generics: &HashMap<String, String>) -> Option<Receiver>
+- extract::rust  (src/extract/rust.rs:469)
+    fn let_binding(n: Node, src: &str, env: &TypeEnv) -> Option<(String, Receiver)>
+- extract::rust  (src/extract/rust.rs:567)
+    fn receiver_of(v: Node, src: &str, env: &TypeEnv) -> Receiver
+- model  (src/model.rs:269)
+    pub struct RawCall { pub path: String, pub recv: Receiver, pub line: usize, pub end_line: usize }
+Signature references only: uses inside function BODIES are not indexed.
+
+completeness: no call site named `Receiver` went unresolved anywhere in this tree —
+this caller list is complete to the limit of what ctx parses.
 ```rust
 pub enum Receiver {
     /// A free function or fully-pathed call: `foo()`, `a::b::foo()`.
