@@ -45,13 +45,21 @@ tokens_of () { local n; n=$(wc -c); echo $(( n / 3 )); }
 # The grep a competent agent would actually write: call syntax, language
 # filtered, skipping the directories ctx skips. Not a naive `grep -rn name`,
 # because beating a strawman proves nothing.
+# Searched from INSIDE the tree, against `.`, so hits read `./src/x.rs:12:` and
+# not `/wherever/the/cache/lives/src/x.rs:12:`. The cost of an answer is counted
+# in bytes, so an absolute path would bill grep for the length of a directory
+# name that has nothing to do with either tool — and would make the figure
+# depend on where the corpus happened to be cloned. Measured on ripgrep, the
+# prefix alone was 9,322 tokens, 21% of that row. It also biased the comparison
+# in ctx's favour, since ctx already reports paths relative to its root.
 fair_grep () {
   local dir="$1" sym="$2"
-  grep -rnE "\\b${sym}\\(" "$dir" \
-    --include='*.rs' --include='*.py' --include='*.ts' --include='*.tsx' --include='*.go' \
-    --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=target \
-    --exclude-dir=__pycache__ --exclude-dir=.venv --exclude-dir=venv \
-    --exclude-dir=dist --exclude-dir=build 2>/dev/null || true
+  ( cd "$dir" 2>/dev/null || return 0
+    grep -rnE "\\b${sym}\\(" . \
+      --include='*.rs' --include='*.py' --include='*.ts' --include='*.tsx' --include='*.go' \
+      --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=target \
+      --exclude-dir=__pycache__ --exclude-dir=.venv --exclude-dir=venv \
+      --exclude-dir=dist --exclude-dir=build 2>/dev/null || true )
 }
 
 # Fetch one pinned commit, shallow. Cached, because re-cloning on every run
