@@ -1273,6 +1273,7 @@ fn source_span(root: &str, file: &str, line: usize, end_line: usize, lang: Lang)
         Lang::Rust => "rust",
         Lang::Python => "python",
         Lang::TypeScript => "typescript",
+        Lang::Go => "go",
         Lang::Markdown => "markdown",
     };
     Some(format!("```{fence}\n{}\n```\n", lines[from..to].join("\n")))
@@ -2027,7 +2028,7 @@ pub fn coverage_report(
             out.push_str(&format!("  .{ext:<8} {n}\n"));
         }
     }
-    out.push_str("  (supported: .rs .py .ts .tsx .md)\n");
+    out.push_str("  (supported: .rs .py .ts .tsx .go .md)\n");
     out
 }
 

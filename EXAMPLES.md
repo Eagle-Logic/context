@@ -285,7 +285,7 @@ grep these; every other edge in the map is one ctx could prove.
 
 ## Not modeled (blind spots)
   none — every source file under this root is a supported language
-  (supported: .rs .py .ts .tsx .md)
+  (supported: .rs .py .ts .tsx .go .md)
 ```
 
 96.2% recall comes with **the exact grep list for the other 3.8%** — eight

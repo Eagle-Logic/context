@@ -243,6 +243,15 @@ pub fn is_public(it: &Item, lang: Lang) -> bool {
                 .iter()
                 .any(|k| s.starts_with(k))
         }
+        // Go's visibility rule is the identifier itself: an exported name
+        // begins with an uppercase letter, and there is no keyword to look for.
+        // The synthetic `<package level>` item is the only nameless one, and it
+        // is wiring rather than API.
+        Lang::Go => it
+            .name
+            .as_deref()
+            .and_then(|n| n.chars().next())
+            .is_some_and(char::is_uppercase),
         // Every heading is part of the document's structure.
         Lang::Markdown => true,
     }

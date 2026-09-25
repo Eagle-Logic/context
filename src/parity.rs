@@ -80,6 +80,34 @@ pub fn py_rust_aliases() -> AliasMap {
     .collect()
 }
 
+/// Systematic Python→Go renames, as `canon(python) -> [canon(go)…]`.
+///
+/// Sparser than the Rust table because `canon()` already bridges most of it:
+/// Go's exported names are capitalised, which canonicalisation folds away, so
+/// `__len__`↔`Len`, `__next__`↔`Next` and `__contains__`↔`Contains` need no
+/// entry.
+///
+/// `__init__` maps to `New`, which is Go's convention for a package's primary
+/// constructor (`store.New()`). It deliberately does NOT try to reach the
+/// `NewGate` form: that target name is derived from the *container*, which a
+/// name-to-name table cannot express, so such a pair is reported as a missing
+/// member plus an added one rather than aligned on a guess.
+pub fn py_go_aliases() -> AliasMap {
+    [
+        ("init", vec!["new"]),
+        ("str", vec!["string"]),
+        ("repr", vec!["string", "gostring"]),
+        ("eq", vec!["equal", "equals"]),
+        ("getitem", vec!["get"]),
+        ("setitem", vec!["set"]),
+        ("delitem", vec!["delete", "remove"]),
+        ("call", vec!["call", "do"]),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.into_iter().map(String::from).collect()))
+    .collect()
+}
+
 #[derive(Clone)]
 struct Member {
     /// Original (display) container name; canonicalised at key time.

@@ -1,3 +1,4 @@
+pub mod go;
 pub mod markdown;
 pub mod python;
 pub mod rust;
@@ -92,6 +93,7 @@ pub fn filter_note() -> Option<String> {
                 Lang::Rust => "rust",
                 Lang::Python => "python",
                 Lang::TypeScript => "ts",
+                Lang::Go => "go",
                 Lang::Markdown => "md",
             })
             .collect();
@@ -158,6 +160,7 @@ pub fn source_files(root: &Path) -> Vec<PathBuf> {
             Some("rs") => lang_selected(Lang::Rust),
             Some("py") => lang_selected(Lang::Python),
             Some("tsx") => lang_selected(Lang::TypeScript),
+            Some("go") => lang_selected(Lang::Go),
             Some("md") | Some("markdown") => lang_selected(Lang::Markdown),
             // Skip `.d.ts` — ambient type declarations carry no topology.
             Some("ts") => {
@@ -207,6 +210,10 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
         .with_context(|| format!("cannot resolve path {}", root.display()))?;
 
     let files = source_files(&root);
+    // Go's unit of import is the module path declared in go.mod, so resolving
+    // an import means splitting it into "which go.mod owns this" and "which
+    // directory under it". Discovered once for the whole tree.
+    let go_mods = go_modules(&root);
 
     let mut modules = Vec::new();
     for path in &files {
@@ -220,6 +227,7 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
             Some("rs") => Lang::Rust,
             Some("py") => Lang::Python,
             Some("ts") | Some("tsx") => Lang::TypeScript,
+            Some("go") => Lang::Go,
             Some("md") | Some("markdown") => Lang::Markdown,
             _ => continue,
         };
@@ -232,6 +240,7 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
             }
             Lang::TypeScript => typescript::extract(&src, ext == Some("tsx"))
                 .with_context(|| format!("parsing {}", rel.display()))?,
+            Lang::Go => go::extract(&src).with_context(|| format!("parsing {}", rel.display()))?,
             Lang::Markdown => {
                 markdown::extract(&src).with_context(|| format!("parsing {}", rel.display()))?
             }
@@ -254,10 +263,41 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
                 b.public = false;
             }
         }
-        let (name, crate_prefix) = module_name(rel, lang);
+        let (name, mut crate_prefix) = module_name(rel, lang);
+        // A Go package IS its directory: every .go file in it is a peer, with no
+        // per-file visibility and no per-file import path. Files stay separate
+        // modules (so an item's location is its own file), but resolution keys
+        // on the package, which is what an import names.
+        let mut resolve_name = String::new();
+        let mut go_module = Vec::new();
+        if lang == Lang::Go {
+            let dir: Vec<String> = rel
+                .parent()
+                .map(|d| {
+                    d.iter()
+                        .filter_map(|c| c.to_str())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            // The package a file belongs to, which is its directory. Files
+            // directly under the scan root share the root package, and it needs
+            // a name of its own: leaving it empty made every root-level file its
+            // own package, so a call into a sibling file read as a miss — and
+            // Go repos routinely put their main package at the root.
+            resolve_name = if dir.is_empty() {
+                "root".to_string()
+            } else {
+                dir.join(Lang::sep(lang))
+            };
+            if let Some((mod_dir, mod_path)) = nearest_go_module(&go_mods, &dir) {
+                crate_prefix = mod_dir;
+                go_module = mod_path;
+            }
+        }
         modules.push(Module {
             name,
-            resolve_name: String::new(),
+            resolve_name,
             heuristic_deps: Vec::new(),
             import_sites: Vec::new(),
             file: slash_path(rel),
@@ -271,6 +311,8 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
             defined_names: facts.defined,
             crate_prefix,
             is_package,
+            go_module,
+            returns: facts.returns,
             diag: Diagnostics::default(),
         });
     }
@@ -330,8 +372,12 @@ fn disambiguate_module_names(modules: &mut [Module]) {
         }
         seen.insert(candidate.clone(), 1);
         renames.push((name.clone(), candidate.clone(), modules[i].file.clone()));
-        // Display name changes; resolution identity must not.
-        modules[i].resolve_name = name;
+        // Display name changes; resolution identity must not. A Go module
+        // already carries its package as `resolve_name`, and overwriting that
+        // with the colliding file name would break every import into it.
+        if modules[i].resolve_name.is_empty() {
+            modules[i].resolve_name = name;
+        }
         modules[i].name = candidate;
     }
     for (from, to, file) in &renames {
@@ -398,6 +444,9 @@ const NON_SOURCE_EXTS: &[&str] = &[
     "sqlite",
     "lock",
     "log",
+    // go.mod / go.sum: a manifest and a checksum file, not Go source.
+    "mod",
+    "sum",
     "txt",
     "toml",
     "yaml",
@@ -453,7 +502,7 @@ pub fn unsupported_census(root: &Path) -> Vec<(String, usize)> {
         let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
             continue;
         };
-        let supported = matches!(ext, "rs" | "py" | "ts" | "tsx" | "md" | "markdown");
+        let supported = matches!(ext, "rs" | "py" | "ts" | "tsx" | "go" | "md" | "markdown");
         if supported {
             if is_hidden {
                 hidden_supported += 1;
@@ -516,7 +565,9 @@ fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>) {
     for (i, c) in comps.iter().enumerate() {
         let last = i == comps.len() - 1;
         if !last {
-            if *c == "src" {
+            // Go has no `src` convention and a directory literally named `src`
+            // is a real package, so the layout rule is not applied to it.
+            if *c == "src" && lang != Lang::Go {
                 if !seen_src {
                     crate_prefix = segs.clone();
                     seen_src = true;
@@ -531,6 +582,9 @@ fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>) {
             Lang::Rust => matches!(stem, "mod" | "lib" | "main"),
             Lang::Python => stem == "__init__",
             Lang::TypeScript => stem == "index",
+            // No filename collapses to its directory in Go: every file in a
+            // package is a peer, and the package itself is `resolve_name`.
+            Lang::Go => false,
             Lang::Markdown => {
                 stem.eq_ignore_ascii_case("readme") || stem.eq_ignore_ascii_case("index")
             }
@@ -543,7 +597,7 @@ fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>) {
     let name = if segs.is_empty() {
         match lang {
             Lang::Rust => "crate".to_string(),
-            Lang::Python | Lang::TypeScript | Lang::Markdown => "root".to_string(),
+            Lang::Python | Lang::TypeScript | Lang::Go | Lang::Markdown => "root".to_string(),
         }
     } else {
         segs.join(lang.sep())
@@ -557,12 +611,22 @@ struct Ctx<'a> {
     /// prefix wins.
     index: Vec<(Vec<String>, String)>,
     by_name: HashMap<String, usize>,
+    /// Go only: package directory segments -> the files that make up that
+    /// package. Empty for a tree with no Go in it.
+    go_pkgs: HashMap<Vec<String>, Vec<usize>>,
+    /// Go only: every go.mod in the tree as (its directory, its module path),
+    /// longest module path first so a nested module wins over its parent.
+    go_mods: Vec<(Vec<String>, Vec<String>)>,
     /// Canonical scan root, for on-disk checks (markdown link targets).
     root: &'a Path,
 }
 
 enum Resolved {
     Internal(String),
+    /// Go: an import names a package *directory*, and every file in it is part
+    /// of that one package — Go compiles and links the package as a unit — so
+    /// the dependency is on all of them, not on whichever file sorts first.
+    Package(Vec<String>),
     External(String),
     Ignore,
 }
@@ -589,10 +653,14 @@ fn resolve_deps(modules: &mut [Module], root: &Path) {
         Diagnostics,
     );
     let results: Vec<ModuleResult> = {
+        let go_pkgs = go_packages(modules);
+        let go_mods = go_mod_index(modules);
         let ctx = Ctx {
             modules: &*modules,
             index,
             by_name,
+            go_pkgs,
+            go_mods,
             root,
         };
         let uni = build_universe(ctx.modules);
@@ -607,6 +675,15 @@ fn resolve_deps(modules: &mut [Module], root: &Path) {
                         Resolved::Internal(n) if n != m.name => {
                             sites.push((imp.clone(), n.clone()));
                             deps.insert(n);
+                        }
+                        Resolved::Package(names) => {
+                            for n in names {
+                                if n == m.name {
+                                    continue;
+                                }
+                                sites.push((imp.clone(), n.clone()));
+                                deps.insert(n);
+                            }
                         }
                         Resolved::External(n) => {
                             ext.insert(n);
@@ -648,7 +725,7 @@ fn resolve_deps(modules: &mut [Module], root: &Path) {
 /// Normalize an import path written inside module `m` into absolute segment
 /// candidates. `true` means the path is explicitly internal (crate-relative
 /// or dot-relative) and must never fall back to an external edge.
-fn candidates(imp: &str, m: &Module) -> (Vec<Vec<String>>, bool) {
+fn candidates(imp: &str, m: &Module, ctx: &Ctx) -> (Vec<Vec<String>>, bool) {
     match m.lang {
         Lang::Rust => {
             let raw: Vec<String> = imp
@@ -718,6 +795,34 @@ fn candidates(imp: &str, m: &Module) -> (Vec<Vec<String>>, bool) {
                 (cands, false)
             }
         }
+        Lang::Go => {
+            let segs = go_segs(imp);
+            if segs.is_empty() {
+                return (Vec::new(), false);
+            }
+            // Any go.mod in the tree may own this import, not just the one over
+            // this file: a Go repo routinely carries nested modules for examples
+            // and tools, and they import the parent by its published path.
+            let abs = go_abs(&segs, ctx);
+            if !abs.is_empty() {
+                return (abs, true);
+            }
+            if !m.go_module.is_empty() {
+                // A go.mod governs this file and no module path in the tree
+                // matched, so nothing here can be the target. Returning no
+                // candidate is what keeps a stdlib `log` or `time` from
+                // colliding with a same-named local package.
+                return (Vec::new(), false);
+            }
+            // No go.mod anywhere: the module path prefix is unknowable, so try
+            // progressively shorter suffixes the way an absolute Python package
+            // path is tried. Best-effort by necessity, not by choice.
+            let mut cands = vec![segs.clone()];
+            for k in 1..segs.len() {
+                cands.push(segs[k..].to_vec());
+            }
+            (cands, false)
+        }
         Lang::Python => {
             let dots = imp.chars().take_while(|c| *c == '.').count();
             let rest: Vec<String> = imp[dots..]
@@ -750,6 +855,173 @@ fn candidates(imp: &str, m: &Module) -> (Vec<Vec<String>>, bool) {
     }
 }
 
+/// Split a Go import path (or go.mod module path) into resolution segments.
+///
+/// Splits on `.` as well as `/` so that a path and a symbol appended to it
+/// (`example.com/org/repo/store` + `.Get`) tokenize the same way, which is
+/// what lets one prefix comparison serve both imports and qualified calls.
+/// `example.com/org/repo` therefore becomes
+/// `["example", "com", "org", "repo"]` — arbitrary as a name, but consistent
+/// on both sides of the comparison, which is all prefix matching needs.
+fn go_segs(path: &str) -> Vec<String> {
+    path.split(['/', '.'])
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
+/// Every go.mod under `root`, as (directory segments relative to root, module
+/// path segments). Sorted deepest-first so the nearest one wins.
+///
+/// Read directly rather than via `go list`: ctx shells out to nothing, and the
+/// `module` directive is a single line of the file's own grammar.
+fn go_modules(root: &Path) -> Vec<(Vec<String>, Vec<String>)> {
+    let mut out: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+    for entry in walker(root).build().flatten() {
+        if entry.file_name() != "go.mod" || !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if path
+            .components()
+            .any(|c| SKIP_DIRS.contains(&c.as_os_str().to_str().unwrap_or("")))
+        {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Some(module) = text.lines().find_map(|l| {
+            l.split_once("//")
+                .map_or(l, |(code, _)| code)
+                .trim()
+                .strip_prefix("module")
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+        }) else {
+            continue;
+        };
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        let dir: Vec<String> = rel
+            .parent()
+            .map(|d| {
+                d.iter()
+                    .filter_map(|c| c.to_str())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push((dir, go_segs(module.trim_matches('"'))));
+    }
+    out.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.0.cmp(&b.0)));
+    out
+}
+
+/// The go.mod governing directory `dir`: the deepest one whose directory is a
+/// prefix of it. A nested module shadows the one above it, which is exactly how
+/// the go tool resolves it.
+fn nearest_go_module(
+    mods: &[(Vec<String>, Vec<String>)],
+    dir: &[String],
+) -> Option<(Vec<String>, Vec<String>)> {
+    mods.iter()
+        .find(|(d, _)| d.len() <= dir.len() && dir[..d.len()] == d[..])
+        .cloned()
+}
+
+/// Every go.mod that governs at least one scanned Go file, as (directory
+/// segments, module path segments).
+///
+/// Recovered from the modules rather than re-walked: each Go module already
+/// carries the pair it was built with, and deduping them yields exactly the set
+/// that matters. Sorted longest module path first so a nested module — an
+/// `_examples/foo/go.mod` that republishes its parent — is matched before the
+/// parent whose path prefixes it.
+fn go_mod_index(modules: &[Module]) -> Vec<(Vec<String>, Vec<String>)> {
+    let mut v: Vec<(Vec<String>, Vec<String>)> = modules
+        .iter()
+        .filter(|m| m.lang == Lang::Go && !m.go_module.is_empty())
+        .map(|m| (m.crate_prefix.clone(), m.go_module.clone()))
+        .collect();
+    v.sort();
+    v.dedup();
+    v.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
+    v
+}
+
+/// Turn Go import-path segments into absolute module segments, for whichever
+/// go.mod in the tree publishes a module path that prefixes them.
+///
+/// Returns candidates rather than one answer because of the root package. When
+/// a go.mod sits at the scan root, what follows its module path may be a
+/// directory (`…/v5/middleware`) or a symbol in the root package itself
+/// (`…/v5` + `.NewRouter`), and the import path alone does not say which. Both
+/// readings are offered, directory first; a go.mod in a subdirectory has no such
+/// ambiguity because its own directory segments lead.
+fn go_abs(segs: &[String], ctx: &Ctx) -> Vec<Vec<String>> {
+    for (dir, path) in &ctx.go_mods {
+        if segs.len() < path.len() || segs[..path.len()] != path[..] {
+            continue;
+        }
+        let rest = segs[path.len()..].to_vec();
+        if !dir.is_empty() {
+            return vec![[dir.clone(), rest].concat()];
+        }
+        // The root package is named rather than empty, so it can be a key.
+        if rest.is_empty() {
+            return vec![vec!["root".to_string()]];
+        }
+        return vec![rest.clone(), [vec!["root".to_string()], rest].concat()];
+    }
+    Vec::new()
+}
+
+/// Go: package-directory segments -> every module (file) in that package.
+///
+/// An import names a directory, and a symbol in it may be defined in any of the
+/// directory's files, so package-qualified resolution has to look across all of
+/// them. Built once per graph.
+fn go_packages(modules: &[Module]) -> HashMap<Vec<String>, Vec<usize>> {
+    let mut out: HashMap<Vec<String>, Vec<usize>> = HashMap::new();
+    for (i, m) in modules.iter().enumerate() {
+        if m.lang == Lang::Go {
+            out.entry(m.resolve_segs()).or_default().push(i);
+        }
+    }
+    out
+}
+
+/// Resolve `abs` (package directory segments, then symbol segments) against the
+/// Go package index, preferring the file in the package that actually defines
+/// the symbol.
+///
+/// Returns the module name and how many leading segments the package consumed.
+/// When no file defines the wanted symbol this yields None rather than the
+/// first file in the package: a confident edge onto the wrong file of the right
+/// package is worse than a reported miss.
+fn go_match(abs: &[String], want: Option<&str>, ctx: &Ctx) -> Option<(String, usize)> {
+    for len in (1..=abs.len()).rev() {
+        let Some(files) = ctx.go_pkgs.get(&abs[..len]) else {
+            continue;
+        };
+        let Some(sym) = want.or_else(|| abs.get(len).map(String::as_str)) else {
+            // A bare package reference with nothing to look up: any file in it
+            // identifies the package.
+            return files.first().map(|&i| (ctx.modules[i].name.clone(), len));
+        };
+        if let Some(&i) = files
+            .iter()
+            .find(|&&i| ctx.modules[i].defined_names.contains(sym))
+        {
+            return Some((ctx.modules[i].name.clone(), len));
+        }
+        // The package is real but the symbol is not one of its top-level
+        // definitions — a method, or a name ctx did not extract.
+        return None;
+    }
+    None
+}
+
 fn match_prefix(abs: &[String], index: &[(Vec<String>, String)]) -> Option<(String, usize)> {
     for (segs, name) in index {
         if !segs.is_empty() && segs.len() <= abs.len() && abs[..segs.len()] == segs[..] {
@@ -762,20 +1034,70 @@ fn match_prefix(abs: &[String], index: &[(Vec<String>, String)]) -> Option<(Stri
 /// Resolve a path written inside `m` to (module, remaining symbol segments),
 /// without chasing or external fallback.
 fn resolve_path(path: &str, m: &Module, ctx: &Ctx) -> Option<(String, Vec<String>)> {
-    let (cands, _) = candidates(path, m);
+    let (cands, _) = candidates(path, m, ctx);
     for c in &cands {
         if c.is_empty() {
             continue;
         }
-        if let Some((name, len)) = match_prefix(c, &ctx.index) {
+        // Every file of a Go package shares the package's segments, so a plain
+        // longest-prefix match would land on whichever file sorts first. The
+        // symbol decides instead.
+        let hit = if m.lang == Lang::Go {
+            go_match(c, None, ctx)
+        } else {
+            match_prefix(c, &ctx.index)
+        };
+        if let Some((name, len)) = hit {
             return Some((name, c[len..].to_vec()));
         }
     }
     None
 }
 
+/// Classify one Go import: the package it names when that package is in this
+/// tree, the external module otherwise.
+fn go_resolve_import(imp: &str, m: &Module, ctx: &Ctx) -> Resolved {
+    let (cands, explicit_internal) = candidates(imp, m, ctx);
+    for c in &cands {
+        if c.is_empty() {
+            continue;
+        }
+        if let Some(files) = ctx.go_pkgs.get(c.as_slice()) {
+            return Resolved::Package(files.iter().map(|&i| ctx.modules[i].name.clone()).collect());
+        }
+    }
+    if explicit_internal {
+        // Inside this go.mod's own module path, but no such package was
+        // scanned — filtered out, or not yet written.
+        return Resolved::Ignore;
+    }
+    go_extern(imp)
+}
+
+/// A Go import path that names nothing in this tree: the standard library, or
+/// another module.
+///
+/// The split is the go tool's own rule rather than a curated list: an import
+/// path outside the standard library must have a dot in its first element, so a
+/// first element without one is stdlib — no more a dependency than Rust's `std`.
+fn go_extern(imp: &str) -> Resolved {
+    let mut parts = imp.split('/');
+    let Some(first) = parts.next() else {
+        return Resolved::Ignore;
+    };
+    if !first.contains('.') {
+        return Resolved::Ignore;
+    }
+    // A module path is conventionally host/org/repo and anything deeper is a
+    // package within it; the module is what a dependency list wants to name.
+    Resolved::External(imp.split('/').take(3).collect::<Vec<_>>().join("/"))
+}
+
 fn resolve_from(imp: &str, m: &Module, ctx: &Ctx) -> Resolved {
-    let (cands, explicit_internal) = candidates(imp, m);
+    if m.lang == Lang::Go {
+        return go_resolve_import(imp, m, ctx);
+    }
+    let (cands, explicit_internal) = candidates(imp, m, ctx);
     for c in &cands {
         if c.is_empty() {
             continue;
@@ -1305,6 +1627,16 @@ fn resolve_call(
         // The receiver is a trait object / interface / bounded generic: the
         // call reaches every implementation.
         Receiver::Dyn(t) => return dispatch_edge(&rc.path, t, m, uni),
+        // The receiver was bound to the result of a call: read the type off the
+        // callee's declared signature and resolve as if it had been written out.
+        // Falling back to an opaque receiver keeps an unfound signature a `~`
+        // rather than a confident edge onto nothing.
+        Receiver::Returned(callee) => {
+            return match go_returned_type(callee, m, ctx) {
+                Some(t) => typed_edge(&rc.path, &t, m, ctx, uni),
+                None => method_edge(&rc.path, container, m, ctx, uni, true),
+            };
+        }
         // `expr.f()`: receiver type unknown — any attribution is a guess.
         Receiver::Unknown => {
             return method_edge(&rc.path, container, m, ctx, uni, true);
@@ -1329,6 +1661,12 @@ fn resolve_call(
             // scoped, so this is the only thing the name can mean.
             if let Some(display) = locals.get(name) {
                 return Resolution::one(EdgeOut::plain(display.clone(), None));
+            }
+            // Go: the rest of this file's own package is in scope unqualified.
+            if m.lang == Lang::Go {
+                if let Some(r) = go_sibling(name, m, ctx) {
+                    return r;
+                }
             }
             // `use crate::core::build; build()` / `from x import f; f()`
             let Some(b) = m.raw_reexports.iter().find(|b| b.name == name) else {
@@ -1362,6 +1700,20 @@ fn resolve_call(
             if let Some(b) = m.raw_reexports.iter().find(|b| b.name == segs[0]) {
                 let full = format!("{}{s}{}", b.path, segs[1..].join(s));
                 let Some((n2, r2)) = resolve_path(&full, m, ctx) else {
+                    // The binding names a package outside this tree, so the
+                    // callee is provably not ours however its name is spelled
+                    // here. Without this, every `http.HandlerFunc(..)` landed in
+                    // the miss census the moment some local type happened to
+                    // declare a method of the same name — which buried the real
+                    // misses under the standard library.
+                    if m.lang == Lang::Go
+                        && matches!(
+                            go_resolve_import(&b.path, m, ctx),
+                            Resolved::External(_) | Resolved::Ignore
+                        )
+                    {
+                        return Resolution::External(last.to_string());
+                    }
                     return miss(last, uni);
                 };
                 let (fm, fr) = chase(&n2, &r2, ctx, CHASE_DEPTH);
@@ -1385,6 +1737,110 @@ fn resolve_call(
             miss(last, uni)
         }
     }
+}
+
+/// The type a [`Receiver::Returned`] stands for: the declared first result of
+/// whatever the call site named.
+///
+/// Looked up where Go itself would look — this file, then the rest of its
+/// package, then through the import binding for a qualified `pkg.New`. A
+/// `Type.Method` key may name a type from another package, which no import
+/// binding covers, so that one falls back to a whole-tree lookup that is
+/// accepted only when it is unambiguous; a bare function name is never resolved
+/// that way, because `New` is ambiguous in every Go repo ever written.
+fn go_returned_type(callee: &str, m: &Module, ctx: &Ctx) -> Option<String> {
+    if let Some(t) = go_return_lookup(callee, m, ctx) {
+        return Some(t);
+    }
+    // A method chain: `new(Route).Host(..).Path(..)` arrives as `Route.Host.Path`
+    // and is walked left to right, each step's result typing the next. The head
+    // is either a callable (`NewRouter` -> Router) or a type written directly
+    // (`new(Route)`), and a link that cannot be resolved ends the walk rather
+    // than being guessed past.
+    let segs: Vec<&str> = callee.split(Lang::sep(Lang::Go)).collect();
+    if segs.len() < 2 {
+        return None;
+    }
+    let mut ty = go_return_lookup(segs[0], m, ctx).unwrap_or_else(|| segs[0].to_string());
+    for seg in &segs[1..] {
+        ty = go_return_lookup(&format!("{ty}.{seg}"), m, ctx)?;
+    }
+    Some(ty)
+}
+
+/// One `returns` lookup, in the order Go itself would resolve the name.
+fn go_return_lookup(callee: &str, m: &Module, ctx: &Ctx) -> Option<String> {
+    if let Some(t) = m.returns.get(callee) {
+        return Some(t.clone());
+    }
+    if let Some(files) = ctx.go_pkgs.get(&m.resolve_segs()) {
+        if let Some(t) = files
+            .iter()
+            .find_map(|&i| ctx.modules[i].returns.get(callee))
+        {
+            return Some(t.clone());
+        }
+    }
+    let s = Lang::sep(Lang::Go);
+    let (qual, name) = callee.split_once(s)?;
+    if let Some(b) = m.raw_reexports.iter().find(|b| b.name == qual) {
+        let full = format!("{}{s}{name}", b.path);
+        if let Some((n2, r2)) = resolve_path(&full, m, ctx) {
+            let (fm, fr) = chase(&n2, &r2, ctx, CHASE_DEPTH);
+            if let Some(&ti) = ctx.by_name.get(&fm) {
+                if let Some(t) = fr
+                    .first()
+                    .and_then(|sym| ctx.modules[ti].returns.get(sym.as_str()))
+                {
+                    return Some(t.clone());
+                }
+            }
+        }
+    }
+    // Last resort for a `Type.Method` key, which names a type rather than an
+    // imported package. Unique-or-nothing: two types sharing a method name that
+    // return different things is exactly the case where guessing goes wrong.
+    let mut found: Option<&String> = None;
+    for other in ctx.modules.iter().filter(|o| o.lang == Lang::Go) {
+        if let Some(t) = other.returns.get(callee) {
+            match found {
+                Some(prev) if prev != t => return None,
+                _ => found = Some(t),
+            }
+        }
+    }
+    found.cloned()
+}
+
+/// Go: a package-level name this file does not define may be defined in a
+/// sibling file of the same package — Go's files share one namespace.
+///
+/// This is a proven edge, not a guess: a package-level name resolves within its
+/// package by the language's own scoping rule, and two files of one package
+/// cannot both define it and still compile. Without this, every cross-file call
+/// inside a package reads as a miss, which is most call sites in real Go.
+fn go_sibling(name: &str, m: &Module, ctx: &Ctx) -> Option<Resolution> {
+    let files = ctx.go_pkgs.get(&m.resolve_segs())?;
+    let &i = files
+        .iter()
+        .find(|&&i| ctx.modules[i].name != m.name && ctx.modules[i].defined_names.contains(name))?;
+    let om = &ctx.modules[i].name;
+    Some(Resolution::one(EdgeOut::plain(
+        format!("{om}{}{name}", Lang::sep(m.lang)),
+        Some(om.clone()),
+    )))
+}
+
+/// Go: the sibling file of `m`'s package that defines method `name` on
+/// `container`. Same scoping rule as `go_sibling`, for methods.
+fn go_sibling_method(container: &str, name: &str, m: &Module, ctx: &Ctx) -> Option<String> {
+    let files = ctx.go_pkgs.get(&m.resolve_segs())?;
+    files
+        .iter()
+        .find(|&&i| {
+            ctx.modules[i].name != m.name && container_has_method(&ctx.modules[i], container, name)
+        })
+        .map(|&i| ctx.modules[i].name.clone())
 }
 
 /// Reduce a declared field type to a receiver kind. Field types are stored as
@@ -1416,8 +1872,20 @@ fn field_receiver(ty: &str, uni: &Universe) -> Receiver {
 
 /// The bare type name: generics stripped, path segments dropped.
 fn base_type(t: &str) -> String {
-    let t = t.split('<').next().unwrap_or(t).trim();
-    t.rsplit("::").next().unwrap_or(t).trim().to_string()
+    // Go writes a field type as `*Cache` / `[]*Cache`; the star and the slice
+    // are not part of the name. Neither is legal at the start of a Rust,
+    // Python or TypeScript type, so stripping them here is safe for all four.
+    let t = t.trim().trim_start_matches(['*', '&']).trim();
+    let t = t
+        .strip_prefix("[]")
+        .unwrap_or(t)
+        .trim_start_matches('*')
+        .trim();
+    let t = t.split(['<', '[']).next().unwrap_or(t).trim();
+    let t = t.rsplit("::").next().unwrap_or(t).trim();
+    // `pkg.Type` in Go / `mod.Type` in Python: the bare name is what the method
+    // and field indexes are keyed on.
+    t.rsplit('.').next().unwrap_or(t).trim().to_string()
 }
 
 /// Is the leading segment of a qualified call path provably not ours? A root
@@ -1578,6 +2046,20 @@ fn method_edge(
             } else {
                 EdgeOut::plain(display, None)
             });
+        }
+        // Go allows a type's methods to be spread across its package's files,
+        // so the enclosing container may own this method in a sibling file.
+        // Still the package's own scoping rule, so confidence is unchanged.
+        if m.lang == Lang::Go {
+            if let Some(om) = go_sibling_method(c, name, m, ctx) {
+                let display = format!("{om}{s}{c}{s}{name}");
+                let dep = Some(om);
+                return Resolution::one(if receiver_unknown {
+                    EdgeOut::guess(display, dep)
+                } else {
+                    EdgeOut::plain(display, dep)
+                });
+            }
         }
     }
     // A ubiquitous std name on a receiver ctx could not type: overwhelmingly
@@ -1964,6 +2446,164 @@ mod tests {
 
     /// A fingerprint that misses an edit is worse than no cache at all: it
     /// makes ctx confidently wrong about current source.
+    /// Go resolution rides on the package directory, not the file, and these
+    /// are the three ways that differed from every other language ctx parses.
+    #[test]
+    fn a_go_package_resolves_across_its_own_files() {
+        let dir = std::env::temp_dir().join(format!("ctx_go_pkg_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("store")).unwrap();
+        fs::write(dir.join("go.mod"), "module example.com/acme/svc\n").unwrap();
+        // A root-level file calling into a subpackage by its import path.
+        fs::write(
+            dir.join("main.go"),
+            "package main\n\nimport \"example.com/acme/svc/store\"\n\n             func main() { store.New(\"dsn\") }\n",
+        )
+        .unwrap();
+        // Two files in one package: `New` is here, `NewCache` next door.
+        fs::write(
+            dir.join("store/store.go"),
+            "package store\n\ntype Store struct{ c *Cache }\n\n             func New(d string) *Store { return &Store{c: NewCache()} }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("store/cache.go"),
+            "package store\n\ntype Cache struct{}\n\nfunc NewCache() *Cache { return nil }\n",
+        )
+        .unwrap();
+
+        let g = build_graph(&dir).unwrap();
+        let by = |n: &str| g.modules.iter().find(|m| m.name == n).unwrap();
+
+        // 1. An import names a directory, so every file in the package is a dep.
+        let main = by("main");
+        assert!(
+            main.deps.contains(&"store.store".to_string())
+                && main.deps.contains(&"store.cache".to_string()),
+            "a Go import depends on the whole package, got {:?}",
+            main.deps
+        );
+
+        // 2. A package-qualified call lands on the file that defines the symbol,
+        //    not on whichever file sorts first.
+        let calls: Vec<&str> = main
+            .items
+            .iter()
+            .flat_map(|i| i.calls.iter())
+            .map(|c| c.to.as_str())
+            .collect();
+        assert!(
+            calls.contains(&"store.store.New"),
+            "expected the defining file, got {calls:?}"
+        );
+
+        // 3. A bare name from a sibling file of the same package resolves, and
+        //    is proven rather than guessed.
+        let store = by("store.store");
+        let edge = store
+            .items
+            .iter()
+            .flat_map(|i| i.calls.iter())
+            .find(|c| c.to.ends_with("NewCache"))
+            .expect("NewCache should resolve across the package");
+        assert_eq!(edge.to, "store.cache.NewCache");
+        assert!(
+            !edge.heuristic,
+            "same-package scope is a language rule, not a guess"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The `x := NewFoo()` idiom: the receiver's type is stated on the callee,
+    /// which may be in another file, so it resolves a step later than `Typed`.
+    #[test]
+    fn a_receiver_bound_to_a_constructor_resolves_through_its_return_type() {
+        let dir = std::env::temp_dir().join(format!("ctx_go_ret_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("go.mod"), "module example.com/r\n").unwrap();
+        fs::write(
+            dir.join("router.go"),
+            "package r\n\ntype Mux struct{}\n\n             func NewRouter() *Mux { return &Mux{} }\n\n             func (m *Mux) Use(s string) {}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("router_test.go"),
+            "package r\n\nfunc TestUse() { m := NewRouter(); m.Use(\"x\") }\n",
+        )
+        .unwrap();
+
+        let g = build_graph(&dir).unwrap();
+        let t = g.modules.iter().find(|m| m.name == "router_test").unwrap();
+        let calls: Vec<&str> = t
+            .items
+            .iter()
+            .flat_map(|i| i.calls.iter())
+            .map(|c| c.to.as_str())
+            .collect();
+        assert!(
+            calls.contains(&"router.Mux.Use"),
+            "the constructor's return type should type the receiver, got {calls:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A `func` literal parameter shadows the enclosing scope. Go's HTTP handler
+    /// idiom rebinds the very name the outer calls use, so flattening the two
+    /// scopes produced confident edges onto the wrong type.
+    #[test]
+    fn a_func_literal_parameter_does_not_leak_into_the_enclosing_scope() {
+        let dir = std::env::temp_dir().join(format!("ctx_go_shadow_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("go.mod"), "module example.com/s\n").unwrap();
+        fs::write(
+            dir.join("app.go"),
+            "package s\n\n             type Mux struct{}\n             type Req struct{}\n\n             func New() *Mux { return &Mux{} }\n             func (m *Mux) Get(p string, h func(r *Req)) {}\n             func (r *Req) Done() {}\n\n             func wire() {\n             \tr := New()\n             \tr.Get(\"/\", func(r *Req) { r.Done() })\n             }\n",
+        )
+        .unwrap();
+
+        let g = build_graph(&dir).unwrap();
+        let m = g.modules.iter().find(|m| m.name == "app").unwrap();
+        let wire = m
+            .items
+            .iter()
+            .find(|i| i.name.as_deref() == Some("wire"))
+            .unwrap();
+        let calls: Vec<&str> = wire.calls.iter().map(|c| c.to.as_str()).collect();
+        // The outer `r` is the Mux; the inner `r` is the Req. Both resolve, and
+        // neither is attributed to the other's type.
+        assert!(calls.contains(&"Mux.Get"), "outer receiver: {calls:?}");
+        assert!(calls.contains(&"Req.Done"), "shadowed receiver: {calls:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A stdlib call whose name a local type happens to share is external, not a
+    /// miss — otherwise the census fills with `net/http` and buries the real ones.
+    #[test]
+    fn a_call_through_an_external_import_is_not_counted_as_a_miss() {
+        let dir = std::env::temp_dir().join(format!("ctx_go_ext_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("go.mod"), "module example.com/e\n").unwrap();
+        fs::write(
+            dir.join("e.go"),
+            "package e\n\nimport \"net/http\"\n\n             type T struct{}\n\n             func (t *T) HandlerFunc() {}\n\n             func use() { http.HandlerFunc(nil) }\n",
+        )
+        .unwrap();
+
+        let g = build_graph(&dir).unwrap();
+        let m = g.modules.iter().find(|m| m.name == "e").unwrap();
+        assert_eq!(
+            m.diag.unresolved, 0,
+            "http.HandlerFunc is provably external: {:?}",
+            m.diag.unresolved_names
+        );
+        assert_eq!(m.diag.external, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_fingerprint_moves_when_the_tree_does() {
         let dir = std::env::temp_dir().join(format!("ctx_fp_{}", std::process::id()));
