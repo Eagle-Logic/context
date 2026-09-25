@@ -12,12 +12,19 @@ pub struct Graph {
 #[derive(Serialize, Clone)]
 pub struct Module {
     pub name: String,
-    /// The name resolution keys on, when it differs from the display `name`.
-    /// Set either because `name` was renamed to break a collision, or —
-    /// for Go — because the unit of import is the package directory rather
-    /// than the file. Empty means `name` is also the resolution name.
+    /// The path segments resolution keys on, carried rather than re-derived.
+    ///
+    /// A module name is these segments joined by the language separator, and
+    /// resolution needs them back. Splitting the name to recover them is what
+    /// made any component containing the separator ambiguous: `app.config.ts`
+    /// reads as two segments, so `./app.config` resolved one level too deep.
+    /// Keeping the Vec removes the ambiguity instead of encoding around it,
+    /// which is why names may contain a dot again and still match their file.
+    ///
+    /// For Go this is the package *directory*, not the file: a package is the
+    /// unit of import, and every `.go` file in it is a peer.
     #[serde(skip)]
-    pub resolve_name: String,
+    pub path_segs: Vec<String>,
     pub file: String,
     pub lang: Lang,
     /// Internal modules this module imports from, with re-export facades
@@ -317,12 +324,16 @@ impl Module {
     /// its directory — so resolving against a renamed name silently loses every
     /// edge. Lookups therefore key on this, while edges and labels use `name`.
     pub fn resolve_segs(&self) -> Vec<String> {
-        let base = if self.resolve_name.is_empty() {
-            &self.name
-        } else {
-            &self.resolve_name
-        };
-        base.split(self.lang.sep()).map(|s| s.to_string()).collect()
+        if !self.path_segs.is_empty() {
+            return self.path_segs.clone();
+        }
+        // Only reachable for a module deserialized from JSON, where `path_segs`
+        // is skipped. Splitting the name is the old behaviour and the old bug,
+        // but it is strictly better than resolving against nothing.
+        self.name
+            .split(self.lang.sep())
+            .map(|s| s.to_string())
+            .collect()
     }
 
     pub fn item_count(&self) -> usize {

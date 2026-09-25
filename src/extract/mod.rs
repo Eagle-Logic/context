@@ -289,12 +289,11 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
                 b.public = false;
             }
         }
-        let (name, mut crate_prefix) = module_name(rel, lang);
+        let (name, mut crate_prefix, mut path_segs) = module_name(rel, lang);
         // A Go package IS its directory: every .go file in it is a peer, with no
         // per-file visibility and no per-file import path. Files stay separate
         // modules (so an item's location is its own file), but resolution keys
         // on the package, which is what an import names.
-        let mut resolve_name = String::new();
         let mut go_module = Vec::new();
         if lang == Lang::Go {
             let dir: Vec<String> = rel
@@ -311,10 +310,10 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
             // a name of its own: leaving it empty made every root-level file its
             // own package, so a call into a sibling file read as a miss — and
             // Go repos routinely put their main package at the root.
-            resolve_name = if dir.is_empty() {
-                "root".to_string()
+            path_segs = if dir.is_empty() {
+                vec!["root".to_string()]
             } else {
-                dir.join(Lang::sep(lang))
+                dir.clone()
             };
             if let Some((mod_dir, mod_path)) = nearest_go_module(&go_mods, &dir) {
                 crate_prefix = mod_dir;
@@ -323,7 +322,7 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
         }
         modules.push(Module {
             name,
-            resolve_name,
+            path_segs,
             heuristic_deps: Vec::new(),
             import_sites: Vec::new(),
             file: slash_path(rel),
@@ -398,12 +397,9 @@ fn disambiguate_module_names(modules: &mut [Module]) {
         }
         seen.insert(candidate.clone(), 1);
         renames.push((name.clone(), candidate.clone(), modules[i].file.clone()));
-        // Display name changes; resolution identity must not. A Go module
-        // already carries its package as `resolve_name`, and overwriting that
-        // with the colliding file name would break every import into it.
-        if modules[i].resolve_name.is_empty() {
-            modules[i].resolve_name = name;
-        }
+        // Display name only. Resolution keys on `path_segs`, which is derived
+        // from the file's location and is deliberately not touched here — that
+        // separation is why a rename can no longer cost an edge.
         modules[i].name = candidate;
     }
     for (from, to, file) in &renames {
@@ -585,27 +581,27 @@ fn slash_path(rel: &Path) -> String {
 /// Derive a stable module name from the file path. "src" components are
 /// dropped; components before the first "src" become the crate prefix
 /// (workspace layouts like crates/foo/src/bar.rs -> crates::foo::bar).
-/// One path component, with any occurrence of the language's module separator
-/// removed from it.
-///
-/// A module name is segments joined by the separator, and resolution splits it
-/// back apart to do path arithmetic. So a component that *contains* the
-/// separator silently adds a segment that was never in the path — and for the
-/// dot-separated languages that is every `foo.test.ts`, `foo.spec.js` and
-/// `foo.stories.tsx` in existence.
-///
-/// The consequence was not a cosmetic one. `src/browser/frag.test.ts` named
-/// itself `browser.frag.test`, which splits into four segments rather than
-/// three, so every relative import in the file resolved one directory too deep
-/// and silently produced nothing: no dep, no call edges, and a module recall of
-/// zero. The identical import in `plain.ts` next door resolved fine. Test files
-/// are exactly where a blast radius matters most, and they were the files where
-/// it was empty.
-fn safe_seg(c: &str, lang: Lang) -> String {
-    c.replace(Lang::sep(lang), "-")
+/// The specifier `./app.js` names the module built from `app.ts`, so a real
+/// source extension comes off before matching. Deliberately an allowlist: a
+/// trailing-dot rule would eat the `.config` in `./app.config`, which is part
+/// of the module's name and not an extension at all. Native ESM and browser
+/// ESM both *require* the written extension, so this is the spec-correct form
+/// rather than an edge case.
+fn strip_source_ext(c: &str) -> &str {
+    match c.rsplit_once('.') {
+        Some((stem, "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs")) if !stem.is_empty() => stem,
+        _ => c,
+    }
 }
 
-fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>) {
+/// `(display name, crate prefix, path segments)`.
+///
+/// The segments are returned rather than recovered later by splitting the
+/// name. A component may legitimately contain the separator — `app.config.ts`,
+/// `types.gen.ts` — and once joined there is no way to tell that dot from a
+/// structural one. Carrying the Vec is what lets the name keep matching the
+/// filename, which is the form a human and an agent can both guess.
+fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>, Vec<String>) {
     let comps: Vec<&str> = rel.iter().filter_map(|c| c.to_str()).collect();
     let mut segs: Vec<String> = Vec::new();
     let mut crate_prefix: Vec<String> = Vec::new();
@@ -623,7 +619,7 @@ fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>) {
                 }
                 continue;
             }
-            segs.push(safe_seg(c, lang));
+            segs.push(c.to_string());
             continue;
         }
         let stem = c.rsplit_once('.').map(|(s, _)| s).unwrap_or(c);
@@ -632,14 +628,14 @@ fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>) {
             Lang::Python => stem == "__init__",
             Lang::TypeScript => stem == "index",
             // No filename collapses to its directory in Go: every file in a
-            // package is a peer, and the package itself is `resolve_name`.
+            // package is a peer, and the package itself is `path_segs`.
             Lang::Go => false,
             Lang::Markdown => {
                 stem.eq_ignore_ascii_case("readme") || stem.eq_ignore_ascii_case("index")
             }
         };
         if !drop {
-            segs.push(safe_seg(stem, lang));
+            segs.push(stem.to_string());
         }
     }
 
@@ -651,7 +647,7 @@ fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>) {
     } else {
         segs.join(lang.sep())
     };
-    (name, crate_prefix)
+    (name, crate_prefix, segs)
 }
 
 struct Ctx<'a> {
@@ -813,11 +809,28 @@ fn candidates(imp: &str, m: &Module, ctx: &Ctx) -> (Vec<Vec<String>>, bool) {
                     }
                     i += 1;
                 }
+                // One component per path segment, exactly as `module_name`
+                // builds them. Splitting on `.` here is what broke
+                // `./app.config`: the module is one segment and the specifier
+                // became two, so they could never match.
+                //
+                // A source extension comes off any component, because the
+                // binding is `specifier/symbol` — `./app.js/boot` — so the
+                // filename is not reliably last. The allowlist is what makes
+                // that safe: `./app.config/boot` keeps its `.config`, since
+                // `config` is not a source extension. A trailing-dot rule
+                // would eat it.
                 let rest: Vec<String> = parts[i..]
                     .iter()
-                    .flat_map(|p| p.split('.'))
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
+                    .map(|p| p.trim())
+                    .filter(|p| !p.is_empty())
+                    .map(|p| {
+                        if m.lang == Lang::TypeScript {
+                            strip_source_ext(p).to_string()
+                        } else {
+                            p.to_string()
+                        }
+                    })
                     .collect();
                 let cur = m.resolve_segs();
                 let dir_len = if m.is_package {
@@ -2704,10 +2717,12 @@ mod tests {
                 .deps
                 .clone()
         };
-        // The separator is stripped from the segment, so the name stays one
-        // segment and the arithmetic matches the plain file's exactly.
-        assert_eq!(deps_of("browser.frag-test"), deps_of("browser.plain"));
-        assert!(deps_of("browser.frag-test").contains(&"util.dom".to_string()));
+        // The name still contains the dot, because it is the filename: segments
+        // are carried rather than recovered by splitting, so a dot in a
+        // component is no longer ambiguous and the arithmetic matches the plain
+        // file's exactly.
+        assert_eq!(deps_of("browser.frag.test"), deps_of("browser.plain"));
+        assert!(deps_of("browser.frag.test").contains(&"util.dom".to_string()));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2732,7 +2747,7 @@ mod tests {
         .unwrap();
 
         let g = build_graph(&dir).unwrap();
-        let m = g.modules.iter().find(|m| m.name == "app-test").unwrap();
+        let m = g.modules.iter().find(|m| m.name == "app.test").unwrap();
         assert_eq!(
             m.diag.unresolved, 0,
             "supertest's request is not ours: {:?}",
@@ -2740,6 +2755,74 @@ mod tests {
         );
         // `request(app)` plus the `require(..)` call itself; both are external.
         assert_eq!(m.diag.external, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A module name is segments joined by the separator, so recovering them by
+    /// splitting the name made any component containing a dot ambiguous. These
+    /// are the four specifier shapes that has to get right at once; three of
+    /// them were broken, in two different directions, by two different fixes.
+    #[test]
+    fn specifier_and_module_name_agree_on_dots_and_extensions() {
+        let dir = std::env::temp_dir().join(format!("ctx_spec_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for f in ["app.ts", "app.config.ts", "app.test.ts"] {
+            fs::write(dir.join(f), "export function boot() { return 1; }\n").unwrap();
+        }
+        let case = |spec: &str| {
+            fs::write(
+                dir.join("c.ts"),
+                format!(
+                    "import {{ boot }} from '{spec}';\nexport function b() {{ return boot(); }}\n"
+                ),
+            )
+            .unwrap();
+            let g = build_graph(&dir).unwrap();
+            g.modules
+                .iter()
+                .find(|m| m.name == "c")
+                .unwrap()
+                .deps
+                .clone()
+        };
+        // Extensionless: the form a bundler accepts, and the only one that ever
+        // worked.
+        assert_eq!(case("./app"), vec!["app".to_string()]);
+        // Explicit extension: mandatory in native Node and browser ESM, and the
+        // form TypeScript tells you to write when emitting ESM.
+        assert_eq!(case("./app.js"), vec!["app".to_string()]);
+        // A dot that is part of the NAME, not an extension. `.config` must
+        // survive, which is why extension stripping is an allowlist.
+        assert_eq!(case("./app.config"), vec!["app.config".to_string()]);
+        // Both at once.
+        assert_eq!(case("./app.test.js"), vec!["app.test".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `./app.config` and `./app.js` name different files, and must not collapse
+    /// onto one module when both exist.
+    #[test]
+    fn a_dotted_name_and_an_extension_are_not_confused() {
+        let dir = std::env::temp_dir().join(format!("ctx_spec2_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("app.ts"), "export function a() { return 1; }\n").unwrap();
+        fs::write(
+            dir.join("app.config.ts"),
+            "export function c() { return 2; }\n",
+        )
+        .unwrap();
+        let u = concat!(
+            "import { a } from './app.js';\n",
+            "import { c } from './app.config';\n",
+            "export function b() { return a() + c(); }\n"
+        );
+        fs::write(dir.join("u.ts"), u).unwrap();
+        let g = build_graph(&dir).unwrap();
+        let deps = &g.modules.iter().find(|m| m.name == "u").unwrap().deps;
+        assert!(deps.contains(&"app".to_string()), "got {deps:?}");
+        assert!(deps.contains(&"app.config".to_string()), "got {deps:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 
