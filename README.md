@@ -39,6 +39,10 @@ them.
 **→ [EXAMPLES.md](EXAMPLES.md)** — ten commands run against this repo, verbatim
 output, including the parts where `ctx` reports its own limits.
 
+**→ [BENCHMARK.md](BENCHMARK.md)** — the same claims re-run on five public
+repositories pinned to exact commits, reproducible with `./bench/run.sh`.
+Including the row where it finds a limitation in ctx.
+
 **→ [What the integration itself costs](#measuring-what-it-costs)** — ctx's own
 MCP tool definitions sit in every turn whether a tool is ever called or not,
 which makes them 2.2× the standing cost of the CLI instructions block. That is
@@ -58,7 +62,7 @@ branch of a dynamic-dispatch fan-out is marked `*`. And `ctx doctor` names
 
 ```
 ## Internal recall — the number to trust
-  1318/1383 = 95.3%   of call sites that could be internal, ctx pinned this many.
+  1319/1384 = 95.3%   of call sites that could be internal, ctx pinned this many.
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
