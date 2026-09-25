@@ -11,7 +11,7 @@ tree they were run against, so a version string dates them without making them
 current — this file had drifted a whole minor version before anyone noticed.
 Regenerate it in the release commit instead.
 
-The repo under analysis: **14 Rust files, 3 Markdown files, 17 modules, 5,101
+The repo under analysis: **15 Rust files, 3 Markdown files, 18 modules, 6,139
 call sites.** Small enough to read in a sitting, which makes it a fair place to
 check whether the answers are actually right.
 
@@ -36,11 +36,11 @@ $ ctx callers coverage_report
 6 caller(s) of 'coverage_report':
 
 mcp::dispatch  (src/mcp.rs:434-571  #94ff6095218b)  → query::coverage_report
-query::tests::a_broken_link_reports_its_own_line_not_its_headings  (src/query.rs:3317-3329  #f94b64f4da35)  → coverage_report
-query::tests::coverage_separates_internal_external_and_blind_spots  (src/query.rs:3332-3343  #adf073f295c1)  → coverage_report
-query::tests::doctor_names_what_it_could_not_pin  (src/query.rs:2458-2467  #6cd4660b675e)  → coverage_report
-query::tests::doctor_recall_excludes_provably_external_calls  (src/query.rs:2433-2445  #6c3b7200040d)  → coverage_report
-query::tests::markdown_links_resolve_headings_and_flag_broken  (src/query.rs:3290-3314  #839e24537089)  → coverage_report
+query::tests::a_broken_link_reports_its_own_line_not_its_headings  (src/query.rs:3318-3330  #f94b64f4da35)  → coverage_report
+query::tests::coverage_separates_internal_external_and_blind_spots  (src/query.rs:3333-3344  #adf073f295c1)  → coverage_report
+query::tests::doctor_names_what_it_could_not_pin  (src/query.rs:2459-2468  #6cd4660b675e)  → coverage_report
+query::tests::doctor_recall_excludes_provably_external_calls  (src/query.rs:2434-2446  #6c3b7200040d)  → coverage_report
+query::tests::markdown_links_resolve_headings_and_flag_broken  (src/query.rs:3291-3315  #839e24537089)  → coverage_report
 
 completeness: no call site named `coverage_report` went unresolved anywhere in this tree —
 this blast radius is complete to the limit of what ctx parses.
@@ -61,12 +61,12 @@ $ ctx path main coverage_report
 # path: main → coverage_report  (5 hop(s))
 ~ heuristic edge (verify) · * one branch of a dispatch fan-out
 
-crate::main  [src/main.rs:462]
+crate::main  [src/main.rs:466]
   → mcp::run  [src/mcp.rs:191]
     → mcp::handle_method  [src/mcp.rs:260]
       → mcp::tools_call  [src/mcp.rs:418]
         → mcp::dispatch  [src/mcp.rs:434]
-          → query::coverage_report  [src/query.rs:1812]
+          → query::coverage_report  [src/query.rs:1813]
 ```
 
 ---
@@ -81,8 +81,21 @@ $ ctx trace build_graph --depth 2
 # call tree from 'build_graph'  (depth 2)
 ~ heuristic edge (verify) · * one branch of a dispatch fan-out
 
-extract::build_graph  [src/extract/mod.rs:204]  [+1 outside graph]
-├─ extract::disambiguate_module_names  [src/extract/mod.rs:305]
+extract::build_graph  [src/extract/mod.rs:207]  [+1 outside graph]
+├─ extract::disambiguate_module_names  [src/extract/mod.rs:347]
+├─ extract::go::extract  [src/extract/go.rs:9]  [+1 outside graph]
+│  ├─ extract::go::function  [src/extract/go.rs:669]  (depth limit)
+│  ├─ extract::go::imports  [src/extract/go.rs:238]  (depth limit)
+│  ├─ extract::go::interfaces_in  [src/extract/go.rs:168]  (depth limit)
+│  ├─ model::content_hash  [src/model.rs:178]
+│  ├─ extract::go::package_level_item  [src/extract/go.rs:197]  (depth limit)
+│  ├─ extract::go::receiver_of_method  [src/extract/go.rs:499]  (depth limit)
+│  ├─ extract::go::returns_in  [src/extract/go.rs:115]  (depth limit)
+│  ├─ extract::go::types  [src/extract/go.rs:320]  (depth limit)
+│  └─ extract::go::values  [src/extract/go.rs:468]  (depth limit)
+├─ extract::go_modules  [src/extract/mod.rs:878]
+│  ├─ extract::go_segs  [src/extract/mod.rs:866]
+│  └─ extract::walker  [src/extract/mod.rs:109]  (depth limit)
 ├─ extract::markdown::extract  [src/extract/markdown.rs:45]  [+1 outside graph]
 │  ├─ extract::markdown::assign_lines  [src/extract/markdown.rs:139]  (depth limit)
 │  ├─ extract::markdown::assign_spans  [src/extract/markdown.rs:184]  (depth limit)
@@ -98,24 +111,28 @@ extract::build_graph  [src/extract/mod.rs:204]  [+1 outside graph]
 │  ├─ extract::markdown::setext_heading  [src/extract/markdown.rs:296]
 │  ├─ extract::markdown::slug  [src/extract/markdown.rs:13]
 │  └─ extract::markdown::strip_inline  [src/extract/markdown.rs:460]
-├─ extract::module_name  [src/extract/mod.rs:510]
-│  └─ model::Lang::sep  [src/model.rs:143]
+├─ model::Lang::sep  [src/model.rs:165]
+├─ extract::module_name  [src/extract/mod.rs:559]
+│  └─ model::Lang::sep  [src/model.rs:165]
+├─ extract::nearest_go_module  [src/extract/mod.rs:923]
 ├─ extract::python::extract  [src/extract/python.rs:9]  [+1 outside graph]
 │  ├─ extract::python::module_level_item  [src/extract/python.rs:35]  (depth limit)
 │  └─ extract::python::visit  [src/extract/python.rs:73]  (depth limit)
-├─ extract::resolve_deps  [src/extract/mod.rs:570]
-│  ├─ extract::apply_calls  [src/extract/mod.rs:1923]  (depth limit)
-│  ├─ extract::build_universe  [src/extract/mod.rs:1104]  (depth limit)
-│  ├─ extract::compute_calls  [src/extract/mod.rs:1760]  (depth limit)
-│  ├─ extract::display_reexport  [src/extract/mod.rs:1930]  (depth limit)
-│  ├─ model::Module::resolve_segs~  [src/model.rs:287]  (depth limit)
-│  └─ extract::resolve_from  [src/extract/mod.rs:777]  (depth limit)
+├─ extract::resolve_deps  [src/extract/mod.rs:634]
+│  ├─ extract::apply_calls  [src/extract/mod.rs:2405]  (depth limit)
+│  ├─ extract::build_universe  [src/extract/mod.rs:1426]  (depth limit)
+│  ├─ extract::compute_calls  [src/extract/mod.rs:2242]  (depth limit)
+│  ├─ extract::display_reexport  [src/extract/mod.rs:2412]  (depth limit)
+│  ├─ extract::go_mod_index  [src/extract/mod.rs:940]
+│  ├─ extract::go_packages  [src/extract/mod.rs:984]  (depth limit)
+│  ├─ model::Module::resolve_segs~  [src/model.rs:319]  (depth limit)
+│  └─ extract::resolve_from  [src/extract/mod.rs:1096]  (depth limit)
 ├─ extract::rust::extract  [src/extract/rust.rs:9]  [+1 outside graph]
 │  └─ extract::rust::visit  [src/extract/rust.rs:25]  (depth limit)
-├─ extract::slash_path  [src/extract/mod.rs:500]
-├─ extract::source_files  [src/extract/mod.rs:140]
-│  ├─ extract::lang_selected  [src/extract/mod.rs:129]  (depth limit)
-│  └─ extract::walker  [src/extract/mod.rs:107]  (depth limit)
+├─ extract::slash_path  [src/extract/mod.rs:549]
+├─ extract::source_files  [src/extract/mod.rs:142]
+│  ├─ extract::lang_selected  [src/extract/mod.rs:131]  (depth limit)
+│  └─ extract::walker  [src/extract/mod.rs:109]  (depth limit)
 └─ extract::typescript::extract  [src/extract/typescript.rs:12]  [+1 outside graph]
    ├─ extract::typescript::module_level_item  [src/extract/typescript.rs:43]  (depth limit)
    └─ extract::typescript::visit  [src/extract/typescript.rs:84]  (depth limit)
@@ -241,46 +258,48 @@ The differentiator. Every tool guesses; this one tells you where.
 $ ctx doctor
 # ctx coverage report — /home/steve/projects/context
 
-Modules: 17  (markdown 3, rust 14)
+Modules: 18  (markdown 3, rust 15)
 
 ## Internal recall — the number to trust
-  1098/1140 = 96.3%   of call sites that could be internal, ctx pinned this many.
+  1317/1382 = 95.3%   of call sites that could be internal, ctx pinned this many.
 
 A call site is "could be internal" when the callee name is defined somewhere
 under this root. Calls into std or a third-party crate are excluded, because no
 internal edge could exist for them however good the resolver gets.
 
 ## Every call site, bucketed
-call sites:            5101
-  internal edges:      1098   [15 heuristic (~), 0 dispatch fan-out (*)]
-  external (provable): 3961   (77.7%)  callee defined nowhere here — std/extern
-  unresolved internal: 42     (0.8%)  the real misses — see below
+call sites:            6139
+  internal edges:      1317   [17 heuristic (~), 0 dispatch fan-out (*)]
+  external (provable): 4757   (77.5%)  callee defined nowhere here — std/extern
+  unresolved internal: 65     (1.1%)  the real misses — see below
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
-     26  walk
-      7  context
+     45  walk
+      9  context
+      3  path
       2  est_tokens
-      2  path
+      2  flatten
       1  as_path
-      1  flatten
       1  name
       1  render_budgeted
       1  subtree_text
 
 ## Where the misses are
+  extract::go                        21 unresolved   (module recall 89%)
   extract::rust                      11 unresolved   (module recall 93%)
   extract::typescript                11 unresolved   (module recall 90%)
   extract::python                    10 unresolved   (module recall 85%)
+  extract                             5 unresolved   (module recall 98%)
   mcp                                 5 unresolved   (module recall 92%)
-  extract                             3 unresolved   (module recall 98%)
   git                                 1 unresolved   (module recall 97%)
   query                               1 unresolved   (module recall 100%)
 
 ## Low-confidence zones (edges to distrust — grep to confirm)
   parity                           18% heuristic (11/61 edges)
-  extract                          1% heuristic (2/172 edges)
-  crate                            1% heuristic (1/148 edges)
+  refactor                         5% heuristic (1/20 edges)
+  extract                          1% heuristic (3/218 edges)
+  crate                            1% heuristic (1/149 edges)
   query                            0% heuristic (1/236 edges)
 
 ## Not modeled (blind spots)
@@ -288,10 +307,10 @@ grep these; every other edge in the map is one ctx could prove.
   (supported: .rs .py .ts .tsx .go .md)
 ```
 
-96.2% recall comes with **the exact grep list for the other 3.8%** — eight
+95.3% recall comes with **the exact grep list for the other 4.7%** — nine
 names, with counts and the modules they live in.
 
-The denominator is honest too. 3,858 of 4,958 call sites go into `std` or a
+The denominator is honest too. 4,757 of 6,139 call sites go into `std` or a
 third-party crate, where no internal edge could ever exist, so they're excluded
 rather than quietly inflating the percentage. That classification is by evidence
 — *is this name defined anywhere under the root?* — not a hardcoded list.
@@ -299,7 +318,7 @@ rather than quietly inflating the percentage. That classification is by evidence
 The honest bit isn't that coverage is high. It's that the gaps are enumerable.
 
 > `ctx` treats Markdown as part of the graph, which is why this file counts
-> toward the 16 modules above — a document about the tool is a node in the
+> toward the 18 modules above — a document about the tool is a node in the
 > graph the tool builds.
 
 ---
@@ -315,22 +334,22 @@ $ ctx core --limit 8
 Ranked by dependency centrality (PageRank); higher = more depended-upon.
 
   score    in  out  module
-  0.3002    12    0  model  [19 items]
-  0.1544    10    1  extract  [76 items]
-  0.0657     4    2  render  [13 items]
-  0.0546     1    0  EXAMPLES  [13 items]
-  0.0512     3    3  view  [11 items]
-  0.0491     2    4  query  [141 items]
-  0.0295     0    0  SECURITY  [6 items]
-  0.0295     0    4  crate  [46 items]
+  0.3036    13    0  model  [19 items]
+  0.1568    11    1  extract  [94 items]
+  0.0617     4    2  render  [13 items]
+  0.0513     1    0  EXAMPLES  [13 items]
+  0.0481     3    3  view  [11 items]
+  0.0460     2    4  query  [141 items]
+  0.0277     0    0  SECURITY  [6 items]
+  0.0277     0    4  crate  [46 items]
 ```
 
-`model` on top with 11 inbound and 0 outbound is the right answer: it's the
+`model` on top with 13 inbound and 0 outbound is the right answer: it's the
 shared data model every other module depends on and which depends on nothing.
 
 `EXAMPLES` ranking fourth is this file. Markdown is part of the graph, so the
 README's link to it is a real edge — which is also why `ctx doctor` above counts
-16 modules and not 14. A document about the tool is a node in the graph the tool
+18 modules and not 15. A document about the tool is a node in the graph the tool
 builds.
 
 ---
@@ -343,7 +362,7 @@ Jump-to-def without knowing the file, across languages.
 $ ctx def Universe
 1 definition(s) of 'Universe':
 
-extract::Universe   [struct]   src/extract/mod.rs:1085-1102  #85eadbaee90b
+extract::Universe   [struct]   src/extract/mod.rs:1407-1424  #85eadbaee90b
     struct Universe { methods: MethodIndex, all_names: BTreeSet<String>, module_segs: BTreeSet<String>, implementors: HashMap<String, BTreeSet<(String, String)>>, fields: HashMap<String, BTreeMap<String, String>> }  — Whole-tree symbol evidence, built once and shared by every module's
 ```
 
@@ -359,7 +378,6 @@ calls, and what calls it — instead of a map→def→callers→subtree dance.
 
 ```
 $ ctx context signature_types
-
 # Context: query::signature_types
 
 ## Definition
@@ -374,14 +392,14 @@ query::signature_types   [fn]   src/query.rs:1179-1198  #4ac8c94b6d61
 - identifiers  @ 1184
 
 ## Callers — dependents (1)
-- query::context  (src/query.rs:1302-1587  #b0710a0017d0)  @ 1347, 1423
+- query::context  (src/query.rs:1303-1588  #b0710a0017d0)  @ 1348, 1424
 
 completeness: no call site named `signature_types` went unresolved anywhere in this tree —
 this caller list is complete to the limit of what ctx parses.
 ```
 
 Two things to notice. The callee list says **where** each call happens
-(`@ 1184`), and the caller list says where it calls *back* (`@ 1363, 1438` —
+(`@ 1184`), and the caller list says where it calls *back* (`@ 1348, 1424` —
 `context` calls this from two places). Those are spans, not lines: a call spread
 over five lines reports `1345-1349`. The section headings name the direction,
 because outgoing dependencies and incoming dependents answer different
@@ -389,14 +407,13 @@ questions — "what does this need" versus "what breaks if I change it".
 
 ### `--include-source` — when the answer should not need a follow-up read
 
-```
+````
 $ ctx context Receiver --include-source
-
 # Context: model::Receiver
 
 ## Definition
-model::Receiver   [enum]   src/model.rs:244-263  #fe75ad1b13f7
-    pub enum Receiver { Free | SelfType | SelfField | Typed | Dyn | Unknown }  — How a callee was referenced — governs how confidently a receiver method
+model::Receiver   [enum]   src/model.rs:266-295  #eaedf052414f
+    pub enum Receiver { Free | SelfType | SelfField | Typed | Dyn | Returned | Unknown }  — How a callee was referenced — governs how confidently a receiver method
 
 ```rust
 pub enum Receiver {
@@ -415,15 +432,41 @@ pub enum Receiver {
     /// A receiver that is a trait object, `impl Trait`, a bounded generic, or
     /// an interface-typed value: the call dispatches over every implementation.
     Dyn(String),
+    /// A receiver bound to the result of calling something else: `r :=
+    /// NewRouter()`, then `r.Path(..)`. The payload is the callee as written
+    /// (`NewRouter`, `mux.NewRouter`, `Router.Path`).
+    ///
+    /// Go's dominant idiom, and the one case an extractor cannot settle on its
+    /// own: the type is stated in the *callee's* signature, which may be in
+    /// another file or another package. So the call site records what it was
+    /// given and resolution looks the return type up, which makes it as backed
+    /// by declared source as `Typed` — just resolved a step later.
+    Returned(String),
     /// An opaque receiver (`expr.f()`): the type is unknown, so any
     /// attribution is a heuristic guess.
     Unknown,
 }
 ```
 
-## Referenced by — dependents (6 signature(s))
-- extract  (src/extract/mod.rs:1392)
+## Referenced by — dependents (14 signature(s))
+- extract  (src/extract/mod.rs:1848)
     fn field_receiver(ty: &str, uni: &Universe) -> Receiver
+- extract::go  (src/extract/go.rs:520)
+    struct TypeEnv { vars: HashMap<String, Receiver> }
+- extract::go  (src/extract/go.rs:527)
+    fn classify_type(raw: &str, ifaces: &BTreeSet<String>) -> Option<Receiver>
+- extract::go  (src/extract/go.rs:635)
+    fn param_types(node: Node, src: &str, ifaces: &BTreeSet<String>) -> Vec<(String, Receiver)>
+- extract::go  (src/extract/go.rs:791)
+    fn short_var_bindings( n: Node, src: &str, env: &TypeEnv, ifaces: &BTreeSet<String>, ) -> Vec<(String, Receiver)>
+- extract::go  (src/extract/go.rs:836)
+    fn var_bindings( n: Node, src: &str, env: &TypeEnv, ifaces: &BTreeSet<String>, ) -> Vec<(String, Receiver)>
+- extract::go  (src/extract/go.rs:875)
+    fn value_type(v: Node, src: &str, env: &TypeEnv, ifaces: &BTreeSet<String>) -> Option<Receiver>
+- extract::go  (src/extract/go.rs:946)
+    fn new_arg_type(v: Node, src: &str, ifaces: &BTreeSet<String>) -> Option<Receiver>
+- extract::go  (src/extract/go.rs:965)
+    let push = |path: String, recv: Receiver, out: &mut Vec<RawCall>|
 - extract::rust  (src/extract/rust.rs:133)
     struct TypeEnv { vars: HashMap<String, Receiver> }
 - extract::rust  (src/extract/rust.rs:237)
@@ -432,133 +475,13 @@ pub enum Receiver {
     fn let_binding(n: Node, src: &str, env: &TypeEnv) -> Option<(String, Receiver)>
 - extract::rust  (src/extract/rust.rs:567)
     fn receiver_of(v: Node, src: &str, env: &TypeEnv) -> Receiver
-- model  (src/model.rs:269)
+- model  (src/model.rs:301)
     pub struct RawCall { pub path: String, pub recv: Receiver, pub line: usize, pub end_line: usize }
 Signature references only: uses inside function BODIES are not indexed.
 
 completeness: no call site named `Receiver` went unresolved anywhere in this tree —
 this caller list is complete to the limit of what ctx parses.
-```rust
-pub enum Receiver {
-    /// A free function or fully-pathed call: `foo()`, `a::b::foo()`.
-    Free,
-    /// An explicit self/Self receiver (`self.f()`, `Self::f()`): the
-    /// enclosing impl/class is the correct container.
-    SelfType,
-    /// `self.field.method()` — the receiver is a field of the enclosing type,
-    /// resolved against that type's declared field types.
-    SelfField(String),
-    /// A receiver whose concrete type is known from a local binding, a
-    /// parameter annotation, or a field declaration: `let e: Engine`, then
-    /// `e.step()`. The attribution is backed by a type written in the source.
-    Typed(String),
-    /// A receiver that is a trait object, `impl Trait`, a bounded generic, or
-    /// an interface-typed value: the call dispatches over every implementation.
-    Dyn(String),
-    /// An opaque receiver (`expr.f()`): the type is unknown, so any
-    /// attribution is a heuristic guess.
-    Unknown,
-}
-```
-
-## Referenced by — dependents (6 signature(s))
-- extract  (src/extract/mod.rs:1392)
-    fn field_receiver(ty: &str, uni: &Universe) -> Receiver
-- extract::rust  (src/extract/rust.rs:133)
-    struct TypeEnv { vars: HashMap<String, Receiver> }
-- extract::rust  (src/extract/rust.rs:237)
-    fn classify_type(raw: &str, generics: &HashMap<String, String>) -> Option<Receiver>
-- extract::rust  (src/extract/rust.rs:469)
-    fn let_binding(n: Node, src: &str, env: &TypeEnv) -> Option<(String, Receiver)>
-- extract::rust  (src/extract/rust.rs:567)
-    fn receiver_of(v: Node, src: &str, env: &TypeEnv) -> Receiver
-- model  (src/model.rs:269)
-    pub struct RawCall { pub path: String, pub recv: Receiver, pub line: usize, pub end_line: usize }
-Signature references only: uses inside function BODIES are not indexed.
-
-completeness: no call site named `Receiver` went unresolved anywhere in this tree —
-this caller list is complete to the limit of what ctx parses.
-```rust
-pub enum Receiver {
-    /// A free function or fully-pathed call: `foo()`, `a::b::foo()`.
-    Free,
-    /// An explicit self/Self receiver (`self.f()`, `Self::f()`): the
-    /// enclosing impl/class is the correct container.
-    SelfType,
-    /// `self.field.method()` — the receiver is a field of the enclosing type,
-    /// resolved against that type's declared field types.
-    SelfField(String),
-    /// A receiver whose concrete type is known from a local binding, a
-    /// parameter annotation, or a field declaration: `let e: Engine`, then
-    /// `e.step()`. The attribution is backed by a type written in the source.
-    Typed(String),
-    /// A receiver that is a trait object, `impl Trait`, a bounded generic, or
-    /// an interface-typed value: the call dispatches over every implementation.
-    Dyn(String),
-    /// An opaque receiver (`expr.f()`): the type is unknown, so any
-    /// attribution is a heuristic guess.
-    Unknown,
-}
-```
-
-## Referenced by — dependents (6 signature(s))
-- extract  (src/extract/mod.rs:1392)
-    fn field_receiver(ty: &str, uni: &Universe) -> Receiver
-- extract::rust  (src/extract/rust.rs:133)
-    struct TypeEnv { vars: HashMap<String, Receiver> }
-- extract::rust  (src/extract/rust.rs:237)
-    fn classify_type(raw: &str, generics: &HashMap<String, String>) -> Option<Receiver>
-- extract::rust  (src/extract/rust.rs:469)
-    fn let_binding(n: Node, src: &str, env: &TypeEnv) -> Option<(String, Receiver)>
-- extract::rust  (src/extract/rust.rs:567)
-    fn receiver_of(v: Node, src: &str, env: &TypeEnv) -> Receiver
-- model  (src/model.rs:269)
-    pub struct RawCall { pub path: String, pub recv: Receiver, pub line: usize, pub end_line: usize }
-Signature references only: uses inside function BODIES are not indexed.
-
-completeness: no call site named `Receiver` went unresolved anywhere in this tree —
-this caller list is complete to the limit of what ctx parses.
-```rust
-pub enum Receiver {
-    /// A free function or fully-pathed call: `foo()`, `a::b::foo()`.
-    Free,
-    /// An explicit self/Self receiver (`self.f()`, `Self::f()`): the
-    /// enclosing impl/class is the correct container.
-    SelfType,
-    /// `self.field.method()` — the receiver is a field of the enclosing type,
-    /// resolved against that type's declared field types.
-    SelfField(String),
-    /// A receiver whose concrete type is known from a local binding, a
-    /// parameter annotation, or a field declaration: `let e: Engine`, then
-    /// `e.step()`. The attribution is backed by a type written in the source.
-    Typed(String),
-    /// A receiver that is a trait object, `impl Trait`, a bounded generic, or
-    /// an interface-typed value: the call dispatches over every implementation.
-    Dyn(String),
-    /// An opaque receiver (`expr.f()`): the type is unknown, so any
-    /// attribution is a heuristic guess.
-    Unknown,
-}
-```
-
-## Referenced by — dependents (6 signature(s))
-- extract  (src/extract/mod.rs:1392)
-    fn field_receiver(ty: &str, uni: &Universe) -> Receiver
-- extract::rust  (src/extract/rust.rs:133)
-    struct TypeEnv { vars: HashMap<String, Receiver> }
-- extract::rust  (src/extract/rust.rs:237)
-    fn classify_type(raw: &str, generics: &HashMap<String, String>) -> Option<Receiver>
-- extract::rust  (src/extract/rust.rs:469)
-    fn let_binding(n: Node, src: &str, env: &TypeEnv) -> Option<(String, Receiver)>
-- extract::rust  (src/extract/rust.rs:567)
-    fn receiver_of(v: Node, src: &str, env: &TypeEnv) -> Receiver
-- model  (src/model.rs:269)
-    pub struct RawCall { pub path: String, pub recv: Receiver, pub line: usize, pub end_line: usize }
-Signature references only: uses inside function BODIES are not indexed.
-
-completeness: no call site named `Receiver` went unresolved anywhere in this tree —
-this caller list is complete to the limit of what ctx parses.
-```
+````
 
 The enum is the case that earns this flag. Shown `Receiver` with no variants, a
 model will confidently invent a seventh one; shown all six with their payloads,
