@@ -121,6 +121,27 @@ pub fn move_plan(g: &Graph, from: &str, to: &str, json_out: bool) -> String {
     let Some(target) = g.modules.iter().find(|m| matches(&m.name)) else {
         return format!("no module matching '{from}'\n");
     };
+    // Go's unit of relocation is the package, which is a directory, not a file.
+    // Moving one file out of a package changes no import anywhere (its importers
+    // name the directory), while moving the package means moving every file in
+    // it — so a file-module plan here would be confidently wrong in both
+    // directions. Refusing is the honest answer; emitting a plausible-looking
+    // plan that silently rewrites nothing is the failure this command exists to
+    // prevent.
+    if target.lang == Lang::Go {
+        let pkg = target.resolve_segs().join("/");
+        return format!(
+            "'{from}' is a Go file, and Go relocations are not planned by file.\n\n\
+             In Go the unit of import is the package directory ({pkg}/), not the\n\
+             file. Importers name the directory, so moving one file within a package\n\
+             changes no import at all, and moving the package means moving every file\n\
+             in it. A file-level plan would be wrong in both directions, so ctx does\n\
+             not offer one.\n\n\
+             To relocate the package, move the directory and rewrite the import path\n\
+             in its importers. This names them:\n\n  \
+             ctx map --lang go | grep '{pkg}'\n"
+        );
+    }
     if g.modules.iter().any(|m| m.name == to) {
         return format!("'{to}' already exists — pick a destination that is free\n");
     }
@@ -303,6 +324,26 @@ mod tests {
         }
         let g = build_graph(&dir).unwrap();
         (g, dir)
+    }
+
+    #[test]
+    fn a_go_module_is_refused_rather_than_planned_by_file() {
+        let (g, dir) = graph(&[
+            ("go.mod", "module example.com/a\n"),
+            (
+                "store/store.go",
+                "package store\n\nfunc New() *S { return nil }\n",
+            ),
+            ("store/cache.go", "package store\n\ntype S struct{}\n"),
+        ]);
+        let out = move_plan(&g, "store.cache", "store.kv", false);
+        assert!(
+            out.contains("not planned by file") && out.contains("store/"),
+            "expected a refusal naming the package directory, got:\n{out}"
+        );
+        // And nothing that reads like a plan to follow.
+        assert!(!out.contains("Move the file"), "got:\n{out}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

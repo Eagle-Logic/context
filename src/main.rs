@@ -47,6 +47,7 @@ enum LangArg {
     Rust,
     Python,
     Ts,
+    Go,
     Md,
     /// Every supported language except Markdown.
     Code,
@@ -59,8 +60,9 @@ impl LangArg {
             LangArg::Rust => vec![Lang::Rust],
             LangArg::Python => vec![Lang::Python],
             LangArg::Ts => vec![Lang::TypeScript],
+            LangArg::Go => vec![Lang::Go],
             LangArg::Md => vec![Lang::Markdown],
-            LangArg::Code => vec![Lang::Rust, Lang::Python, Lang::TypeScript],
+            LangArg::Code => vec![Lang::Rust, Lang::Python, Lang::TypeScript, Lang::Go],
         }
     }
 }
@@ -76,6 +78,8 @@ enum Format {
 enum AliasSet {
     /// Python → Rust conventions (e.g. `__init__` → `new`)
     PyRust,
+    /// Python → Go conventions (e.g. `__str__` → `String`)
+    PyGo,
 }
 
 #[derive(Subcommand)]
@@ -389,7 +393,7 @@ fn snippet_for(g: &Graph) -> String {
     let mut out = String::from("<!-- ctx:begin — regenerate with `ctx snippet` -->\n");
     out.push_str("## Codebase Discovery\n\n");
     out.push_str(
-        "`ctx` is a deterministic structural index (Rust/Python/TS/Markdown). Use it to locate \
+        "`ctx` is a deterministic structural index (Rust/Python/TS/Go/Markdown). Use it to locate \
          and orient; read raw files for implementation bodies. `ctx <cmd> --help` for detail.\n\n",
     );
 
@@ -773,6 +777,7 @@ fn main() -> Result<()> {
             }
             let amap = match aliases {
                 Some(AliasSet::PyRust) => parity::py_rust_aliases(),
+                Some(AliasSet::PyGo) => parity::py_go_aliases(),
                 None => parity::AliasMap::new(),
             };
             let containers: std::collections::BTreeMap<String, String> =

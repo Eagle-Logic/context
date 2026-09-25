@@ -12,8 +12,10 @@ pub struct Graph {
 #[derive(Serialize, Clone)]
 pub struct Module {
     pub name: String,
-    /// Original path-derived name, kept when `name` is renamed to break a
-    /// collision. Empty means `name` was never renamed.
+    /// The name resolution keys on, when it differs from the display `name`.
+    /// Set either because `name` was renamed to break a collision, or —
+    /// for Go — because the unit of import is the package directory rather
+    /// than the file. Empty means `name` is also the resolution name.
     #[serde(skip)]
     pub resolve_name: String,
     pub file: String,
@@ -56,6 +58,17 @@ pub struct Module {
     /// name rather than its parent.
     #[serde(skip)]
     pub is_package: bool,
+    /// Go: the `module` path from the nearest enclosing go.mod, split into
+    /// segments. An import starting with these segments is internal and its
+    /// remainder is a directory path under `crate_prefix`; anything else is
+    /// another module's. Empty when no go.mod was found, which drops Go import
+    /// resolution back to suffix matching.
+    #[serde(skip)]
+    pub go_module: Vec<String>,
+    /// Declared return types of this module's callables; see
+    /// [`FileFacts::returns`]. Consumed during resolution.
+    #[serde(skip)]
+    pub returns: BTreeMap<String, String>,
     /// Call-edge resolution stats for this module (for `ctx doctor`).
     #[serde(skip)]
     pub diag: Diagnostics,
@@ -114,6 +127,13 @@ pub struct FileFacts {
     pub imports: Vec<String>,
     pub reexports: Vec<Binding>,
     pub defined: BTreeSet<String>,
+    /// Declared return types, for resolving a [`Receiver::Returned`].
+    ///
+    /// Keyed by the callee as a call site writes it: a bare name for a free
+    /// function, `Type.Method` for a method. The value is the base type of the
+    /// callee's FIRST result, which is what `x, err := New()` binds `x` to —
+    /// position 0 of a result tuple, not a guess about which result matters.
+    pub returns: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +142,7 @@ pub enum Lang {
     Rust,
     Python,
     TypeScript,
+    Go,
     Markdown,
 }
 
@@ -131,6 +152,7 @@ impl Lang {
             Lang::Rust => "rust",
             Lang::Python => "python",
             Lang::TypeScript => "typescript",
+            Lang::Go => "go",
             Lang::Markdown => "markdown",
         }
     }
@@ -143,7 +165,7 @@ impl Lang {
     pub fn sep(self) -> &'static str {
         match self {
             Lang::Rust => "::",
-            Lang::Python | Lang::TypeScript | Lang::Markdown => ".",
+            Lang::Python | Lang::TypeScript | Lang::Go | Lang::Markdown => ".",
         }
     }
 }
@@ -257,6 +279,16 @@ pub enum Receiver {
     /// A receiver that is a trait object, `impl Trait`, a bounded generic, or
     /// an interface-typed value: the call dispatches over every implementation.
     Dyn(String),
+    /// A receiver bound to the result of calling something else: `r :=
+    /// NewRouter()`, then `r.Path(..)`. The payload is the callee as written
+    /// (`NewRouter`, `mux.NewRouter`, `Router.Path`).
+    ///
+    /// Go's dominant idiom, and the one case an extractor cannot settle on its
+    /// own: the type is stated in the *callee's* signature, which may be in
+    /// another file or another package. So the call site records what it was
+    /// given and resolution looks the return type up, which makes it as backed
+    /// by declared source as `Typed` — just resolved a step later.
+    Returned(String),
     /// An opaque receiver (`expr.f()`): the type is unknown, so any
     /// attribution is a heuristic guess.
     Unknown,

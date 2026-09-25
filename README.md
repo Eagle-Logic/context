@@ -11,7 +11,8 @@ set of queries an agent runs mid-task: *who calls this, how does execution get
 here, what breaks if I change it, what must a move touch, does my port still
 match the original.*
 
-One Rust binary. Tree-sitter for Rust, Python, TypeScript/TSX, and Markdown. No
+One Rust binary. Tree-sitter for Rust, Python, TypeScript/TSX, Go, and Markdown.
+No
 language servers, no embeddings, no index to warm. The graph is a pure function
 of the source tree — same code in, same answer out — and it builds in ~100 ms,
 so every query runs against current source.
@@ -103,7 +104,7 @@ and not failed.
 Treat it as a tripwire that surfaces an unintended removal in review, not as a
 semver authority — a language-specific tool with a type system
 (`cargo-semver-checks`, `apidiff`, `japicmp`) is stricter within its language. The
-trade ctx makes is breadth: one gate across Rust, Python and TypeScript in a
+trade ctx makes is breadth: one gate across Rust, Python, TypeScript and Go in a
 polyglot repo.
 
 ```yaml
@@ -193,7 +194,7 @@ Against it, `ctx` trades semantic precision for two things:
 | startup | ~100 ms graph build, per query | server warm-up, project indexing |
 | determinism | pure function of the source tree | depends on server state, versions, build artifacts |
 | uncertainty | marked per edge (`~`, `*`) + a miss census | resolved or absent, silently |
-| coverage | 4 languages (today), one graph across all of them | as many as you install servers for |
+| coverage | 5 languages (today), one graph across all of them | as many as you install servers for |
 
 If you need type-perfect resolution inside one language, use an LSP. If you
 want the same graph across a polyglot repo with nothing to install and answers
@@ -385,7 +386,7 @@ ctx map --max-tokens 8000             # hard cap: reduces detail, then prunes
 ctx map -o CODEBASE_MAP.md            # write it out (goes stale on the next edit)
 
 # Scoping (global, repeatable)
-ctx map --lang code                   # Rust/Python/TypeScript only, no prose
+ctx map --lang code                   # Rust/Python/TS/Go only, no prose
 ctx map --exclude 'docs/archive/**'   # vendored trees, dead code
 
 # Show each edge's call sites in map/subtree/callers (context always shows them)
@@ -408,7 +409,7 @@ defaulting to `.`; `parity` takes a source and one or more targets instead. See
 archived docs and dead code are usually tracked, so `.gitignore` will not exclude
 them: `--exclude 'docs/archive/**'`. And because a docs tree can dominate a *code*
 map — 78% of one 720-module repo's skeleton view — `--lang code` restricts the
-scan to Rust/Python/TypeScript, cutting that map from ~169k to ~35k tokens.
+scan to Rust/Python/TypeScript/Go, cutting that map from ~169k to ~35k tokens.
 
 Module names are unique. They derive from paths, so `src/lib.rs` and `src/main.rs`
 both want to be `crate`, and a `native/README.md` collides with the
@@ -595,7 +596,9 @@ Because it leans on names, `canon()` alone bridges most Python↔Rust dunder
 renames for free (it strips the underscores, so `__len__`↔`len`, `__eq__`↔`eq`,
 `__hash__`↔`hash`, `__next__`↔`next` already align). For the renames it can't —
 chiefly `__init__`→`new`, plus `__str__`→`fmt`/`to_string`,
-`__getitem__`→`index`, `__iter__`→`into_iter` — pass `--aliases py-rust`. Every
+`__getitem__`→`index`, `__iter__`→`into_iter` — pass `--aliases py-rust`, or
+`--aliases py-go` for Go's conventions (`__str__`→`String`, `__eq__`→`Equal`).
+Every
 alias-based match is reported in its own **Aligned via alias** section, never
 silently folded, so the fuzz you opted into stays visible.
 
@@ -840,6 +843,89 @@ jq -s 'map(select(.summary|not)) | group_by(.tool)
        | map({tool: .[0].tool, calls: length, tokens: (map(.output_tokens)|add)})' /tmp/ctx.jsonl
 ```
 
+## Go: the package is the unit
+
+Go is the one language here where the file is not the module. A directory *is* a
+package: its files share one namespace, there is no per-file visibility, and an
+import names the directory, never a file. So `ctx` splits the difference — files
+stay separate modules, because an item's location has to be its own file, but
+**resolution keys on the package**. Concretely:
+
+- **An import depends on the whole package.** `import "example.com/svc/store"`
+  yields a dep on every file in `store/`, because Go compiles and links the
+  package as a unit. One edge to whichever file sorted first would have been
+  arbitrary; all of them is the truth.
+- **A bare name reaches across the package.** `NewCache()` in `store/store.go`
+  resolving to `store/cache.go` is a **proven** edge, not a heuristic: it is the
+  language's own scoping rule, and two files of one package cannot both define
+  the name and still compile.
+- **A method may live in any file of its package.** Methods are bucketed by
+  receiver type into one synthetic `impl T` container per file, so `T.M` is
+  reachable the same way a Rust inherent method is.
+
+**Imports are resolved from `go.mod`, not guessed.** The `module` directive gives
+the path prefix; the remainder is directory arithmetic — deterministic and
+non-heuristic, the same class of signal `move-plan` rides on in other languages.
+Every `go.mod` in the tree is read, so a repo with nested modules (the usual
+`_examples/`, `tools/`) resolves an import of its own parent correctly.
+
+**The standard library is excluded by the go tool's own rule**, not a curated
+list: an import path outside the standard library must have a dot in its first
+element, so a first element without one is stdlib and is no more a dependency
+than Rust's `std`. And a call through an import that leaves the tree
+(`http.HandlerFunc(..)`) is classified *external* even when a local type happens
+to declare a method of the same name — otherwise the miss census fills with
+`net/http` and buries the real misses.
+
+**`x := NewFoo()` is resolved through the callee's signature.** This is Go's
+dominant idiom and the one case a receiver's type is not written where it is
+used — it is stated on the function being called, possibly in another file or
+another package. So the call site records what it was handed and resolution reads
+the return type off the callee, which makes the edge as backed by declared source
+as any annotated receiver, just resolved a step later. Builder chains
+(`new(Route).Host("h").Path("/a")`) are walked link by link, each step's result
+typing the next.
+
+Measured internal recall, `--lang go`, on six upstream repos:
+
+| repo | modules | recall | misses |
+|---|---|---|---|
+| spf13/cobra | 36 | **99.8%** | 5 |
+| gorilla/mux | 17 | **93.9%** | 81 |
+| hashicorp/go-retryablehttp | 6 | **92.2%** | 15 |
+| google/uuid | 23 | **91.3%** | 27 |
+| go-chi/chi | 84 | **89.6%** | 183 |
+| sirupsen/logrus | 53 | **88.3%** | 152 |
+
+Those numbers are `ctx doctor`'s own, on unmodified upstream checkouts, and every
+miss behind them is named by `doctor` with the grep to confirm it. They moved a
+long way during development — go-chi was at 36.8% before cross-package scope,
+return types and the `/vN` fix — which is the argument for the miss census
+existing at all: each jump was a specific, nameable class of call site, visible
+in the census rather than hidden in an aggregate.
+
+**Four limits worth knowing**, all of them things ctx declines to guess at:
+
+- **Interface satisfaction is structural in Go, and ctx does not compute it.** A
+  type implements an interface by having its methods, with nothing in the source
+  saying so. `implements` is therefore populated from *embedding* only, which is
+  syntactic. A call through an interface-typed receiver fans out (`*`) when the
+  interface is embedded and otherwise resolves to the interface's own method, so
+  dispatch fan-out is narrower here than in Rust or TypeScript.
+- **A package-qualified type is matched by its bare name.** `http.Handler` and a
+  local `Handler` are not told apart, so a call on an `http.Handler` receiver can
+  miss, or — if the local type declares a method of the same name — land on the
+  wrong one. Grep the census to confirm anything load-bearing.
+- **`move-plan` refuses Go**, with a message saying why. The unit of relocation is
+  the package directory: moving one file within a package changes no import, and
+  moving the package means moving every file in it, so a file-level plan would be
+  wrong in both directions.
+- **Build tags and cgo are not evaluated.** Every `.go` file is parsed regardless
+  of `//go:build` constraints, so a tree with several mutually exclusive
+  platform builds is over-approximated. Directories the go tool ignores because
+  they start with `_` or `.` are still scanned, which is usually what you want
+  from a code map and is not what the compiler sees.
+
 ## Markdown as a graph
 
 A docs tree is a graph too — and unlike JSON/XML (which are trees, no
@@ -946,31 +1032,43 @@ you at.
 pub fn extract(src: &str) -> Result<FileFacts>
 ```
 
-`FileFacts` (`src/model.rs`) is four fields: `items`, `imports`, `reexports`,
-`defined`. The work is in populating `Item` — and specifically in `raw_calls`,
+`FileFacts` (`src/model.rs`) is five fields: `items`, `imports`, `reexports`,
+`defined`, and `returns` (declared result types — only needed if your language
+binds a receiver to a call's result, as Go's `x := NewFoo()` does; leave it empty
+otherwise). The work is in populating `Item` — and specifically in `raw_calls`,
 where each `RawCall` carries a `Receiver` (`Free`, `SelfType`, `SelfField`,
-`Typed`, `Dyn`, `Unknown`). **`Receiver` is where edge confidence comes from.**
+`Typed`, `Dyn`, `Returned`, `Unknown`). **`Receiver` is where edge confidence
+comes from.**
 An extractor that returns `Unknown` everywhere compiles and runs, and produces a
 map in which every edge is marked `~`. Getting `Typed` and `Dyn` right is most of
 the value. `src/extract/python.rs` is the smallest complete example and the
 template worth copying; note that `TypeEnv` (local-binding type tracking) is
 deliberately per-language, not shared, so that part is written fresh each time.
 
-**2. Add the `Lang` variant**, then run `cargo check`. Eight exhaustive matches
+**2. Add the `Lang` variant**, then run `cargo check`. Nine exhaustive matches
 will fail to compile, and each is a real decision:
 
 | site | decision |
 |---|---|
 | `extract/mod.rs` `build_graph` | call your `extract()` |
-| `extract/mod.rs` `module_name` stem collapse | which filename collapses to its directory (`mod`/`lib`/`main`, `__init__`, `index`) |
+| `extract/mod.rs` `module_name` stem collapse | which filename collapses to its directory (`mod`/`lib`/`main`, `__init__`, `index`; nothing, in Go) |
 | `extract/mod.rs` `module_name` root | the name of the root module (`crate` vs `root`) |
-| `extract/mod.rs` `candidates()` | import string → absolute module segments — by name (Rust/Python) or by path (TypeScript) |
+| `extract/mod.rs` `candidates()` | import string → absolute module segments — by name (Rust/Python), by path (TypeScript), or from a manifest (Go's `go.mod`) |
 | `extract/mod.rs` `filter_note()` | how `--lang` describes your language |
+| `main.rs` `LangArg` | the `--lang` value, and whether `--lang code` includes it |
 | `model.rs` `Lang::name()` | display string |
 | `model.rs` `Lang::sep()` | path separator (`::` vs `.`) |
-| `view.rs` `is_public()` | what "public" means: a keyword, a naming convention, an `export` |
+| `query.rs` fence | the language tag for `--include-source` code fences |
+| `view.rs` `is_public()` | what "public" means: a keyword, a naming convention, an `export`, a capital letter |
 
 Only `candidates()` and the visibility rule are real design work.
+
+**If your language's module is not the file**, budget for more than an extractor.
+A directory-scoped language (Go) needs `resolve_name` set to the package, a
+package index so a qualified call finds the file that defines the symbol rather
+than the one that sorts first, and same-package lookup for bare names — see
+`go_packages`, `go_match` and `go_sibling`. That was the bulk of Go's work, and
+none of it is in the extractor.
 
 **3. Four places the compiler will _not_ catch** — each has a `_` fallback, so
 missing one fails silently rather than loudly:
@@ -979,8 +1077,9 @@ missing one fails silently rather than loudly:
   walked, and the map is simply empty
 - the extension → `Lang` mapping (`_ => continue`)
 - `is_package` (`_ => false`)
-- `UNSUPPORTED_SOURCE_EXTS` — remove your extension, or `ctx doctor` keeps
-  reporting the language as a blind spot after you've added it
+- `NON_SOURCE_EXTS` and the `supported` list in `unsupported_census` — miss
+  either and `ctx doctor` keeps reporting the language as a blind spot after
+  you have added it, or stops reporting a genuine one
 
 Grammars are compiled into the binary, so a new grammar crate is a real
 binary-size decision, not just a dependency.
