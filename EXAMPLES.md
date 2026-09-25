@@ -11,7 +11,7 @@ tree they were run against, so a version string dates them without making them
 current — this file had drifted a whole minor version before anyone noticed.
 Regenerate it in the release commit instead.
 
-The repo under analysis: **15 Rust files, 3 Markdown files, 18 modules, 6,139
+The repo under analysis: **15 Rust files, 4 Markdown files, 19 modules, 6,293
 call sites.** Small enough to read in a sitting, which makes it a fair place to
 check whether the answers are actually right.
 
@@ -81,8 +81,8 @@ $ ctx trace build_graph --depth 2
 # call tree from 'build_graph'  (depth 2)
 ~ heuristic edge (verify) · * one branch of a dispatch fan-out
 
-extract::build_graph  [src/extract/mod.rs:207]  [+1 outside graph]
-├─ extract::disambiguate_module_names  [src/extract/mod.rs:347]
+extract::build_graph  [src/extract/mod.rs:226]  [+1 outside graph]
+├─ extract::disambiguate_module_names  [src/extract/mod.rs:373]
 ├─ extract::go::extract  [src/extract/go.rs:9]  [+1 outside graph]
 │  ├─ extract::go::function  [src/extract/go.rs:669]  (depth limit)
 │  ├─ extract::go::imports  [src/extract/go.rs:238]  (depth limit)
@@ -93,8 +93,8 @@ extract::build_graph  [src/extract/mod.rs:207]  [+1 outside graph]
 │  ├─ extract::go::returns_in  [src/extract/go.rs:115]  (depth limit)
 │  ├─ extract::go::types  [src/extract/go.rs:320]  (depth limit)
 │  └─ extract::go::values  [src/extract/go.rs:468]  (depth limit)
-├─ extract::go_modules  [src/extract/mod.rs:878]
-│  ├─ extract::go_segs  [src/extract/mod.rs:866]
+├─ extract::go_modules  [src/extract/mod.rs:927]
+│  ├─ extract::go_segs  [src/extract/mod.rs:915]
 │  └─ extract::walker  [src/extract/mod.rs:109]  (depth limit)
 ├─ extract::markdown::extract  [src/extract/markdown.rs:45]  [+1 outside graph]
 │  ├─ extract::markdown::assign_lines  [src/extract/markdown.rs:139]  (depth limit)
@@ -112,24 +112,26 @@ extract::build_graph  [src/extract/mod.rs:207]  [+1 outside graph]
 │  ├─ extract::markdown::slug  [src/extract/markdown.rs:13]
 │  └─ extract::markdown::strip_inline  [src/extract/markdown.rs:460]
 ├─ model::Lang::sep  [src/model.rs:165]
-├─ extract::module_name  [src/extract/mod.rs:559]
-│  └─ model::Lang::sep  [src/model.rs:165]
-├─ extract::nearest_go_module  [src/extract/mod.rs:923]
+├─ extract::module_name  [src/extract/mod.rs:608]
+│  ├─ model::Lang::sep  [src/model.rs:165]
+│  └─ extract::safe_seg  [src/extract/mod.rs:604]  (depth limit)
+├─ extract::nearest_go_module  [src/extract/mod.rs:972]
+├─ extract::needs_jsx  [src/extract/mod.rs:222]
 ├─ extract::python::extract  [src/extract/python.rs:9]  [+1 outside graph]
 │  ├─ extract::python::module_level_item  [src/extract/python.rs:35]  (depth limit)
 │  └─ extract::python::visit  [src/extract/python.rs:73]  (depth limit)
-├─ extract::resolve_deps  [src/extract/mod.rs:634]
-│  ├─ extract::apply_calls  [src/extract/mod.rs:2405]  (depth limit)
-│  ├─ extract::build_universe  [src/extract/mod.rs:1426]  (depth limit)
-│  ├─ extract::compute_calls  [src/extract/mod.rs:2242]  (depth limit)
-│  ├─ extract::display_reexport  [src/extract/mod.rs:2412]  (depth limit)
-│  ├─ extract::go_mod_index  [src/extract/mod.rs:940]
-│  ├─ extract::go_packages  [src/extract/mod.rs:984]  (depth limit)
+├─ extract::resolve_deps  [src/extract/mod.rs:683]
+│  ├─ extract::apply_calls  [src/extract/mod.rs:2473]  (depth limit)
+│  ├─ extract::build_universe  [src/extract/mod.rs:1493]  (depth limit)
+│  ├─ extract::compute_calls  [src/extract/mod.rs:2310]  (depth limit)
+│  ├─ extract::display_reexport  [src/extract/mod.rs:2480]  (depth limit)
+│  ├─ extract::go_mod_index  [src/extract/mod.rs:989]
+│  ├─ extract::go_packages  [src/extract/mod.rs:1033]  (depth limit)
 │  ├─ model::Module::resolve_segs~  [src/model.rs:319]  (depth limit)
-│  └─ extract::resolve_from  [src/extract/mod.rs:1096]  (depth limit)
+│  └─ extract::resolve_from  [src/extract/mod.rs:1163]  (depth limit)
 ├─ extract::rust::extract  [src/extract/rust.rs:9]  [+1 outside graph]
 │  └─ extract::rust::visit  [src/extract/rust.rs:25]  (depth limit)
-├─ extract::slash_path  [src/extract/mod.rs:549]
+├─ extract::slash_path  [src/extract/mod.rs:578]
 ├─ extract::source_files  [src/extract/mod.rs:142]
 │  ├─ extract::lang_selected  [src/extract/mod.rs:131]  (depth limit)
 │  └─ extract::walker  [src/extract/mod.rs:109]  (depth limit)
@@ -258,24 +260,24 @@ The differentiator. Every tool guesses; this one tells you where.
 $ ctx doctor
 # ctx coverage report — /home/steve/projects/context
 
-Modules: 18  (markdown 3, rust 15)
+Modules: 19  (markdown 4, rust 15)
 
 ## Internal recall — the number to trust
-  1317/1382 = 95.3%   of call sites that could be internal, ctx pinned this many.
+  1355/1422 = 95.3%   of call sites that could be internal, ctx pinned this many.
 
 A call site is "could be internal" when the callee name is defined somewhere
 under this root. Calls into std or a third-party crate are excluded, because no
 internal edge could exist for them however good the resolver gets.
 
 ## Every call site, bucketed
-call sites:            6139
-  internal edges:      1317   [17 heuristic (~), 0 dispatch fan-out (*)]
-  external (provable): 4757   (77.5%)  callee defined nowhere here — std/extern
-  unresolved internal: 65     (1.1%)  the real misses — see below
+call sites:            6293
+  internal edges:      1355   [17 heuristic (~), 0 dispatch fan-out (*)]
+  external (provable): 4871   (77.4%)  callee defined nowhere here — std/extern
+  unresolved internal: 67     (1.1%)  the real misses — see below
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
-     45  walk
+     47  walk
       9  context
       3  path
       2  est_tokens
@@ -287,8 +289,8 @@ grep these; every other edge in the map is one ctx could prove.
 
 ## Where the misses are
   extract::go                        21 unresolved   (module recall 89%)
+  extract::typescript                13 unresolved   (module recall 91%)
   extract::rust                      11 unresolved   (module recall 93%)
-  extract::typescript                11 unresolved   (module recall 90%)
   extract::python                    10 unresolved   (module recall 85%)
   extract                             5 unresolved   (module recall 98%)
   mcp                                 5 unresolved   (module recall 92%)
@@ -298,19 +300,20 @@ grep these; every other edge in the map is one ctx could prove.
 ## Low-confidence zones (edges to distrust — grep to confirm)
   parity                           18% heuristic (11/61 edges)
   refactor                         5% heuristic (1/20 edges)
-  extract                          1% heuristic (3/218 edges)
+  extract                          1% heuristic (3/228 edges)
   crate                            1% heuristic (1/149 edges)
   query                            0% heuristic (1/236 edges)
 
 ## Not modeled (blind spots)
-  none — every source file under this root is a supported language
-  (supported: .rs .py .ts .tsx .go .md)
+  source files present that ctx does not parse:
+  .sh       1
+  (supported: .rs .py .ts .tsx .js .jsx .go .md)
 ```
 
 95.3% recall comes with **the exact grep list for the other 4.7%** — nine
 names, with counts and the modules they live in.
 
-The denominator is honest too. 4,757 of 6,139 call sites go into `std` or a
+The denominator is honest too. 4,871 of 6,293 call sites go into `std` or a
 third-party crate, where no internal edge could ever exist, so they're excluded
 rather than quietly inflating the percentage. That classification is by evidence
 — *is this name defined anywhere under the root?* — not a hardcoded list.
@@ -318,7 +321,7 @@ rather than quietly inflating the percentage. That classification is by evidence
 The honest bit isn't that coverage is high. It's that the gaps are enumerable.
 
 > `ctx` treats Markdown as part of the graph, which is why this file counts
-> toward the 18 modules above — a document about the tool is a node in the
+> toward the 19 modules above — a document about the tool is a node in the
 > graph the tool builds.
 
 ---
@@ -334,23 +337,23 @@ $ ctx core --limit 8
 Ranked by dependency centrality (PageRank); higher = more depended-upon.
 
   score    in  out  module
-  0.3036    13    0  model  [19 items]
-  0.1568    11    1  extract  [94 items]
-  0.0617     4    2  render  [13 items]
-  0.0513     1    0  EXAMPLES  [13 items]
-  0.0481     3    3  view  [11 items]
-  0.0460     2    4  query  [141 items]
-  0.0277     0    0  SECURITY  [6 items]
-  0.0277     0    4  crate  [46 items]
+  0.2954    13    0  model  [19 items]
+  0.1525    11    1  extract  [100 items]
+  0.0601     4    2  render  [13 items]
+  0.0468     3    3  view  [11 items]
+  0.0448     2    4  query  [141 items]
+  0.0384     1    0  BENCHMARK  [4 items]
+  0.0384     1    0  EXAMPLES  [13 items]
+  0.0270     0    0  SECURITY  [6 items]
 ```
 
 `model` on top with 13 inbound and 0 outbound is the right answer: it's the
 shared data model every other module depends on and which depends on nothing.
 
-`EXAMPLES` ranking fourth is this file. Markdown is part of the graph, so the
-README's link to it is a real edge — which is also why `ctx doctor` above counts
-18 modules and not 15. A document about the tool is a node in the graph the tool
-builds.
+`EXAMPLES` and `BENCHMARK` in that list are this file and its neighbour.
+Markdown is part of the graph, so the README's link to each is a real edge —
+which is also why `ctx doctor` above counts 19 modules and not 15. A document
+about the tool is a node in the graph the tool builds.
 
 ---
 
@@ -362,7 +365,7 @@ Jump-to-def without knowing the file, across languages.
 $ ctx def Universe
 1 definition(s) of 'Universe':
 
-extract::Universe   [struct]   src/extract/mod.rs:1407-1424  #85eadbaee90b
+extract::Universe   [struct]   src/extract/mod.rs:1474-1491  #85eadbaee90b
     struct Universe { methods: MethodIndex, all_names: BTreeSet<String>, module_segs: BTreeSet<String>, implementors: HashMap<String, BTreeSet<(String, String)>>, fields: HashMap<String, BTreeMap<String, String>> }  — Whole-tree symbol evidence, built once and shared by every module's
 ```
 
@@ -449,7 +452,7 @@ pub enum Receiver {
 ```
 
 ## Referenced by — dependents (14 signature(s))
-- extract  (src/extract/mod.rs:1848)
+- extract  (src/extract/mod.rs:1916)
     fn field_receiver(ty: &str, uni: &Universe) -> Receiver
 - extract::go  (src/extract/go.rs:520)
     struct TypeEnv { vars: HashMap<String, Receiver> }
