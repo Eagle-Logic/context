@@ -11,10 +11,10 @@ set of queries an agent runs mid-task: *who calls this, how does execution get
 here, what breaks if I change it, what must a move touch, does my port still
 match the original.*
 
-One Rust binary. Tree-sitter for Rust, Python, TypeScript/TSX, Go, and Markdown.
-No language servers, no embeddings, no index to warm. The graph is a pure
-function of the source tree — same code in, same answer out — and it builds in
-~100 ms, so every query runs against current source.
+One Rust binary. Tree-sitter for Rust, Python, TypeScript/TSX, JavaScript/JSX,
+Go, and Markdown. No language servers, no embeddings, no index to warm. The
+graph is a pure function of the source tree — same code in, same answer out —
+and it builds in ~100 ms, so every query runs against current source.
 
 ```sh
 $ ctx callers resolve_call
@@ -39,7 +39,7 @@ them.
 **→ [EXAMPLES.md](EXAMPLES.md)** — ten commands run against this repo, verbatim
 output, including the parts where `ctx` reports its own limits.
 
-**→ [BENCHMARK.md](BENCHMARK.md)** — the same claims re-run on five public
+**→ [BENCHMARK.md](BENCHMARK.md)** — the same claims re-run on six public
 repositories pinned to exact commits, reproducible with `./bench/run.sh`.
 Including the row where it finds a limitation in ctx.
 
@@ -62,7 +62,7 @@ branch of a dynamic-dispatch fan-out is marked `*`. And `ctx doctor` names
 
 ```
 ## Internal recall — the number to trust
-  1319/1384 = 95.3%   of call sites that could be internal, ctx pinned this many.
+  1355/1422 = 95.3%   of call sites that could be internal, ctx pinned this many.
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
@@ -134,8 +134,8 @@ and not failed.
 Treat it as a tripwire that surfaces an unintended removal in review, not as a
 semver authority — a language-specific tool with a type system
 (`cargo-semver-checks`, `apidiff`, `japicmp`) is stricter within its language. The
-trade ctx makes is breadth: one gate across Rust, Python, TypeScript and Go in a
-polyglot repo.
+trade ctx makes is breadth: one gate across Rust, Python, TypeScript,
+JavaScript and Go in a polyglot repo.
 
 ```yaml
 # .github/workflows/ci.yml — PR-only; fetch-depth 0, the default shallow clone
@@ -224,7 +224,7 @@ Against it, `ctx` trades semantic precision for two things:
 | startup | ~100 ms graph build, per query | server warm-up, project indexing |
 | determinism | pure function of the source tree | depends on server state, versions, build artifacts |
 | uncertainty | marked per edge (`~`, `*`) + a miss census | resolved or absent, silently |
-| coverage | 5 languages (today), one graph across all of them | as many as you install servers for |
+| coverage | 6 languages (today), one graph across all of them | as many as you install servers for |
 
 If you need type-perfect resolution inside one language, use an LSP. If you
 want the same graph across a polyglot repo with nothing to install and answers
@@ -416,7 +416,7 @@ ctx map --max-tokens 8000             # hard cap: reduces detail, then prunes
 ctx map -o CODEBASE_MAP.md            # write it out (goes stale on the next edit)
 
 # Scoping (global, repeatable)
-ctx map --lang code                   # Rust/Python/TS/Go only, no prose
+ctx map --lang code                   # code only, no prose
 ctx map --exclude 'docs/archive/**'   # vendored trees, dead code
 
 # Show each edge's call sites in map/subtree/callers (context always shows them)
@@ -439,7 +439,7 @@ defaulting to `.`; `parity` takes a source and one or more targets instead. See
 archived docs and dead code are usually tracked, so `.gitignore` will not exclude
 them: `--exclude 'docs/archive/**'`. And because a docs tree can dominate a *code*
 map — 78% of one 720-module repo's skeleton view — `--lang code` restricts the
-scan to Rust/Python/TypeScript/Go, cutting that map from ~169k to ~35k tokens.
+scan to code only, cutting that map from ~169k to ~35k tokens.
 
 Module names are unique. They derive from paths, so `src/lib.rs` and `src/main.rs`
 both want to be `crate`, and a `native/README.md` collides with the
@@ -872,6 +872,41 @@ ctx mcp --metrics /tmp/ctx.jsonl
 jq -s 'map(select(.summary|not)) | group_by(.tool)
        | map({tool: .[0].tool, calls: length, tokens: (map(.output_tokens)|add)})' /tmp/ctx.jsonl
 ```
+
+## JavaScript: the same extractor, and one honest gap
+
+`.js`, `.jsx`, `.mjs` and `.cjs` are parsed by the TypeScript extractor with the
+JSX-capable grammar, and counted as TypeScript. No second grammar is compiled
+in: TypeScript is a syntactic superset of JavaScript, and JSX in a plain `.js`
+file — which Create React App shipped for years — is exactly what the TSX
+grammar is for.
+
+They share one `Lang` deliberately. JavaScript and TypeScript are one
+interoperating module graph: a `.js` file importing a `.ts` module is ordinary,
+and a half-migrated repo is the normal case. Splitting them would make the
+cross-language guard refuse real edges between files that genuinely call each
+other.
+
+CommonJS is handled alongside ESM — `const { a, b: c } = require('./y')`,
+`require('./y').z`, bare `require('./y')`, `module.exports = { … }`, and
+`exports.name = …`, which is a *definition* rather than a re-export and reaches
+`defined` accordingly. Without that, a Node module has no import edges at all.
+
+**Where it is weak, measured.** Modern ESM JavaScript does about as well as
+TypeScript — `preactjs/preact` reports 78.1% internal recall. `expressjs/express`
+reports **44.0%**, and the gap is one feature: express defines its API by
+assignment onto objects and prototypes.
+
+```js
+View.prototype.render = function render(options, callback) { … }
+res.render = function render(view, options, callback) { … }
+```
+
+ctx sees definitions, not assignments, so those names are not in the graph and
+calls to them cannot resolve. It is the dominant pattern in pre-class Node code
+and untouched by this support. `ctx doctor` names every one of them rather than
+absorbing them into an average, which is the only reason the 44% above is
+quotable at all.
 
 ## Go: the package is the unit
 

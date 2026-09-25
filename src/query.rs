@@ -2028,7 +2028,7 @@ pub fn coverage_report(
             out.push_str(&format!("  .{ext:<8} {n}\n"));
         }
     }
-    out.push_str("  (supported: .rs .py .ts .tsx .go .md)\n");
+    out.push_str("  (supported: .rs .py .ts .tsx .js .jsx .go .md)\n");
     out
 }
 

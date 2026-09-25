@@ -87,6 +87,11 @@ fn visit(node: Node, src: &str, items: &mut Vec<Item>, facts: &mut FileFacts) {
         match child.kind() {
             "import_statement" => parse_import(child, src, facts),
             "export_statement" => parse_export(child, src, items, facts),
+            // CommonJS. `require` is not a niche spelling of `import`: it is how
+            // most `.js` in the wild names its dependencies, and without it a
+            // Node module has no import edges at all — free-function calls into
+            // it become misses, because nothing binds the name.
+            "expression_statement" => parse_cjs(child, src, facts),
             k if DECL_KINDS.contains(&k) => definition(child, child, src, items, facts, false),
             "lexical_declaration" | "variable_declaration" => {
                 lexical(child, child, src, items, facts, false)
@@ -330,10 +335,20 @@ fn lexical(
         if decl.kind() != "variable_declarator" {
             continue;
         }
+        let value = decl.child_by_field_name("value");
+
+        // `const { a } = require('./y')` is an import, not a declaration, and it
+        // has to be recognised before the non-callable skip below discards it.
+        if let (Some(v), Some(n)) = (value, decl.child_by_field_name("name")) {
+            if let Some((spec, member)) = require_spec(v, src) {
+                bind_require(n, &spec, member.as_deref(), src, facts);
+                continue;
+            }
+        }
+
         let Some(name) = field_text(decl, "name", src) else {
             continue;
         };
-        let value = decl.child_by_field_name("value");
         let is_fn = value.is_some_and(|v| {
             matches!(
                 v.kind(),
@@ -540,6 +555,152 @@ fn declarator_binding(n: Node, src: &str) -> Option<(String, String)> {
 /// `import D, { a, b as c } from './x'` / `import * as ns from './x'` /
 /// `import './x'`. Each imported name is pushed as a `specifier/name` path
 /// (for a module dep edge) plus a binding (for call resolution).
+/// The specifier a CommonJS `require(...)` names, plus the member picked off it
+/// for `require('./x').y`. `None` when this expression is not a require.
+fn require_spec(v: Node, src: &str) -> Option<(String, Option<String>)> {
+    match v.kind() {
+        "call_expression" => {
+            let f = v.child_by_field_name("function")?;
+            if text(f, src) != "require" {
+                return None;
+            }
+            let args = v.child_by_field_name("arguments")?;
+            let s = args
+                .named_children(&mut args.walk())
+                .find(|n| n.kind() == "string")?;
+            Some((string_text(s, src), None))
+        }
+        // `require('./x').y` — a specifier plus one member.
+        "member_expression" => {
+            let obj = v.child_by_field_name("object")?;
+            let prop = v.child_by_field_name("property")?;
+            let (spec, inner) = require_spec(obj, src)?;
+            // Only one level; `require('x').a.b` is not a module path.
+            inner
+                .is_none()
+                .then(|| (spec, Some(text(prop, src).to_string())))
+        }
+        _ => None,
+    }
+}
+
+/// Bind the names a `const … = require('./x')` introduces, in the same
+/// `specifier/symbol` shape the ESM path uses, so resolution cannot tell the
+/// two spellings apart downstream.
+fn bind_require(
+    name_node: Node,
+    spec: &str,
+    member: Option<&str>,
+    src: &str,
+    facts: &mut FileFacts,
+) {
+    let mut bind = |local: String, sym: Option<&str>| {
+        let path = match sym {
+            Some(s) => format!("{spec}/{s}"),
+            None => spec.to_string(),
+        };
+        facts.imports.push(path.clone());
+        facts.reexports.push(Binding {
+            name: local,
+            path,
+            public: false,
+        });
+    };
+
+    match name_node.kind() {
+        // `const x = require('./y')` / `const x = require('./y').z`
+        "identifier" => bind(text(name_node, src).to_string(), member),
+        // `const { a, b: c } = require('./y')`
+        "object_pattern" => {
+            let mut cursor = name_node.walk();
+            for p in name_node.named_children(&mut cursor) {
+                match p.kind() {
+                    "shorthand_property_identifier_pattern" => {
+                        let n = text(p, src).to_string();
+                        bind(n.clone(), Some(&n));
+                    }
+                    "pair_pattern" => {
+                        let (Some(k), Some(v)) =
+                            (p.child_by_field_name("key"), p.child_by_field_name("value"))
+                        else {
+                            continue;
+                        };
+                        // The local name is the value side; the key is what the
+                        // module exports.
+                        if v.kind() == "identifier" {
+                            bind(text(v, src).to_string(), Some(text(k, src)));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// CommonJS statements at module level: a bare `require('./x')` for side
+/// effects, `module.exports = …`, and `exports.name = …`.
+///
+/// `exports.name = fn` is a *definition*, not just a re-export — it is the only
+/// place that name exists — so it has to reach `defined`, or every call into it
+/// from another module resolves to nothing.
+fn parse_cjs(stmt: Node, src: &str, facts: &mut FileFacts) {
+    let Some(expr) = stmt.named_children(&mut stmt.walk()).next() else {
+        return;
+    };
+    if let Some((spec, _)) = require_spec(expr, src) {
+        facts.imports.push(spec);
+        return;
+    }
+    if expr.kind() != "assignment_expression" {
+        return;
+    }
+    let (Some(left), Some(right)) = (
+        expr.child_by_field_name("left"),
+        expr.child_by_field_name("right"),
+    ) else {
+        return;
+    };
+    let target = collapse(text(left, src));
+
+    // `exports.foo = …` / `module.exports.foo = …`
+    if let Some(name) = target
+        .strip_prefix("exports.")
+        .or_else(|| target.strip_prefix("module.exports."))
+    {
+        if !name.is_empty() && !name.contains('.') {
+            facts.defined.insert(name.to_string());
+            facts.reexports.push(Binding {
+                name: name.to_string(),
+                path: name.to_string(),
+                public: true,
+            });
+        }
+        return;
+    }
+
+    // `module.exports = { a, b }` — names already defined here, re-exported.
+    if target == "module.exports" && right.kind() == "object" {
+        let mut cursor = right.walk();
+        for p in right.named_children(&mut cursor) {
+            let name = match p.kind() {
+                "shorthand_property_identifier" => text(p, src).to_string(),
+                "pair" => match p.child_by_field_name("key") {
+                    Some(k) => text(k, src).to_string(),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            facts.reexports.push(Binding {
+                name: name.clone(),
+                path: name,
+                public: true,
+            });
+        }
+    }
+}
+
 fn parse_import(node: Node, src: &str, facts: &mut FileFacts) {
     let mut cursor = node.walk();
     let children: Vec<Node> = node.named_children(&mut cursor).collect();
@@ -770,6 +931,82 @@ mod tests {
 
     fn items(src: &str) -> Vec<Item> {
         extract(src, true).unwrap().items
+    }
+
+    fn facts_of(src: &str) -> FileFacts {
+        extract(src, true).unwrap()
+    }
+
+    fn bindings(src: &str) -> Vec<(String, String)> {
+        facts_of(src)
+            .reexports
+            .into_iter()
+            .map(|b| (b.name, b.path))
+            .collect()
+    }
+
+    #[test]
+    fn require_binds_the_same_shape_as_an_esm_import() {
+        // Destructured, renamed, namespace, and side-effect forms. All four are
+        // ordinary in `.js`, and each has to produce the `specifier/symbol` path
+        // the ESM branch produces or resolution can tell them apart downstream.
+        assert_eq!(
+            bindings("const { a, b: c } = require('./y');\n"),
+            vec![
+                ("a".to_string(), "./y/a".to_string()),
+                ("c".to_string(), "./y/b".to_string()),
+            ]
+        );
+        assert_eq!(
+            bindings("const ns = require('./y');\n"),
+            vec![("ns".to_string(), "./y".to_string())]
+        );
+        assert_eq!(
+            bindings("const z = require('./y').z;\n"),
+            vec![("z".to_string(), "./y/z".to_string())]
+        );
+        // Side-effect require binds nothing but is still a dependency.
+        let f = facts_of("require('./y');\n");
+        assert!(f.reexports.is_empty());
+        assert_eq!(f.imports, vec!["./y".to_string()]);
+    }
+
+    #[test]
+    fn a_require_is_not_mistaken_for_a_local_const() {
+        // The declarator must be consumed as an import before the
+        // skip-non-callable-consts rule throws it away.
+        let f = facts_of("const { a } = require('./y');\n");
+        assert!(
+            !f.defined.contains("a"),
+            "an imported name is not defined here"
+        );
+        assert_eq!(f.imports, vec!["./y/a".to_string()]);
+    }
+
+    #[test]
+    fn exports_dot_name_is_a_definition_not_just_a_reexport() {
+        // `exports.build = fn` is the only place that name exists, so it has to
+        // reach `defined` or calls into it from another module resolve to
+        // nothing.
+        let f = facts_of("exports.build = function (n) { return n; };\n");
+        assert!(f.defined.contains("build"));
+        assert!(f.reexports.iter().any(|b| b.name == "build" && b.public));
+    }
+
+    #[test]
+    fn module_exports_object_reexports_local_names() {
+        let f = facts_of("class S {}\nfunction h() {}\nmodule.exports = { S, h };\n");
+        let re: Vec<&str> = f.reexports.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(re, vec!["S", "h"]);
+    }
+
+    #[test]
+    fn a_call_named_require_that_is_not_an_import_is_left_alone() {
+        // `require` with a non-literal argument is a runtime lookup, not a
+        // module path, and inventing an edge for it would be a guess.
+        let f = facts_of("const x = require(dynamicName);\n");
+        assert!(f.imports.is_empty());
+        assert!(f.reexports.is_empty());
     }
 
     #[test]
