@@ -12,25 +12,37 @@ here, what breaks if I change it, what must a move touch, does my port still
 match the original.*
 
 One Rust binary. Tree-sitter for Rust, Python, TypeScript/TSX, Go, and Markdown.
-No
-language servers, no embeddings, no index to warm. The graph is a pure function
-of the source tree — same code in, same answer out — and it builds in ~100 ms,
-so every query runs against current source.
+No language servers, no embeddings, no index to warm. The graph is a pure
+function of the source tree — same code in, same answer out — and it builds in
+~100 ms, so every query runs against current source.
 
 ```sh
 $ ctx callers resolve_call
 1 caller(s) of 'resolve_call':
 
-extract::Walk::rec  (src/extract/mod.rs:1473)  → resolve_call
+extract::Walk::rec  (src/extract/mod.rs:2265-2359  #ab0418a77d9f)  → resolve_call
 
 completeness: no call site named `resolve_call` went unresolved anywhere in this
 tree — this blast radius is complete to the limit of what ctx parses.
 ```
 
-That last line is the whole idea. The answer travels with its own limits.
+That last line is the whole idea. **Every other code graph tells you what it
+found. `ctx` tells you what it missed** — per edge, in aggregate, and with the
+grep list to check it yourself.
+
+It matters because the failure mode of a code graph is silent. A blast radius
+that comes back short reads exactly like a blast radius that is complete, and an
+agent cannot tell the difference — so it changes the signature and ships the
+break. Every tool in this space has gaps; this one is built so you can enumerate
+them.
 
 **→ [EXAMPLES.md](EXAMPLES.md)** — ten commands run against this repo, verbatim
 output, including the parts where `ctx` reports its own limits.
+
+**→ [What the integration itself costs](#measuring-what-it-costs)** — ctx's own
+MCP tool definitions sit in every turn whether a tool is ever called or not,
+which makes them 2.2× the standing cost of the CLI instructions block. That is
+the shape this project objects to, measured on itself.
 
 ## Four things you won't find elsewhere
 
@@ -46,16 +58,18 @@ branch of a dynamic-dispatch fan-out is marked `*`. And `ctx doctor` names
 
 ```
 ## Internal recall — the number to trust
-  1058/1100 = 96.2%   of call sites that could be internal, ctx pinned this many.
+  1318/1383 = 95.3%   of call sites that could be internal, ctx pinned this many.
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
-     26  walk
-      7  context
-      2  path
+     45  walk
+      9  context
+      3  path
+      2  est_tokens
 
 ## Low-confidence zones (edges to distrust — grep to confirm)
-  parity                           26% heuristic (10/38 edges)
+  parity                           18% heuristic (11/61 edges)
+  refactor                         5% heuristic (1/20 edges)
 ```
 
 The recall number comes with the exact grep list for everything it doesn't
@@ -72,6 +86,18 @@ artifacts and ~18% of module dep edges were impossible Python→Rust edges — w
 then distorted `core`'s ranking.
 
 The honest bit isn't that coverage is high. It's that the gaps are enumerable.
+
+**That property is not decoration — it is how this tool gets built.** Go support
+went from **36.8% to 89.6%** internal recall on `go-chi/chi` in six steps, and
+every step was a class of call site the census had already named by count:
+package scope spanning files, constructor return types, calls leaving through an
+external import, a `func` literal shadowing its enclosing scope, the `/vN` in a
+module path binding the wrong package name, and method chains. Not one of those
+was visible in the aggregate number. Each was one line in *What ctx missed*,
+with the grep to confirm it.
+
+A tool that reported only "36.8%" would have told you it was bad without telling
+you why, which is the position every other code graph leaves you in.
 
 ### 2. `changed --api` — a breaking-change gate that names who breaks
 
