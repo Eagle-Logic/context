@@ -48,7 +48,13 @@ jobs:
       - run: cargo clippy --all-targets --locked
 
   msrv:
-    name: msrv (1.90)
+    # Deliberately NOT "msrv (1.90)". This job name is a required status check
+    # in main's branch protection, and a required context that stops reporting
+    # blocks every PR permanently — `enforce_admins` is on, so not even an
+    # admin can merge past it. Stamping the version here meant the 1.88 -> 1.90
+    # bump renamed the check and wedged its own PR. The version lives in the
+    # `toolchain` input below, and the job's log prints it; the name stays put.
+    name: msrv
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
