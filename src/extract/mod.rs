@@ -160,6 +160,13 @@ pub fn source_files(root: &Path) -> Vec<PathBuf> {
             Some("rs") => lang_selected(Lang::Rust),
             Some("py") => lang_selected(Lang::Python),
             Some("tsx") => lang_selected(Lang::TypeScript),
+            // JavaScript is parsed by the TypeScript extractor and counted as
+            // TypeScript. They are one interoperating module graph — a .js file
+            // importing a .ts module is ordinary, and incremental migrations
+            // leave repos half of each — so splitting them into separate `Lang`s
+            // would make the cross-language guard in `owner_edge` refuse real
+            // edges between files that genuinely call each other.
+            Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => lang_selected(Lang::TypeScript),
             Some("go") => lang_selected(Lang::Go),
             Some("md") | Some("markdown") => lang_selected(Lang::Markdown),
             // Skip `.d.ts` — ambient type declarations carry no topology.
@@ -204,6 +211,18 @@ pub fn source_fingerprint(root: &Path) -> u64 {
     h.finish()
 }
 
+/// Which grammar the TypeScript extractor should use for this extension.
+///
+/// Everything except `.ts` gets the JSX-capable grammar. For `.tsx` that is
+/// obvious; for JavaScript it is because JSX in a plain `.js` file is ordinary —
+/// Create React App shipped it that way for years — and the TSX grammar is a
+/// superset of JavaScript in every respect that matters here. The one thing
+/// `.ts` needs that TSX cannot give it is the `<T>expr` type assertion, which no
+/// JavaScript file can contain anyway.
+fn needs_jsx(ext: Option<&str>) -> bool {
+    !matches!(ext, Some("ts"))
+}
+
 pub fn build_graph(root: &Path) -> Result<Graph> {
     let root = root
         .canonicalize()
@@ -226,7 +245,9 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
         let lang = match ext {
             Some("rs") => Lang::Rust,
             Some("py") => Lang::Python,
-            Some("ts") | Some("tsx") => Lang::TypeScript,
+            Some("ts") | Some("tsx") | Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => {
+                Lang::TypeScript
+            }
             Some("go") => Lang::Go,
             Some("md") | Some("markdown") => Lang::Markdown,
             _ => continue,
@@ -238,7 +259,7 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
             Lang::Python => {
                 python::extract(&src).with_context(|| format!("parsing {}", rel.display()))?
             }
-            Lang::TypeScript => typescript::extract(&src, ext == Some("tsx"))
+            Lang::TypeScript => typescript::extract(&src, needs_jsx(ext))
                 .with_context(|| format!("parsing {}", rel.display()))?,
             Lang::Go => go::extract(&src).with_context(|| format!("parsing {}", rel.display()))?,
             Lang::Markdown => {
@@ -248,7 +269,12 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
         let file_name = rel.file_name().and_then(|f| f.to_str());
         let is_package = match lang {
             Lang::Python => file_name == Some("__init__.py"),
-            Lang::TypeScript => matches!(file_name, Some("index.ts") | Some("index.tsx")),
+            Lang::TypeScript => file_name.is_some_and(|f| {
+                matches!(
+                    f,
+                    "index.ts" | "index.tsx" | "index.js" | "index.jsx" | "index.mjs" | "index.cjs"
+                )
+            }),
             // README / index collapse to their directory, like an index file.
             Lang::Markdown => file_name.is_some_and(|f| {
                 let stem = f.rsplit_once('.').map_or(f, |(s, _)| s);
@@ -502,7 +528,10 @@ pub fn unsupported_census(root: &Path) -> Vec<(String, usize)> {
         let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
             continue;
         };
-        let supported = matches!(ext, "rs" | "py" | "ts" | "tsx" | "go" | "md" | "markdown");
+        let supported = matches!(
+            ext,
+            "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "go" | "md" | "markdown"
+        );
         if supported {
             if is_hidden {
                 hidden_supported += 1;
@@ -556,6 +585,26 @@ fn slash_path(rel: &Path) -> String {
 /// Derive a stable module name from the file path. "src" components are
 /// dropped; components before the first "src" become the crate prefix
 /// (workspace layouts like crates/foo/src/bar.rs -> crates::foo::bar).
+/// One path component, with any occurrence of the language's module separator
+/// removed from it.
+///
+/// A module name is segments joined by the separator, and resolution splits it
+/// back apart to do path arithmetic. So a component that *contains* the
+/// separator silently adds a segment that was never in the path — and for the
+/// dot-separated languages that is every `foo.test.ts`, `foo.spec.js` and
+/// `foo.stories.tsx` in existence.
+///
+/// The consequence was not a cosmetic one. `src/browser/frag.test.ts` named
+/// itself `browser.frag.test`, which splits into four segments rather than
+/// three, so every relative import in the file resolved one directory too deep
+/// and silently produced nothing: no dep, no call edges, and a module recall of
+/// zero. The identical import in `plain.ts` next door resolved fine. Test files
+/// are exactly where a blast radius matters most, and they were the files where
+/// it was empty.
+fn safe_seg(c: &str, lang: Lang) -> String {
+    c.replace(Lang::sep(lang), "-")
+}
+
 fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>) {
     let comps: Vec<&str> = rel.iter().filter_map(|c| c.to_str()).collect();
     let mut segs: Vec<String> = Vec::new();
@@ -574,7 +623,7 @@ fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>) {
                 }
                 continue;
             }
-            segs.push((*c).to_string());
+            segs.push(safe_seg(c, lang));
             continue;
         }
         let stem = c.rsplit_once('.').map(|(s, _)| s).unwrap_or(c);
@@ -590,7 +639,7 @@ fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>) {
             }
         };
         if !drop {
-            segs.push(stem.to_string());
+            segs.push(safe_seg(stem, lang));
         }
     }
 
@@ -1052,6 +1101,24 @@ fn resolve_path(path: &str, m: &Module, ctx: &Ctx) -> Option<(String, Vec<String
         }
     }
     None
+}
+
+/// Does this import binding name a package outside the tree?
+///
+/// A call reached through such a binding is *provably* not ours, however its
+/// name is spelled here — `var request = require('supertest')` then
+/// `request(app)` is supertest's function, whatever else in the tree happens to
+/// be called `request`. Without this the name lands in the miss census the
+/// moment any local symbol shares its spelling, which buries the real misses
+/// under other people's libraries: on `expressjs/express` one such name
+/// accounted for 995 of 1360 reported misses.
+///
+/// Deliberately only `External`, not `Ignore`. `Ignore` means the specifier was
+/// explicitly internal (`./x`, `crate::y`) and simply did not resolve — which is
+/// a genuine miss, not proof of anything. Go is the exception and handles its
+/// own stdlib rule at its call site.
+fn binding_is_external(path: &str, m: &Module, ctx: &Ctx) -> bool {
+    matches!(resolve_from(path, m, ctx), Resolved::External(_))
 }
 
 /// Classify one Go import: the package it names when that package is in this
@@ -1673,6 +1740,9 @@ fn resolve_call(
                 return miss(name, uni);
             };
             let Some((n2, r2)) = resolve_path(&b.path, m, ctx) else {
+                if binding_is_external(&b.path, m, ctx) {
+                    return Resolution::External(name.to_string());
+                }
                 return miss(name, uni);
             };
             let (fm, fr) = chase(&n2, &r2, ctx, CHASE_DEPTH);
@@ -1706,11 +1776,9 @@ fn resolve_call(
                     // the miss census the moment some local type happened to
                     // declare a method of the same name — which buried the real
                     // misses under the standard library.
-                    if m.lang == Lang::Go
-                        && matches!(
-                            go_resolve_import(&b.path, m, ctx),
-                            Resolved::External(_) | Resolved::Ignore
-                        )
+                    if binding_is_external(&b.path, m, ctx)
+                        || (m.lang == Lang::Go
+                            && matches!(go_resolve_import(&b.path, m, ctx), Resolved::Ignore))
                     {
                         return Resolution::External(last.to_string());
                     }
@@ -2601,6 +2669,77 @@ mod tests {
             m.diag.unresolved_names
         );
         assert_eq!(m.diag.external, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A dot in a filename used to add a module-name segment that was never in
+    /// the path, so every relative import in `foo.test.ts` resolved one
+    /// directory too deep and produced nothing at all.
+    #[test]
+    fn a_dot_in_a_filename_does_not_shift_relative_imports() {
+        let dir = std::env::temp_dir().join(format!("ctx_dotted_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src/util")).unwrap();
+        fs::create_dir_all(dir.join("src/browser")).unwrap();
+        fs::write(
+            dir.join("src/util/dom.ts"),
+            "export function div(x: string) { return x; }\n",
+        )
+        .unwrap();
+        let body = "import { div } from '../util/dom';\nexport function a() { return div('x'); }\n";
+        fs::write(dir.join("src/browser/plain.ts"), body).unwrap();
+        fs::write(dir.join("src/browser/frag.test.ts"), body).unwrap();
+
+        let g = build_graph(&dir).unwrap();
+        let deps_of = |n: &str| {
+            g.modules
+                .iter()
+                .find(|m| m.name == n)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no module {n}, have {:?}",
+                        g.modules.iter().map(|m| &m.name).collect::<Vec<_>>()
+                    )
+                })
+                .deps
+                .clone()
+        };
+        // The separator is stripped from the segment, so the name stays one
+        // segment and the arithmetic matches the plain file's exactly.
+        assert_eq!(deps_of("browser.frag-test"), deps_of("browser.plain"));
+        assert!(deps_of("browser.frag-test").contains(&"util.dom".to_string()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A call reached through a binding that names a package outside the tree is
+    /// provably external, whatever local symbol shares its spelling. Counting
+    /// those as misses buried the real ones under other people's libraries.
+    #[test]
+    fn a_call_through_an_external_binding_is_not_a_miss() {
+        let dir = std::env::temp_dir().join(format!("ctx_extbind_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // The tree defines `request` itself, so the name IS in the universe.
+        fs::write(
+            dir.join("lib.js"),
+            "export function request(x) { return x; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("app.test.js"),
+            "const request = require('supertest');\nfunction t() { request(app); }\n",
+        )
+        .unwrap();
+
+        let g = build_graph(&dir).unwrap();
+        let m = g.modules.iter().find(|m| m.name == "app-test").unwrap();
+        assert_eq!(
+            m.diag.unresolved, 0,
+            "supertest's request is not ours: {:?}",
+            m.diag.unresolved_names
+        );
+        // `request(app)` plus the `require(..)` call itself; both are external.
+        assert_eq!(m.diag.external, 2);
         let _ = fs::remove_dir_all(&dir);
     }
 

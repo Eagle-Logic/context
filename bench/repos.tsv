@@ -7,7 +7,9 @@
 #
 # One well-known repository per supported language, plus a second Go one
 # because Go is the newest extractor and the spread between its best and worst
-# case is the honest thing to show.
+# case is the honest thing to show. JavaScript is represented by preact, which
+# is modern ESM; `expressjs/express` is the other shape of JavaScript and scores
+# far worse, for a reason recorded in the README under prototype assignment.
 #
 # name	lang	commit	url
 ripgrep	rust	3fce3b5bb0236da2df6d99672afb8a719642eca7	https://github.com/BurntSushi/ripgrep
@@ -15,3 +17,4 @@ requests	python	611c6162cbc4ac2020a2f91c7cfa4f3abf9bbb60	https://github.com/psf/
 got	ts	e1d87d2ced01d5b7d855a7dc8b091bf7b014a1e4	https://github.com/sindresorhus/got
 cobra	go	adbc8813901bba65827259daa8e22ff94ec1f30e	https://github.com/spf13/cobra
 chi	go	3d1777a1ef8881f7d1da0b02c76ca8f0a29cd2bc	https://github.com/go-chi/chi
+preact	ts	8101ff821690817c7786739c317af215c62a0cff	https://github.com/preactjs/preact
