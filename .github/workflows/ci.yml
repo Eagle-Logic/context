@@ -48,20 +48,26 @@ jobs:
       - run: cargo clippy --all-targets --locked
 
   msrv:
-    name: msrv (1.88)
+    # Deliberately NOT "msrv (1.90)". This job name is a required status check
+    # in main's branch protection, and a required context that stops reporting
+    # blocks every PR permanently — `enforce_admins` is on, so not even an
+    # admin can merge past it. Stamping the version here meant the 1.88 -> 1.90
+    # bump renamed the check and wedged its own PR. The version lives in the
+    # `toolchain` input below, and the job's log prints it; the name stays put.
+    name: msrv
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # Keep in sync with `rust-version` in Cargo.toml. README promises 1.88+,
+      # Keep in sync with `rust-version` in Cargo.toml. README promises 1.90+,
       # and nothing else checks that promise.
       #
-      # The version is an INPUT, not the action ref. Pinned as `@1.88` it looks
+      # The version is an INPUT, not the action ref. Pinned as `@1.90` it looks
       # to Dependabot like an action version, and it duly "upgraded" it to
       # @1.100 — a Rust release that does not exist, so the job 404'd instead of
       # checking anything.
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.88"
+          toolchain: "1.90"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --locked
 
