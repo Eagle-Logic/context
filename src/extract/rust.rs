@@ -19,7 +19,46 @@ pub fn extract(src: &str) -> Result<FileFacts> {
     let mut items = Vec::new();
     visit(tree.root_node(), src, &mut items, &mut facts, true);
     facts.items = items;
+    let macros = count_macro_invocations(tree.root_node());
+    if macros > 0 {
+        facts
+            .undescended
+            .insert("macro invocation".to_string(), macros);
+    }
     Ok(facts)
+}
+
+/// Count `macro_invocation` nodes, whose contents are never read as code.
+///
+/// tree-sitter parses a macro's arguments as a `token_tree` of raw tokens
+/// rather than expressions, so `foo()` inside `assert_eq!(..)` never becomes a
+/// `call_expression` and can never reach the resolver. It is not an unresolved
+/// call site; it is not a call site at all, as far as the rest of ctx is
+/// concerned. That is the one path where a missing edge is invisible to the
+/// machinery built to make missing edges enumerable, so the regions are
+/// counted even though their contents cannot be.
+///
+/// Every macro invocation counts, including those whose token tree holds no
+/// calls. Filtering to the ones that "look like they contain a call" would put
+/// a guess inside the single mechanism that exists to avoid guessing, and the
+/// filter would itself be unverifiable. The cost is a larger number than
+/// strictly necessary; the benefit is that it is a fact.
+///
+/// On ripgrep this counts 3549 regions, which is the scale behind
+/// `ctx callers arg` reporting 2 callers where ~357 real call sites exist.
+fn count_macro_invocations(root: Node) -> usize {
+    let mut n = 0;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "macro_invocation" {
+            n += 1;
+        }
+        let mut c = node.walk();
+        for ch in node.named_children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    n
 }
 
 fn visit(node: Node, src: &str, items: &mut Vec<Item>, facts: &mut FileFacts, module_level: bool) {
@@ -924,6 +963,48 @@ fn clip_doc(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_macro_invocation_is_counted_as_undescended() {
+        let f = extract("fn run() { assert_eq!(a(), b()); }\n").unwrap();
+        assert_eq!(f.undescended.get("macro invocation"), Some(&1));
+    }
+
+    #[test]
+    fn a_file_with_no_macros_discloses_nothing() {
+        let f = extract("fn run() { helper(); }\nfn helper() {}\n").unwrap();
+        assert!(f.undescended.is_empty(), "{:?}", f.undescended);
+    }
+
+    /// The reason this disclosure exists. Calls inside a macro are not
+    /// unresolved call sites — they are not call sites at all, because
+    /// tree-sitter hands back a token tree rather than expressions. So they
+    /// cannot lower recall, and nothing but this count reveals them.
+    #[test]
+    fn calls_inside_a_macro_are_absent_not_unresolved() {
+        let f = extract("fn run() { assert_eq!(ghost(), other()); }\n").unwrap();
+        let run = f
+            .items
+            .iter()
+            .find(|i| i.name.as_deref() == Some("run"))
+            .expect("run should be extracted");
+        let seen: Vec<&String> = run.raw_calls.iter().map(|c| &c.path).collect();
+        assert!(
+            seen.is_empty(),
+            "macro body should contribute no call sites, got {seen:?}"
+        );
+        assert_eq!(f.undescended.get("macro invocation"), Some(&1));
+    }
+
+    #[test]
+    fn macro_definitions_are_not_counted_as_invocations() {
+        let f = extract("macro_rules! m { () => { a(); } }\n").unwrap();
+        assert!(
+            !f.undescended.contains_key("macro invocation"),
+            "a definition is not an invocation: {:?}",
+            f.undescended
+        );
+    }
 
     #[test]
     fn nested_brace_use_expands_without_inventing_paths() {

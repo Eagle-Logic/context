@@ -76,6 +76,14 @@ pub struct Module {
     /// [`FileFacts::returns`]. Consumed during resolution.
     #[serde(skip)]
     pub returns: BTreeMap<String, String>,
+    /// Source regions the extractor did not enter, by kind — carried from
+    /// [`FileFacts::undescended`].
+    ///
+    /// Deliberately NOT on [`Diagnostics`], which `resolve_deps` replaces
+    /// wholesale after extraction; a value seeded at extract time would be
+    /// silently dropped there.
+    #[serde(skip)]
+    pub undescended: BTreeMap<String, usize>,
     /// Call-edge resolution stats for this module (for `ctx doctor`).
     #[serde(skip)]
     pub diag: Diagnostics,
@@ -141,6 +149,19 @@ pub struct FileFacts {
     /// callee's FIRST result, which is what `x, err := New()` binds `x` to —
     /// position 0 of a result tuple, not a guess about which result matters.
     pub returns: BTreeMap<String, String>,
+    /// Source regions this extractor did not enter, by human-readable kind.
+    ///
+    /// The third quantity. A call site ctx resolved is an edge; one it saw and
+    /// could not pin is `Diagnostics::unresolved`; one inside a region never
+    /// entered is neither — it is absent, and absence cannot be a miss. That
+    /// is the single path where a gap is invisible to the machinery whose
+    /// whole job is making gaps enumerable, so the regions get counted even
+    /// though their contents cannot be.
+    ///
+    /// Rust populates this with `macro_invocation`. The analogues are known
+    /// and unmeasured: Python `exec`/`eval`, and TypeScript or JavaScript
+    /// calls built from template strings.
+    pub undescended: BTreeMap<String, usize>,
 }
 
 #[derive(Serialize, Clone, Copy, PartialEq, Eq)]

@@ -323,6 +323,7 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
             deps: Vec::new(),
             extern_deps: Vec::new(),
             reexports: Vec::new(),
+            undescended: std::mem::take(&mut facts.undescended),
             items: facts.items,
             raw_imports: facts.imports,
             raw_reexports: facts.reexports,
