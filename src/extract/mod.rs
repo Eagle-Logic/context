@@ -156,25 +156,25 @@ pub fn source_files(root: &Path) -> Vec<PathBuf> {
         {
             continue;
         }
-        let take = match path.extension().and_then(|e| e.to_str()) {
-            Some("rs") => lang_selected(Lang::Rust),
-            Some("py") => lang_selected(Lang::Python),
-            Some("tsx") => lang_selected(Lang::TypeScript),
-            // JavaScript is parsed by the TypeScript extractor and counted as
-            // TypeScript. They are one interoperating module graph — a .js file
-            // importing a .ts module is ordinary, and incremental migrations
-            // leave repos half of each — so splitting them into separate `Lang`s
-            // would make the cross-language guard in `owner_edge` refuse real
-            // edges between files that genuinely call each other.
-            Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => lang_selected(Lang::TypeScript),
-            Some("go") => lang_selected(Lang::Go),
-            Some("md") | Some("markdown") => lang_selected(Lang::Markdown),
-            // Skip `.d.ts` — ambient type declarations carry no topology.
-            Some("ts") => {
-                lang_selected(Lang::TypeScript)
-                    && !path.to_str().is_some_and(|s| s.ends_with(".d.ts"))
-            }
-            _ => false,
+        // Which extensions belong to which language lives in `Lang::exts`, so
+        // this walk, `build_graph` and `unsupported_census` cannot disagree
+        // about what counts as source.
+        //
+        // JavaScript is parsed by the TypeScript extractor and counted as
+        // TypeScript. They are one interoperating module graph — a .js file
+        // importing a .ts module is ordinary, and incremental migrations
+        // leave repos half of each — so splitting them into separate `Lang`s
+        // would make the cross-language guard in `owner_edge` refuse real
+        // edges between files that genuinely call each other.
+        let take = match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(Lang::from_ext)
+        {
+            // Skip `.d.ts` — ambient type declarations carry no topology. Only
+            // a `.ts` file can end that way, so the guard costs nothing here.
+            Some(l) => lang_selected(l) && !path.to_str().is_some_and(|s| s.ends_with(".d.ts")),
+            None => false,
         };
         if take {
             files.push(path.to_path_buf());
@@ -242,15 +242,8 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
         };
         let rel = path.strip_prefix(&root).unwrap_or(path);
         let ext = path.extension().and_then(|e| e.to_str());
-        let lang = match ext {
-            Some("rs") => Lang::Rust,
-            Some("py") => Lang::Python,
-            Some("ts") | Some("tsx") | Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => {
-                Lang::TypeScript
-            }
-            Some("go") => Lang::Go,
-            Some("md") | Some("markdown") => Lang::Markdown,
-            _ => continue,
+        let Some(lang) = ext.and_then(Lang::from_ext) else {
+            continue;
         };
         let mut facts = match lang {
             Lang::Rust => {
@@ -524,10 +517,7 @@ pub fn unsupported_census(root: &Path) -> Vec<(String, usize)> {
         let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
             continue;
         };
-        let supported = matches!(
-            ext,
-            "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "go" | "md" | "markdown"
-        );
+        let supported = Lang::from_ext(ext).is_some();
         if supported {
             if is_hidden {
                 hidden_supported += 1;

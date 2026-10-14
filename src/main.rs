@@ -62,7 +62,14 @@ impl LangArg {
             LangArg::Ts => vec![Lang::TypeScript],
             LangArg::Go => vec![Lang::Go],
             LangArg::Md => vec![Lang::Markdown],
-            LangArg::Code => vec![Lang::Rust, Lang::Python, Lang::TypeScript, Lang::Go],
+            // Derived, so a new language joins `code` by default instead of
+            // being silently left out of it. Adding one therefore changes
+            // `--lang code` behaviour, which is a release-note item.
+            LangArg::Code => Lang::ALL
+                .iter()
+                .copied()
+                .filter(|l| !matches!(l, Lang::Markdown))
+                .collect(),
         }
     }
 }
@@ -326,6 +333,14 @@ enum Cmd {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Print every file extension ctx parses, one per line
+    ///
+    /// Machine-readable counterpart to the `(supported: ...)` line in
+    /// `ctx doctor`. Exists so tooling — `bench/run.sh` builds its
+    /// `grep --include` list from it — derives the set instead of restating
+    /// it. A restated copy is how the benchmark harness came to measure
+    /// JavaScript repos without opening their .js files.
+    SupportedExts,
 }
 
 /// Build the agent instructions block for a specific repo.
@@ -823,6 +838,11 @@ fn main() -> Result<()> {
         Cmd::Snippet { path } => {
             let g = extract::build_graph(&path)?;
             print!("{}", snippet_for(&g));
+        }
+        Cmd::SupportedExts => {
+            for e in model::Lang::all_exts() {
+                println!("{e}");
+            }
         }
     }
     Ok(())
@@ -1520,12 +1540,31 @@ fn render_pruned(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_range, render_budgeted, snippet_for, Format, View};
+    use super::{parse_range, render_budgeted, snippet_for, Format, LangArg, View};
     use crate::extract::build_graph;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// `--lang code` is derived from `Lang::ALL`, so a newly added language is
+    /// in it by default. The failure this guards against is the silent one: a
+    /// language added to the enum but forgotten here, making `code` quietly
+    /// mean "every language except the new one".
+    #[test]
+    fn lang_code_is_every_language_but_markdown() {
+        use crate::model::Lang;
+        let code = LangArg::Code.expand();
+        assert!(
+            !code.iter().any(|l| matches!(l, Lang::Markdown)),
+            "code must exclude Markdown"
+        );
+        assert_eq!(
+            code.len(),
+            Lang::ALL.len() - 1,
+            "code must cover every non-Markdown language"
+        );
+    }
 
     /// A repo with enough modules that a small budget cannot be met by detail
     /// reduction alone, forcing the pruning rung.

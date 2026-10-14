@@ -175,6 +175,55 @@ impl Lang {
             Lang::Python | Lang::TypeScript | Lang::Go | Lang::Markdown => ".",
         }
     }
+
+    /// Every language, in the order `doctor` and `--lang` report them.
+    pub const ALL: [Lang; 5] = [
+        Lang::Rust,
+        Lang::Python,
+        Lang::TypeScript,
+        Lang::Go,
+        Lang::Markdown,
+    ];
+
+    /// Every file extension this language parses.
+    ///
+    /// Deliberately the single definition, for exactly the reason given on
+    /// [`Lang::sep`] — and this list learned the lesson the hard way. It was
+    /// copied into six places: `source_files`, the extension->`Lang` match in
+    /// `build_graph`, `unsupported_census`, the `doctor` footer, and twice into
+    /// `bench/run.sh`. Five agreed and the sixth silently disagreed: the
+    /// benchmark harness never gained `.js` when JavaScript shipped, so every
+    /// published preact row compared ctx over 232 files against a grep that
+    /// opened 40 of them.
+    ///
+    /// JavaScript lives under `TypeScript` because one extractor parses both
+    /// and they form a single interoperating module graph; `source_files`
+    /// explains why splitting them into separate `Lang`s would break real
+    /// edges.
+    pub fn exts(self) -> &'static [&'static str] {
+        match self {
+            Lang::Rust => &["rs"],
+            Lang::Python => &["py"],
+            Lang::TypeScript => &["ts", "tsx", "js", "jsx", "mjs", "cjs"],
+            Lang::Go => &["go"],
+            Lang::Markdown => &["md", "markdown"],
+        }
+    }
+
+    /// The language that parses `ext`, or `None` if none does.
+    ///
+    /// `ext` is the bare extension, without a leading dot.
+    pub fn from_ext(ext: &str) -> Option<Lang> {
+        Lang::ALL.iter().copied().find(|l| l.exts().contains(&ext))
+    }
+
+    /// Every supported extension, grouped by language in [`Lang::ALL`] order.
+    ///
+    /// This is what `ctx doctor` prints and what `bench/run.sh` builds its
+    /// `grep --include` list from, so neither restates the set.
+    pub fn all_exts() -> impl Iterator<Item = &'static str> {
+        Lang::ALL.iter().flat_map(|l| l.exts().iter().copied())
+    }
 }
 
 /// Short content hash used for [`Item::hash`].
@@ -341,5 +390,53 @@ impl Module {
             items.iter().map(|i| 1 + count(&i.children)).sum()
         }
         count(&self.items)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every extension must map back to the language that claims it. A typo or
+    /// a duplicate across two `exts()` arms would otherwise route files to the
+    /// wrong extractor, and `from_ext` picks the first match silently.
+    #[test]
+    fn every_extension_round_trips_to_its_own_language() {
+        for lang in Lang::ALL {
+            for ext in lang.exts() {
+                assert_eq!(
+                    Lang::from_ext(ext).map(Lang::name),
+                    Some(lang.name()),
+                    ".{ext} is claimed by {} but resolves elsewhere",
+                    lang.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_extension_is_claimed_twice() {
+        let mut seen: Vec<&str> = Lang::all_exts().collect();
+        let before = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(before, seen.len(), "duplicate extension across languages");
+    }
+
+    #[test]
+    fn unknown_extensions_resolve_to_nothing() {
+        for ext in ["cpp", "java", "cs", "rb", "", "RS"] {
+            assert!(Lang::from_ext(ext).is_none(), ".{ext} must not be claimed");
+        }
+    }
+
+    /// The regression this single-sourcing exists for: these three were parsed
+    /// by the walk while `doctor` reported them unsupported, because the footer
+    /// restated the list instead of deriving it.
+    #[test]
+    fn javascript_module_and_long_markdown_extensions_are_supported() {
+        for ext in ["mjs", "cjs", "markdown"] {
+            assert!(Lang::from_ext(ext).is_some(), ".{ext} must be supported");
+        }
     }
 }
