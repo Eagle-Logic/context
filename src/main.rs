@@ -340,7 +340,15 @@ enum Cmd {
     /// `grep --include` list from it — derives the set instead of restating
     /// it. A restated copy is how the benchmark harness came to measure
     /// JavaScript repos without opening their .js files.
-    SupportedExts,
+    SupportedExts {
+        /// Exclude Markdown, matching `--lang code`
+        ///
+        /// What a caller wants when it is searching for call syntax: prose
+        /// mentioning `foo(` is not a call site, so counting Markdown would
+        /// inflate a text search against no corresponding ctx edge.
+        #[arg(long)]
+        code: bool,
+    },
 }
 
 /// Build the agent instructions block for a specific repo.
@@ -839,8 +847,13 @@ fn main() -> Result<()> {
             let g = extract::build_graph(&path)?;
             print!("{}", snippet_for(&g));
         }
-        Cmd::SupportedExts => {
-            for e in model::Lang::all_exts() {
+        Cmd::SupportedExts { code } => {
+            let langs = if code {
+                LangArg::Code.expand()
+            } else {
+                model::Lang::ALL.to_vec()
+            };
+            for e in langs.iter().flat_map(|l| l.exts().iter()) {
                 println!("{e}");
             }
         }
@@ -1546,6 +1559,26 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// What `bench/run.sh` builds its `grep --include` list from. Markdown is
+    /// out because prose mentioning `foo(` is not a call site; JavaScript must
+    /// be in, because its absence from the harness's hardcoded copy is exactly
+    /// how every published preact row came to compare ctx over a whole tree
+    /// against a grep that opened a sixth of it.
+    #[test]
+    fn code_extensions_exclude_markdown_and_include_javascript() {
+        let code: Vec<&str> = LangArg::Code
+            .expand()
+            .iter()
+            .flat_map(|l| l.exts().iter().copied())
+            .collect();
+        for e in ["md", "markdown"] {
+            assert!(!code.contains(&e), "prose must not be searched: {code:?}");
+        }
+        for e in ["js", "jsx", "mjs", "cjs", "ts", "tsx", "rs", "py", "go"] {
+            assert!(code.contains(&e), "code set is missing .{e}: {code:?}");
+        }
+    }
 
     /// `--lang code` is derived from `Lang::ALL`, so a newly added language is
     /// in it by default. The failure this guards against is the silent one: a
