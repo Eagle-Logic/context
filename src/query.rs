@@ -331,7 +331,12 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
     // edges at all, by design — including for a project-defined method that
     // merely shares the name. An empty result there is silence, not absence.
     let suppressed = crate::extract::is_suppressed_method_name(bare_name);
-    let lower_bound = ambiguous || suppressed;
+    // A region no extractor entered can hold a call to this name, and nothing
+    // downstream can tell. That makes the list a floor for a third reason,
+    // and `lower_bound: false` on a tree full of macro bodies was simply
+    // false — the text output said so while the JSON denied it.
+    let undescended = undescended_count(g);
+    let lower_bound = ambiguous || suppressed || undescended > 0;
     // A type is never "called", so call edges alone answer the wrong question.
     let kinds = definition_kinds(g, &q);
     let is_type = !kinds.is_empty() && kinds.iter().all(|k| is_type_kind(k));
@@ -362,15 +367,21 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
             "definitions": defs,
             // Never claim completeness: resolution can drop a call site for
             // reasons not visible from here (module-level calls, function-local
-            // imports). These flag the two knowable causes; absent flags mean
+            // imports). These flag the three knowable causes; absent flags mean
             // "no known reason to distrust this", not "guaranteed complete".
             "lower_bound": lower_bound,
             "ambiguous_name": ambiguous,
             "suppressed_common_name": suppressed,
+            // Tree-wide, not per-name: regions no extractor entered, any of
+            // which could hold a call to this name. Outside `completeness`
+            // below because that block answers a per-name question and this
+            // cannot be attributed to a name at all.
+            "undescended_regions": undescended,
             // Measured, per-name: how many call sites bearing this name ctx
             // could not pin, and how many it proved external. `complete` is
-            // scoped to that question — it is not a claim about the two flags
-            // above, which cover losses this count cannot see.
+            // scoped to that question — it is not a claim about the three flags
+            // above, which cover losses this count cannot see. Read it with
+            // `lower_bound`, never on its own.
             "completeness": {
                 "unresolved_call_sites_with_this_name": unresolved,
                 "external_call_sites_with_this_name": external,
@@ -1246,39 +1257,33 @@ fn completeness_note(g: &Graph, name: &str, subject: &str) -> String {
              If `{name}`\nis also invoked on a value ctx could not type, those calls are not listed.\n"
         );
     }
-    let mut note = format!(
+    // "to the limit of what ctx parses" used to be the whole caveat, carrying
+    // far more weight than it looked like it carried: a call site inside a
+    // region no extractor entered is absent rather than unresolved, so it
+    // could never reduce this claim.
+    //
+    // Stated as one factual clause, not a warning. Every real Rust tree has
+    // macros, so a three-line alarm here fired on every complete answer in
+    // every Rust repo — including queries with no plausible macro involvement —
+    // and a caveat that always fires is one nobody reads. The count and the
+    // per-kind breakdown live in `ctx doctor`, which is where someone acting
+    // on it will look.
+    let limit = match undescended_count(g) {
+        0 => String::new(),
+        n => format!(
+            " {n} undescended region(s) in this tree are outside that limit; \
+             see `ctx doctor`."
+        ),
+    };
+    format!(
         "\ncompleteness: no call site named `{name}` went unresolved anywhere in this tree —\n\
-         this {subject} is complete to the limit of what ctx parses.\n"
-    );
-    // That limit used to be the whole caveat, carrying far more weight than it
-    // looked like it carried. A call site inside a region no extractor entered
-    // is not unresolved — it is absent — so it could never reduce this claim,
-    // which made this the one place a missing edge was invisible to the
-    // machinery built to make missing edges enumerable.
-    if let Some(regions) = undescended_summary(g) {
-        note.push_str(&format!(
-            "that limit is load-bearing here: {regions} were not descended into, so a call to\n\
-             `{name}` inside one was never seen — absent, not unresolved — and could not have\n\
-             counted against the line above. grep `{name}` to rule it out.\n"
-        ));
-    }
-    note
+         this {subject} is complete to the limit of what ctx parses.{limit}\n"
+    )
 }
 
-/// Regions no extractor entered, summarised across the graph, or `None` when
-/// there are none. Phrased for an in-band caveat: "3549 macro invocation(s)".
-fn undescended_summary(g: &Graph) -> Option<String> {
-    let totals = undescended_totals(g);
-    if totals.is_empty() {
-        return None;
-    }
-    Some(
-        totals
-            .iter()
-            .map(|(kind, n)| format!("{n} {kind}(s)"))
-            .collect::<Vec<_>>()
-            .join(", "),
-    )
+/// Total undescended regions across the graph, all kinds.
+fn undescended_count(g: &Graph) -> usize {
+    g.modules.iter().flat_map(|m| m.undescended.values()).sum()
 }
 
 /// Undescended region counts across every module, by kind.
@@ -1417,6 +1422,11 @@ pub fn context(
             "context": blocks,
             "matches": targets.len(),
             "truncated": truncated,
+            // Same reasoning as `callers`: a region no extractor entered can
+            // hold a call to this name, so the answer is a floor and the JSON
+            // has to say so rather than leaving it to the text rendering.
+            "lower_bound": undescended_count(g) > 0,
+            "undescended_regions": undescended_count(g),
             "completeness": {
                 "unresolved_call_sites_with_this_name": unresolved,
                 "external_call_sites_with_this_name": external,
@@ -1939,6 +1949,12 @@ pub fn coverage_report(
             } else { Vec::new() },
             "broken_links": broken.iter().map(|(f, l, tg)| json!({"file": f, "line": l, "target": tg})).collect::<Vec<_>>(),
             "unsupported_files": unsupported.iter().map(|(e, n)| json!({"ext": e, "count": n})).collect::<Vec<_>>(),
+            // Regions inside files ctx parsed and chose not to enter — distinct
+            // from `unsupported_files`, which is files it cannot parse at all.
+            // Present even when empty, so a consumer can tell "nothing skipped"
+            // from "this version does not report it".
+            "undescended": undescended_totals(g).iter().map(|(k, n)| json!({"kind": k, "count": n})).collect::<Vec<_>>(),
+            "undescended_total": undescended_count(g),
         }))
         .unwrap_or_default()
             + "\n";
@@ -3418,8 +3434,15 @@ export function run(s: S): number { return s.step(); }
             "{out}"
         );
         assert!(
-            out.contains("macro invocation(s) were not descended into"),
-            "the claim must name what was skipped: {out}"
+            out.contains("1 undescended region(s) in this tree are outside that limit"),
+            "the claim must count what was skipped: {out}"
+        );
+        // Deliberately a clause, not an alarm. Every real Rust tree has
+        // macros, so a multi-line warning here fires on every complete answer
+        // in every Rust repo — see `completeness_note`.
+        assert!(
+            out.lines().count() < 10,
+            "the disclosure must stay a footnote: {out}"
         );
         let _ = fs::remove_dir_all(dir);
     }
@@ -3434,6 +3457,43 @@ export function run(s: S): number { return s.step(); }
         let out = callers(&g, "target", false);
         assert!(out.contains("complete to the limit"), "{out}");
         assert!(!out.contains("not descended into"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The gap a review caught: #47 taught the text path to disclose and left
+    /// the JSON asserting `complete: true` with `lower_bound: false`, on the
+    /// interface an agent is most likely to parse. The machine-readable answer
+    /// must not be more confident than the human one.
+    #[test]
+    fn callers_json_discloses_undescended_regions() {
+        let (g, dir) = graph(&[(
+            "src/a.rs",
+            "pub fn target() {}\npub fn run() { target(); assert_eq!(1, 1); }\n",
+        )]);
+        let json = callers(&g, "target", true);
+        assert!(json.contains("\"lower_bound\": true"), "{json}");
+        assert!(json.contains("\"undescended_regions\": 1"), "{json}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn callers_json_does_not_cry_wolf_without_regions() {
+        let (g, dir) = graph(&[(
+            "src/a.rs",
+            "pub fn target() {}\npub fn run() { target(); }\n",
+        )]);
+        let json = callers(&g, "target", true);
+        assert!(json.contains("\"lower_bound\": false"), "{json}");
+        assert!(json.contains("\"undescended_regions\": 0"), "{json}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn doctor_json_carries_the_undescended_counts() {
+        let (g, dir) = graph(&[("src/a.rs", "pub fn run() { assert_eq!(1, 1); }\n")]);
+        let json = coverage_report(&g, &[], false, true);
+        assert!(json.contains("\"undescended_total\": 1"), "{json}");
+        assert!(json.contains("macro invocation"), "{json}");
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -491,9 +491,12 @@ Three loss channels are knowable and reported in band:
   sites bearing this name that ctx could not pin, and says where. When it reports
   none, the confirming grep can be skipped.
 
-The first two set `lower_bound: true`. The absence of a flag means "no *known*
-reason to distrust this" — not a guarantee: a call made at module level, or
-through a function-local import, can still be missed.
+The first two set `lower_bound: true`, and so does a third cause that is not
+per-name: **undescended regions**. Any region no extractor entered — Rust macro
+bodies and `static`/`const` initializers today — can hold a call to the queried
+name, so the count rides alongside as `undescended_regions` and the text output
+closes with it. The absence of a flag means "no *known* reason to distrust this"
+— not a guarantee: a call through a function-local import can still be missed.
 
 That module-level channel is **not uniform across languages**, which is worth
 stating plainly. Python, TypeScript and Go each synthesize a module-level
@@ -502,12 +505,9 @@ Rust does not: the initializer of a `static` or `const` is parsed as an item
 but never walked for calls, so `pub static X: u32 = make();` contributes
 nothing. It is not an unresolved call site — it is absent — so it cannot lower
 recall. Rust is the only supported language with a live instance of this
-channel.
-
-What it *does* do is say so. Every such initializer that contains a call is
-counted and reported under "Not descended into" by `ctx doctor`, and the
-completeness line on `callers` names the count rather than claiming the tree
-is covered. The calls are still missing; they are no longer missing silently. Before changing a
+channel, and every such initializer containing a call is counted under "Not
+descended into" by `ctx doctor`. The calls are still missing; they are no
+longer missing silently. Before changing a
 signature, run the `rg` command ctx prints. This matters because `callers` is the
 pre-signature-change safety check, and "no callers" reads as "safe to change".
 

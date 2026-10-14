@@ -245,7 +245,13 @@ NOTE
         # std/third-party one. The caller list is right; grep's line count is
         # mostly a different function that happens to share the spelling.
         verdict='name collision'
-      elif printf '%s' "$ctxout" | grep -q 'were not descended into'; then
+      elif printf '%s' "$ctxout" | grep -q 'undescended region'; then
+        # NOTE: this classifies by grepping ctx's PROSE, which couples the
+        # published figures to output wording — rewording the disclosure once
+        # silently reverted this row to `**complete**` and put it back in the
+        # median. `ctx callers --format json` now carries `undescended_regions`
+        # as a stable field; switching to it would remove the coupling.
+        #
         # Every call site ctx SAW resolved, and it also declined to enter
         # regions whose contents it never read. Calling that "complete" states
         # a fact about the parsed subset in the voice of a fact about the code,
