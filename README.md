@@ -500,9 +500,14 @@ stating plainly. Python, TypeScript and Go each synthesize a module-level
 container, so `X = make()` written outside any function is a real call site.
 Rust does not: the initializer of a `static` or `const` is parsed as an item
 but never walked for calls, so `pub static X: u32 = make();` contributes
-nothing. It is not an unresolved call site — it is absent — so it neither
-lowers recall nor qualifies a completeness line. Rust is the only supported
-language with a live instance of this channel. Before changing a
+nothing. It is not an unresolved call site — it is absent — so it cannot lower
+recall. Rust is the only supported language with a live instance of this
+channel.
+
+What it *does* do is say so. Every such initializer that contains a call is
+counted and reported under "Not descended into" by `ctx doctor`, and the
+completeness line on `callers` names the count rather than claiming the tree
+is covered. The calls are still missing; they are no longer missing silently. Before changing a
 signature, run the `rg` command ctx prints. This matters because `callers` is the
 pre-signature-change safety check, and "no callers" reads as "safe to change".
 
