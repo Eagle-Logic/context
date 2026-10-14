@@ -1246,10 +1246,50 @@ fn completeness_note(g: &Graph, name: &str, subject: &str) -> String {
              If `{name}`\nis also invoked on a value ctx could not type, those calls are not listed.\n"
         );
     }
-    format!(
+    let mut note = format!(
         "\ncompleteness: no call site named `{name}` went unresolved anywhere in this tree —\n\
          this {subject} is complete to the limit of what ctx parses.\n"
+    );
+    // That limit used to be the whole caveat, carrying far more weight than it
+    // looked like it carried. A call site inside a region no extractor entered
+    // is not unresolved — it is absent — so it could never reduce this claim,
+    // which made this the one place a missing edge was invisible to the
+    // machinery built to make missing edges enumerable.
+    if let Some(regions) = undescended_summary(g) {
+        note.push_str(&format!(
+            "that limit is load-bearing here: {regions} were not descended into, so a call to\n\
+             `{name}` inside one was never seen — absent, not unresolved — and could not have\n\
+             counted against the line above. grep `{name}` to rule it out.\n"
+        ));
+    }
+    note
+}
+
+/// Regions no extractor entered, summarised across the graph, or `None` when
+/// there are none. Phrased for an in-band caveat: "3549 macro invocation(s)".
+fn undescended_summary(g: &Graph) -> Option<String> {
+    let totals = undescended_totals(g);
+    if totals.is_empty() {
+        return None;
+    }
+    Some(
+        totals
+            .iter()
+            .map(|(kind, n)| format!("{n} {kind}(s)"))
+            .collect::<Vec<_>>()
+            .join(", "),
     )
+}
+
+/// Undescended region counts across every module, by kind.
+fn undescended_totals(g: &Graph) -> BTreeMap<&str, usize> {
+    let mut totals: BTreeMap<&str, usize> = BTreeMap::new();
+    for m in &g.modules {
+        for (kind, n) in &m.undescended {
+            *totals.entry(kind.as_str()).or_default() += n;
+        }
+    }
+    totals
 }
 
 /// Read the source lines a span covers, fenced for Markdown display.
@@ -2017,6 +2057,29 @@ pub fn coverage_report(
         if broken.len() > 20 {
             out.push_str(&format!("  … and {} more\n", broken.len() - 20));
         }
+    }
+
+    // Distinct from the blind spots below. A blind spot is a file ctx cannot
+    // parse at all; this is a region inside a file it parsed fine and chose not
+    // to enter. The second is more dangerous precisely because the file looks
+    // covered.
+    let undescended = undescended_totals(g);
+    if !undescended.is_empty() {
+        out.push_str("\n## Not descended into (regions never read as code)\n");
+        for (kind, n) in &undescended {
+            let mods = g
+                .modules
+                .iter()
+                .filter(|m| m.undescended.contains_key(*kind))
+                .count();
+            out.push_str(&format!("  {kind:<22} {n:>6}   in {mods} module(s)\n"));
+        }
+        out.push_str(
+            "  A call site inside one of these was never seen. It is absent, not\n\
+             \x20 unresolved, so it appears in NEITHER side of the recall figure above —\n\
+             \x20 not the numerator and not the denominator. Recall is a ratio over what\n\
+             \x20 ctx saw; this is the measure of what it did not.\n",
+        );
     }
 
     out.push_str("\n## Not modeled (blind spots)\n");
@@ -3336,6 +3399,57 @@ export function run(s: S): number { return s.step(); }
         let cov = coverage_report(&g, &[], false, false);
         assert!(cov.contains("guide.md:7"), "{cov}");
         assert!(!cov.contains("guide.md:1"), "{cov}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The invariant issue #35 is about. A bare "complete" claim is only
+    /// honest when there is nothing the extractor declined to enter, and
+    /// `arg` on ripgrep showed what the unqualified version costs: 2 callers
+    /// reported against ~357 real call sites, with no warning.
+    #[test]
+    fn a_complete_claim_discloses_undescended_regions() {
+        let (g, dir) = graph(&[(
+            "src/a.rs",
+            "pub fn target() {}\npub fn run() { target(); assert_eq!(1, 1); }\n",
+        )]);
+        let out = callers(&g, "target", false);
+        assert!(
+            out.contains("complete to the limit of what ctx parses"),
+            "{out}"
+        );
+        assert!(
+            out.contains("macro invocation(s) were not descended into"),
+            "the claim must name what was skipped: {out}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// And must not cry wolf: with nothing skipped, the claim stands alone.
+    #[test]
+    fn a_tree_with_no_macros_leaves_the_claim_unqualified() {
+        let (g, dir) = graph(&[(
+            "src/a.rs",
+            "pub fn target() {}\npub fn run() { target(); }\n",
+        )]);
+        let out = callers(&g, "target", false);
+        assert!(out.contains("complete to the limit"), "{out}");
+        assert!(!out.contains("not descended into"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn doctor_separates_undescended_regions_from_blind_spots() {
+        let (g, dir) = graph(&[("src/a.rs", "pub fn run() { assert_eq!(1, 1); }\n")]);
+        let out = coverage_report(&g, &[("cpp".to_string(), 1)], false, false);
+        assert!(out.contains("## Not descended into"), "{out}");
+        assert!(out.contains("macro invocation"), "{out}");
+        // A region inside a parsed file is not the same thing as a file ctx
+        // cannot parse, and conflating them would hide the worse one.
+        assert!(out.contains("## Not modeled (blind spots)"), "{out}");
+        assert!(
+            out.contains("NEITHER side of the recall figure"),
+            "it must say it is outside the ratio: {out}"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
