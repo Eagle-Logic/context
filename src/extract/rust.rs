@@ -61,6 +61,53 @@ fn count_macro_invocations(root: Node) -> usize {
     n
 }
 
+/// Whether this subtree contains a call expression.
+///
+/// Exact, not heuristic: the node is ordinary parsed Rust, so this is a
+/// question the tree can simply answer. That is the difference from
+/// [`count_macro_invocations`], which must count every macro because a token
+/// tree cannot be asked anything — here only the initializers that really do
+/// hide a call are counted, so the number means what it says.
+fn contains_call(node: Node) -> bool {
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "call_expression" {
+            return true;
+        }
+        let mut c = n.walk();
+        for ch in n.named_children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    false
+}
+
+/// Walk a file, collecting items and the calls inside function bodies.
+///
+/// One asymmetry worth knowing, because nothing else records it. Python
+/// (`python.rs`), TypeScript (`typescript.rs`) and Go (`go.rs`) each
+/// synthesize a module-level container so that calls written outside any
+/// function are still call sites. Rust has none, so the initializer of a
+/// `static` or `const` is parsed as an item but never walked for calls:
+///
+///     pub fn make() -> u32 { 7 }
+///     pub static X: u32 = make();   // not a call site
+///     pub const Y: u32 = make();    // not a call site
+///     pub fn seen() { make(); }     // a call site
+///
+/// `ctx doctor` reports `call sites: 1` there. All three calls are real. The
+/// two it misses are absent rather than unresolved, so they cannot lower
+/// recall — the same shape as the macro-body gap, by a different route.
+///
+/// They are therefore *disclosed* rather than resolved: each initializer that
+/// contains a call is counted into [`FileFacts::undescended`], so `callers`
+/// qualifies its completeness line instead of claiming the tree is covered.
+/// Before that, `ctx callers make` reported one caller and closed with "no
+/// call site named `make` went unresolved anywhere in this tree" — true as
+/// written, and false as read.
+///
+/// README.md names "a call made at module level" as a loss channel; this is
+/// the live instance of it, and the only language here that still has one.
 fn visit(node: Node, src: &str, items: &mut Vec<Item>, facts: &mut FileFacts, module_level: bool) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -124,6 +171,21 @@ fn visit(node: Node, src: &str, items: &mut Vec<Item>, facts: &mut FileFacts, mo
                 }
             }
             "type_item" | "associated_type" | "const_item" | "static_item" => {
+                // The initializer is parsed and then never walked for calls,
+                // so a call written here is absent from the graph rather than
+                // unresolved — see this function's doc comment. Counting it
+                // keeps `callers` from claiming completeness over a gap it
+                // cannot see, which is the whole point of the field.
+                //
+                // A macro in the initializer (`static X: Vec<u32> =
+                // vec![make()]`) is already counted as a macro invocation, so
+                // it is disclosed either way and never counted twice here.
+                if matches!(child.kind(), "const_item" | "static_item") && contains_call(child) {
+                    *facts
+                        .undescended
+                        .entry("module-level initializer".to_string())
+                        .or_default() += 1;
+                }
                 let sig = clip(collapse(text(child, src)).trim_end_matches(';'));
                 items.push(item(
                     child.kind(),
@@ -963,6 +1025,55 @@ fn clip_doc(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the asymmetry documented on `visit`. This asserts current
+    /// behaviour, not desired behaviour: if Rust ever gains module-level call
+    /// sites, this fails and whoever did it updates that doc comment and the
+    /// matching paragraph in README.md. A documented gap that quietly closes
+    /// leaves prose that lies in the other direction.
+    #[test]
+    fn module_level_initializers_contribute_no_call_sites() {
+        let f = extract(
+            "pub fn make() -> u32 { 7 }\n\
+             pub static X: u32 = make();\n\
+             pub const Y: u32 = make();\n\
+             pub fn seen() { make(); }\n",
+        )
+        .unwrap();
+        fn count(items: &[Item]) -> usize {
+            items
+                .iter()
+                .map(|i| i.raw_calls.len() + count(&i.children))
+                .sum()
+        }
+        assert_eq!(
+            count(&f.items),
+            1,
+            "three calls to `make` are written; only the one inside `seen` is seen"
+        );
+        // Unseen is acceptable; unseen and undisclosed is not. The two it
+        // missed must show up here so `callers` cannot claim completeness.
+        assert_eq!(
+            f.undescended.get("module-level initializer"),
+            Some(&2),
+            "both skipped initializers must be disclosed: {:?}",
+            f.undescended
+        );
+    }
+
+    /// The exactness that separates this from the macro count. A `const` with
+    /// no call in it hides nothing, so counting it would inflate the
+    /// disclosure with noise — and unlike a token tree, the initializer is
+    /// real AST, so "does this hide a call" is answerable rather than guessed.
+    #[test]
+    fn an_initializer_with_no_call_is_not_disclosed() {
+        let f = extract("pub const N: u32 = 7;\npub static S: &str = \"x\";\n").unwrap();
+        assert!(
+            f.undescended.is_empty(),
+            "nothing is hidden here: {:?}",
+            f.undescended
+        );
+    }
 
     #[test]
     fn a_macro_invocation_is_counted_as_undescended() {

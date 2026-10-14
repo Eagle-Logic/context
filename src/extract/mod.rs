@@ -24,6 +24,17 @@ const SKIP_DIRS: &[&str] = &[
     ".git",
 ];
 
+/// How far [`chase`] follows a re-export facade before stopping.
+///
+/// Empirical, not principled: facade chains this deep are rare, and a bound is
+/// required because a re-export cycle would otherwise recurse forever.
+///
+/// What happens at the bound is the part worth knowing. `chase` returns the
+/// module it had reached and the remaining unresolved segments, so a chain
+/// deeper than this resolves to an intermediate facade rather than the module
+/// that actually defines the symbol. It does not error, and nothing counts it,
+/// which makes a very deep facade the one re-export shape ctx gets quietly
+/// wrong instead of loudly.
 const CHASE_DEPTH: usize = 8;
 
 /// One deduped outgoing edge, mid-accumulation.
@@ -754,7 +765,27 @@ fn resolve_deps(modules: &mut [Module], root: &Path) {
         m.import_sites = sites;
         m.diag = diag;
         let mut it = calls.into_iter();
-        apply_calls(&mut m.items, &mut it);
+        let mut starved = 0usize;
+        apply_calls(&mut m.items, &mut it, &mut starved);
+        // Both directions of a desynchronized walk. Loud beats silent: a
+        // mismatch here misattributes call edges across items, and the old
+        // behaviour was to produce a plausible-looking graph instead.
+        let unconsumed = it.len();
+        debug_assert_eq!(
+            (starved, unconsumed),
+            (0, 0),
+            "call-list walk desynchronized in {}: {starved} item(s) starved, \
+             {unconsumed} list(s) unconsumed",
+            m.name
+        );
+        if starved > 0 || unconsumed > 0 {
+            eprintln!(
+                "[ctx] internal: call-list walk desynchronized in {} ({starved} starved, \
+                 {unconsumed} unconsumed) — call edges in this module may be misattributed; \
+                 please report this with the file that triggered it",
+                m.name
+            );
+        }
     }
 }
 
@@ -2474,10 +2505,30 @@ fn extend_locals(
     out
 }
 
-fn apply_calls(items: &mut [Item], resolved: &mut std::vec::IntoIter<Vec<Call>>) {
+/// Attach resolved call lists to items, consuming them in the same DFS
+/// pre-order `compute_calls` produced them in.
+///
+/// The two walks are coupled by position, not by key. They traverse the same
+/// immutable tree with nothing mutating it in between, so they cannot drift
+/// today — but if they ever did, every item past the drift point would receive
+/// another item's call edges. `starved` counts the items that ran off the end
+/// of the list; the caller checks the opposite direction. Previously this was
+/// a bare `unwrap_or_default()`, which rendered that failure as "a module with
+/// no calls" — indistinguishable from the truth.
+fn apply_calls(
+    items: &mut [Item],
+    resolved: &mut std::vec::IntoIter<Vec<Call>>,
+    starved: &mut usize,
+) {
     for it in items {
-        it.calls = resolved.next().unwrap_or_default();
-        apply_calls(&mut it.children, resolved);
+        match resolved.next() {
+            Some(calls) => it.calls = calls,
+            None => {
+                *starved += 1;
+                it.calls = Vec::new();
+            }
+        }
+        apply_calls(&mut it.children, resolved, starved);
     }
 }
 

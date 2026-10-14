@@ -55,7 +55,7 @@ callers, not a list of lines.
 |---|---|---|---|---|---|---|---|
 | ripgrep | `new` | 1216 | 35975 | 17594 | 2.0x | 359 | name collision |
 | ripgrep | `unwrap` | 1147 | 33526 | 411 | 81.6x | 5 | name collision |
-| ripgrep | `arg` | 357 | 9270 | 238 | 38.9x | 2 | regions skipped |
+| ripgrep | `arg` | 357 | 9270 | 249 | 37.2x | 2 | regions skipped |
 | ripgrep | `parse_low_raw` | 565 | 17467 | 108 | 161.7x | 0 | incomplete |
 | requests | `get` | 180 | 4812 | 4266 | 1.1x | 89 | name collision |
 | requests | `httpbin` | 156 | 4503 | 100 | 45.0x | 0 | incomplete |
