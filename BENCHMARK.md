@@ -30,7 +30,7 @@ could not pin — and `ctx doctor` names every one of them with a grep to confir
 |---|---|---|---|---|---|---|
 | ripgrep | rust | `3fce3b5` | 110 | **4601/7038 = 65.4%** | 2437 | `parse_low_raw` ×560, `path` ×371, `build` ×221 |
 | requests | python | `611c616` | 37 | **976/1167 = 83.6%** | 191 | `httpbin` ×155, `should_strip_auth` ×9, `httpbin_secure` ×8 |
-| got | ts | `e1d87d2` | 88 | **1723/2184 = 78.9%** | 461 | `request` ×91, `now` ×71, `setTimeout` ×55 |
+| got | ts | `e1d87d2` | 88 | **1920/2184 = 87.9%** | 264 | `now` ×71, `setTimeout` ×55, `request` ×49 |
 | cobra | go | `adbc881` | 36 | **2278/2283 = 99.8%** | 5 | `string` ×3, `Len` ×2 |
 | chi | go | `3d1777a` | 84 | **1569/1752 = 89.6%** | 183 | `ServeHTTP` ×98, `Get` ×41, `Context` ×5 |
 | preact | ts | `8101ff8` | 223 | **2176/2787 = 78.1%** | 611 | `createElement` ×92, `render` ×79, `hydrate` ×40 |
