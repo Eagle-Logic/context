@@ -55,7 +55,7 @@ callers, not a list of lines.
 |---|---|---|---|---|---|---|---|
 | ripgrep | `new` | 1216 | 35975 | 17594 | 2.0x | 359 | name collision |
 | ripgrep | `unwrap` | 1147 | 33526 | 411 | 81.6x | 5 | name collision |
-| ripgrep | `arg` | 357 | 9270 | 159 | 58.3x | 2 | **complete** |
+| ripgrep | `arg` | 357 | 9270 | 238 | 38.9x | 2 | regions skipped |
 | ripgrep | `parse_low_raw` | 565 | 17467 | 108 | 161.7x | 0 | incomplete |
 | requests | `get` | 180 | 4812 | 4266 | 1.1x | 89 | name collision |
 | requests | `httpbin` | 156 | 4503 | 100 | 45.0x | 0 | incomplete |
@@ -86,6 +86,7 @@ Only `complete` rows are counted in the summary below.
 | ctx says | what the number means |
 |---|---|
 | `complete` | every call site with that name resolved. Act on it; no follow-up grep needed. |
+| `regions skipped` | every call site ctx *saw* resolved, but it never entered some regions — Rust macro bodies today — so a call in one was never seen at all. Not a miss; an absence. The ratio is real and the caller list is a floor of unknown depth. Treat it as the weakest verdict here, not the second strongest. |
 | `name collision` | every *internal* call resolved, but the name also belongs to a std/third-party function. The caller list is right and grep's line count is mostly a different function that happens to share the spelling — the ratio is real, but it is measuring grep's false positives, not ctx's compression. |
 | `ambiguous` | several definitions share the name, and calls through a receiver ctx could not type were dropped. Lower bound. |
 | `incomplete` | ctx could not pin some call sites. The cheap answer is cheap *because the analysis fell down*, and ctx names the unresolved callees so you can grep them. |
@@ -101,11 +102,18 @@ never parsed cannot be unresolved, so it does not reduce the claim — which is
 what "complete to the limit of what ctx parses" is doing in that sentence, and
 it is doing more work than it looks.
 
-The sharpest case in this corpus is `ripgrep`/`arg`. ctx reports 2 callers and
-says `complete`; the fair grep finds 357 lines, and the ~355 it does not report
-are real calls to that same method. They sit inside `rgtest!(...)` macro
-invocations, and **ctx does not descend into macro bodies** — so those sites were
-never seen, never counted, and never held against the completeness line.
+The sharpest case in this corpus is `ripgrep`/`arg`. ctx reports 2 callers;
+the fair grep finds 357 lines, and the ~355 it does not report are real calls
+to that same method. They sit inside `rgtest!(...)` macro invocations, and
+**ctx does not descend into macro bodies** — so those sites were never seen.
+
+None of that has changed. What changed is that ctx now says it: that row reads
+`regions skipped` rather than `complete`, and the answer itself names how many
+regions in that tree were never entered, any one of which could hold a call to
+`arg`. The limitation is identical; it is no longer silent. It is not free
+either — the disclosure is part of the answer, so that row's ctx token count
+went up and its ratio went down. Compare it against the `complete` rows with
+that in mind.
 
 Minimal reproduction:
 
@@ -114,15 +122,17 @@ pub fn plain() { let mut t = T; t.arg(); }      // seen
 wrap!(inside, { let mut t = T; t.arg(); });     // not seen
 ```
 
-`ctx doctor` reports `call sites: 1` for that file. Both calls are real.
+`ctx doctor` reports `call sites: 1` for that file, and one undescended macro
+invocation beside it. Both calls are real.
 
 This is the honest reading of the whole benchmark: the calibration claim is
 about what ctx *resolved* versus what it *saw*, and a macro-heavy Rust codebase
-can hide a large fraction of the third quantity. That is a limitation this
+can hide a large fraction of the third quantity. ctx now counts that quantity
+rather than leaving it to be inferred from a caveat. That is a limitation this
 harness found on a third-party repository, which is the argument for running it
 on third-party repositories.
 
-Over the 7 `complete` answers above, the median is **1.6x** fewer tokens than the fair grep.
+Over the 6 `complete` answers above, the median is **1.5x** fewer tokens than the fair grep.
 
 The median, not the best case or the range. Individual ratios here span two orders of
 magnitude, and the largest of them are the least trustworthy — a ratio is only as good
