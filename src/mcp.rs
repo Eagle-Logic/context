@@ -291,7 +291,7 @@ const DEFAULT_MCP_BUDGET: usize = 25_000;
 /// modules — so they never truncate. The flat reports have no such ladder, so
 /// the honest option is to cut and be loud about it: a silent cut would be a
 /// report that lies by omission, which is the one thing this tool must not do.
-fn clamp(text: String, budget: Option<usize>, what: &str) -> String {
+fn clamp(text: String, budget: Option<usize>, what: &str, narrow: &str) -> String {
     let Some(budget) = budget else { return text };
     if crate::est_tokens(&text) <= budget {
         return text;
@@ -304,11 +304,35 @@ fn clamp(text: String, budget: Option<usize>, what: &str) -> String {
     let kept = &text[..cut];
     let dropped_lines = text[cut..].lines().count();
     format!(
-        "{kept}\n[ctx] TRUNCATED at {budget} tokens: {dropped_lines} more line(s) withheld \
-         (~{} tokens total). This is a cut, not the whole answer. Raise max_tokens, or \
-         narrow the query — `{what}` on a subdirectory, or a more specific name.\n",
+        "{kept}\n[ctx] TRUNCATED `{what}` at {budget} tokens: {dropped_lines} more line(s) \
+         withheld (~{} tokens total). This is a cut, not the whole answer. Raise max_tokens, \
+         or {narrow}.\n",
         crate::est_tokens(&text)
     )
+}
+
+/// Ceilings for the two arguments that size an answer before any budget can
+/// cut it. `max_tokens` trims the rendered text, which protects the caller's
+/// context but still builds the whole string first; these bound the work.
+///
+/// Both are generous — they exist to stop a pathological argument, not to
+/// second-guess a deliberate one — and exceeding either is disclosed in band
+/// rather than applied quietly.
+const MAX_TRACE_DEPTH: usize = 10;
+const MAX_CORE_LIMIT: usize = 200;
+
+/// Hold a sizing argument to a ceiling, returning the value to use and a
+/// disclosure line when the request was reduced. A silently ignored argument
+/// is a lie about what was computed.
+fn capped(requested: usize, ceiling: usize, what: &str) -> (usize, String) {
+    if requested <= ceiling {
+        (requested, String::new())
+    } else {
+        (
+            ceiling,
+            format!("[ctx] {what} capped at {ceiling} (requested {requested}).\n"),
+        )
+    }
 }
 
 /// Repeated in every tool's schema, so each word here is paid ten times over
@@ -363,7 +387,7 @@ fn tools() -> Vec<Value> {
         tool(
             "def",
             "Where a symbol is defined: file, span, signature.",
-            json!({ "path": path_prop(), "name": name_prop }),
+            json!({ "path": path_prop(), "name": name_prop, "max_tokens": budget_prop(BUDGET_DESC) }),
             &["name"],
         ),
         tool(
@@ -387,19 +411,24 @@ fn tools() -> Vec<Value> {
         tool(
             "core",
             "Modules ranked by dependency centrality.",
-            json!({ "path": path_prop(), "limit": {"type": "integer", "description": "Default 30"} }),
+            json!({ "path": path_prop(), "limit": {"type": "integer", "description": "Default 30, max 200"},
+                    "max_tokens": budget_prop(BUDGET_DESC) }),
             &[],
         ),
         tool(
             "trace",
             "Transitive call tree from a symbol; reverse=true for what reaches it.",
-            json!({ "path": path_prop(), "name": name_prop, "depth": {"type": "integer", "description": "Default 3"}, "reverse": {"type": "boolean", "description": "Inbound tree"} }),
+            json!({ "path": path_prop(), "name": name_prop, "depth": {"type": "integer", "description": "Default 3, max 10"},
+                    "reverse": {"type": "boolean", "description": "Inbound tree"},
+                    "max_tokens": budget_prop(BUDGET_DESC) }),
             &["name"],
         ),
         tool(
             "path",
             "Shortest call path between two symbols.",
-            json!({ "path": path_prop(), "from": {"type": "string", "description": "From symbol"}, "to": {"type": "string", "description": "To symbol"} }),
+            json!({ "path": path_prop(), "from": {"type": "string", "description": "From symbol"},
+                    "to": {"type": "string", "description": "To symbol"},
+                    "max_tokens": budget_prop(BUDGET_DESC) }),
             &["from", "to"],
         ),
         tool(
@@ -504,7 +533,15 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
                 }
             }
         }
-        "modules" => (clamp(render::module_list(g), budget, "ctx modules"), false),
+        "modules" => (
+            clamp(
+                render::module_list(g),
+                budget,
+                "ctx modules",
+                "`ctx modules` on a subdirectory",
+            ),
+            false,
+        ),
         "subtree" => match sarg("module") {
             // Same code path as the CLI, so the two cannot drift again.
             Some(m) => {
@@ -516,20 +553,34 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
             None => ("missing required argument 'module'".into(), true),
         },
         "def" => match sarg("name") {
-            Some(n) => (query::def(g, n, false), false),
+            Some(n) => (
+                clamp(
+                    query::def(g, n, false),
+                    budget,
+                    "ctx def",
+                    "a more specific name",
+                ),
+                false,
+            ),
             None => ("missing required argument 'name'".into(), true),
         },
         "callers" => match sarg("name") {
             Some(n) => (
-                clamp(query::callers(g, n, false), budget, "ctx callers"),
+                clamp(
+                    query::callers(g, n, false),
+                    budget,
+                    "ctx callers",
+                    "a more specific name",
+                ),
                 false,
             ),
             None => ("missing required argument 'name'".into(), true),
         },
         "context" => match sarg("name") {
-            // The only budget-advertising tool that never clamped: its internal
-            // budget caps two lists, not the whole bundle, and `include_source`
-            // puts real bulk outside those lists. A ceiling that leaks is not one.
+            // `context` advertises a budget and enforces it internally over two
+            // lists only, while `include_source` puts real bulk outside those
+            // lists — a ceiling that leaks is not one, so the whole bundle is
+            // clamped as well.
             Some(n) => {
                 let cap = uarg("max_tokens", 4000);
                 (
@@ -537,22 +588,53 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
                         query::context(g, n, cap, barg("include_source"), false),
                         Some(cap),
                         "ctx context",
+                        "dropping `include_source`, or a more specific name",
                     ),
                     false,
                 )
             }
             None => ("missing required argument 'name'".into(), true),
         },
-        "core" => (query::core(g, uarg("limit", 30), None, false), false),
-        "trace" => match sarg("name") {
-            Some(n) => (
-                query::trace(g, n, uarg("depth", 3), barg("reverse"), false),
+        "core" => {
+            let (limit, note) = capped(uarg("limit", 30), MAX_CORE_LIMIT, "limit");
+            (
+                clamp(
+                    format!("{note}{}", query::core(g, limit, None, false)),
+                    budget,
+                    "ctx core",
+                    "a smaller `limit`",
+                ),
                 false,
-            ),
+            )
+        }
+        "trace" => match sarg("name") {
+            Some(n) => {
+                let (depth, note) = capped(uarg("depth", 3), MAX_TRACE_DEPTH, "depth");
+                (
+                    clamp(
+                        format!(
+                            "{note}{}",
+                            query::trace(g, n, depth, barg("reverse"), false)
+                        ),
+                        budget,
+                        "ctx trace",
+                        "a smaller `depth`",
+                    ),
+                    false,
+                )
+            }
             None => ("missing required argument 'name'".into(), true),
         },
         "path" => match (sarg("from"), sarg("to")) {
-            (Some(f), Some(t)) => (query::path(g, f, t, false), false),
+            (Some(f), Some(t)) => (
+                clamp(
+                    query::path(g, f, t, false),
+                    budget,
+                    "ctx path",
+                    "endpoints that are closer together",
+                ),
+                false,
+            ),
             _ => ("missing required argument 'from' or 'to'".into(), true),
         },
         "doctor" => {
@@ -562,6 +644,7 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
                     query::coverage_report(g, &unsupported, barg("explain"), false),
                     budget,
                     "ctx doctor",
+                    "`ctx doctor` on a subdirectory",
                 ),
                 false,
             )
@@ -598,6 +681,93 @@ mod tests {
                 "missing tool {expected}: {names:?}"
             );
         }
+    }
+
+    /// Every tool that enforces a ceiling must advertise it, or the truncation
+    /// message tells the caller to raise an argument the schema never offered.
+    /// `def`, `core`, `trace` and `path` advertised nothing and enforced
+    /// nothing, while `budget` was already computed for all ten.
+    #[test]
+    fn every_tool_advertises_max_tokens() {
+        for t in tools() {
+            let name = t["name"].as_str().unwrap();
+            assert!(
+                t["inputSchema"]["properties"].get("max_tokens").is_some(),
+                "{name} does not advertise max_tokens"
+            );
+        }
+    }
+
+    /// Every flat report must honour the ceiling. `map` and `subtree` are
+    /// excluded only because they degrade through the view ladder instead of
+    /// truncating; their budgets are tested in main.rs.
+    ///
+    /// The bug this locks down: a zero-argument `trace` returned its entire
+    /// fan-out straight into the caller's context.
+    #[test]
+    fn every_flat_report_honours_max_tokens() {
+        let cases: &[(&str, Value)] = &[
+            ("modules", json!({})),
+            ("def", json!({"name": "Lang"})),
+            ("callers", json!({"name": "build_graph"})),
+            ("context", json!({"name": "build_graph"})),
+            ("core", json!({})),
+            ("trace", json!({"name": "build_graph"})),
+            ("path", json!({"from": "main", "to": "build_graph"})),
+            ("doctor", json!({})),
+        ];
+        for (name, extra) in cases {
+            let mut args = extra.clone();
+            args["path"] = json!(".");
+            args["max_tokens"] = json!(50);
+            let (text, is_error) = dispatch(name, &args);
+            assert!(!is_error, "{name}: {text}");
+            let got = crate::est_tokens(&text);
+            assert!(got <= 500, "{name} ignored max_tokens: {got} tokens");
+        }
+    }
+
+    /// A cut lands in a context where the originating call is not visible, so
+    /// it has to name itself.
+    #[test]
+    fn a_truncated_report_names_the_tool_that_was_cut() {
+        let (text, _) = dispatch("doctor", &json!({"path": ".", "max_tokens": 20}));
+        assert!(text.contains("TRUNCATED `ctx doctor`"), "{text}");
+    }
+
+    #[test]
+    fn an_over_large_trace_depth_is_capped_and_discloses_it() {
+        let (text, is_error) = dispatch(
+            "trace",
+            &json!({"path": ".", "name": "build_graph", "depth": 99, "max_tokens": 20000}),
+        );
+        assert!(!is_error, "{text}");
+        assert!(
+            text.contains(&format!("depth capped at {MAX_TRACE_DEPTH}")),
+            "a silently ignored argument is a lie about what was computed: {text}"
+        );
+    }
+
+    #[test]
+    fn an_over_large_core_limit_is_capped_and_discloses_it() {
+        let (text, is_error) = dispatch(
+            "core",
+            &json!({"path": ".", "limit": 9999, "max_tokens": 20000}),
+        );
+        assert!(!is_error, "{text}");
+        assert!(
+            text.contains(&format!("limit capped at {MAX_CORE_LIMIT}")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_depth_within_the_cap_is_not_announced() {
+        let (text, _) = dispatch(
+            "trace",
+            &json!({"path": ".", "name": "build_graph", "depth": 2, "max_tokens": 20000}),
+        );
+        assert!(!text.contains("capped"), "{text}");
     }
 
     #[test]
