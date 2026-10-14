@@ -2028,7 +2028,17 @@ pub fn coverage_report(
             out.push_str(&format!("  .{ext:<8} {n}\n"));
         }
     }
-    out.push_str("  (supported: .rs .py .ts .tsx .js .jsx .go .md)\n");
+    // Derived from `Lang::exts`, never restated: this line claimed
+    // `.rs .py .ts .tsx .js .jsx .go .md` while the walk also accepted `.mjs`,
+    // `.cjs` and `.markdown`, so the one command whose job is honest
+    // disclosure understated its own coverage.
+    out.push_str(&format!(
+        "  (supported: {})\n",
+        Lang::all_exts()
+            .map(|e| format!(".{e}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
     out
 }
 
@@ -3326,6 +3336,19 @@ export function run(s: S): number { return s.step(); }
         let cov = coverage_report(&g, &[], false, false);
         assert!(cov.contains("guide.md:7"), "{cov}");
         assert!(!cov.contains("guide.md:1"), "{cov}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The footer must be derived from `Lang::exts`, not restated. It used to
+    /// claim 8 extensions while the walk accepted 11, so the one command whose
+    /// job is honest disclosure understated its own coverage.
+    #[test]
+    fn doctor_footer_lists_every_supported_extension() {
+        let (g, dir) = graph(&[("src/a.rs", "pub fn run() {}\n")]);
+        let out = coverage_report(&g, &[], false, false);
+        for ext in Lang::all_exts() {
+            assert!(out.contains(&format!(".{ext}")), "missing .{ext}: {out}");
+        }
         let _ = fs::remove_dir_all(dir);
     }
 
