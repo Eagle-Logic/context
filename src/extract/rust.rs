@@ -61,6 +61,28 @@ fn count_macro_invocations(root: Node) -> usize {
     n
 }
 
+/// Walk a file, collecting items and the calls inside function bodies.
+///
+/// One asymmetry worth knowing, because nothing else records it. Python
+/// (`python.rs`), TypeScript (`typescript.rs`) and Go (`go.rs`) each
+/// synthesize a module-level container so that calls written outside any
+/// function are still call sites. Rust has none, so the initializer of a
+/// `static` or `const` is parsed as an item but never walked for calls:
+///
+///     pub fn make() -> u32 { 7 }
+///     pub static X: u32 = make();   // not a call site
+///     pub const Y: u32 = make();    // not a call site
+///     pub fn seen() { make(); }     // a call site
+///
+/// `ctx doctor` reports `call sites: 1` there, and `ctx callers make` reports
+/// one caller and closes with "no call site named `make` went unresolved
+/// anywhere in this tree". All three calls are real. The two it missed are
+/// absent rather than unresolved, so they cannot lower recall and cannot
+/// qualify that claim — the same shape as the macro-body gap, by a different
+/// route.
+///
+/// README.md names "a call made at module level" as a loss channel; this is
+/// the live instance of it, and the only language here that still has one.
 fn visit(node: Node, src: &str, items: &mut Vec<Item>, facts: &mut FileFacts, module_level: bool) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -963,6 +985,33 @@ fn clip_doc(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the asymmetry documented on `visit`. This asserts current
+    /// behaviour, not desired behaviour: if Rust ever gains module-level call
+    /// sites, this fails and whoever did it updates that doc comment and the
+    /// matching paragraph in README.md. A documented gap that quietly closes
+    /// leaves prose that lies in the other direction.
+    #[test]
+    fn module_level_initializers_contribute_no_call_sites() {
+        let f = extract(
+            "pub fn make() -> u32 { 7 }\n\
+             pub static X: u32 = make();\n\
+             pub const Y: u32 = make();\n\
+             pub fn seen() { make(); }\n",
+        )
+        .unwrap();
+        fn count(items: &[Item]) -> usize {
+            items
+                .iter()
+                .map(|i| i.raw_calls.len() + count(&i.children))
+                .sum()
+        }
+        assert_eq!(
+            count(&f.items),
+            1,
+            "three calls to `make` are written; only the one inside `seen` is seen"
+        );
+    }
 
     #[test]
     fn a_macro_invocation_is_counted_as_undescended() {

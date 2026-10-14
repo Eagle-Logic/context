@@ -493,7 +493,16 @@ Three loss channels are knowable and reported in band:
 
 The first two set `lower_bound: true`. The absence of a flag means "no *known*
 reason to distrust this" — not a guarantee: a call made at module level, or
-through a function-local import, can still be missed. Before changing a
+through a function-local import, can still be missed.
+
+That module-level channel is **not uniform across languages**, which is worth
+stating plainly. Python, TypeScript and Go each synthesize a module-level
+container, so `X = make()` written outside any function is a real call site.
+Rust does not: the initializer of a `static` or `const` is parsed as an item
+but never walked for calls, so `pub static X: u32 = make();` contributes
+nothing. It is not an unresolved call site — it is absent — so it neither
+lowers recall nor qualifies a completeness line. Rust is the only supported
+language with a live instance of this channel. Before changing a
 signature, run the `rg` command ctx prints. This matters because `callers` is the
 pre-signature-change safety check, and "no callers" reads as "safe to change".
 
