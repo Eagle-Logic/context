@@ -1238,6 +1238,30 @@ fn name_diagnostics<'a>(g: &'a Graph, name: &str) -> (usize, usize, Vec<(&'a str
 /// specific symbol it asked about is one of the unresolved ones.
 fn completeness_note(g: &Graph, name: &str, subject: &str) -> String {
     let (unresolved, external, zones) = name_diagnostics(g, name);
+
+    // Appended to EVERY branch, not only the `complete` one. A region no
+    // extractor entered weakens "every internal call site resolved" exactly as
+    // much as it weakens "nothing went unresolved" — and two of ripgrep's four
+    // published rows take the external branch, where the original silence was
+    // simply wearing a different label.
+    //
+    // Stated as one factual clause rather than a warning. Every real Rust tree
+    // has macros, so an alarm here fires on every answer in every Rust repo,
+    // including queries with no plausible macro involvement, and a caveat that
+    // always fires is one nobody reads. The count and the per-kind breakdown
+    // live in `ctx doctor`, where someone acting on it will look.
+    //
+    // "at least": a nested macro invocation is not a node, so the count is a
+    // floor. Overstating certainty about the size of a gap is the same error
+    // as not reporting it.
+    let limit = match undescended_count(g) {
+        0 => String::new(),
+        n => format!(
+            " At least {n} undescended region(s) in this tree were not read; \
+             see `ctx doctor`."
+        ),
+    };
+
     if unresolved > 0 {
         let where_ = zones
             .iter()
@@ -1247,34 +1271,17 @@ fn completeness_note(g: &Graph, name: &str, subject: &str) -> String {
             .join(", ");
         return format!(
             "\ncompleteness: {unresolved} call site(s) named `{name}` could not be pinned \
-             ({where_}) —\nthis {subject} may be incomplete; grep `{name}` to confirm.\n"
+             ({where_}) —\nthis {subject} may be incomplete; grep `{name}` to confirm.{limit}\n"
         );
     }
     if external > 0 {
         return format!(
             "\ncompleteness: every internal call site named `{name}` resolved, but {external} \
              call(s)\nto that name were classified external (a std/third-party name collision). \
-             If `{name}`\nis also invoked on a value ctx could not type, those calls are not listed.\n"
+             If `{name}`\nis also invoked on a value ctx could not type, those calls are not \
+             listed.{limit}\n"
         );
     }
-    // "to the limit of what ctx parses" used to be the whole caveat, carrying
-    // far more weight than it looked like it carried: a call site inside a
-    // region no extractor entered is absent rather than unresolved, so it
-    // could never reduce this claim.
-    //
-    // Stated as one factual clause, not a warning. Every real Rust tree has
-    // macros, so a three-line alarm here fired on every complete answer in
-    // every Rust repo — including queries with no plausible macro involvement —
-    // and a caveat that always fires is one nobody reads. The count and the
-    // per-kind breakdown live in `ctx doctor`, which is where someone acting
-    // on it will look.
-    let limit = match undescended_count(g) {
-        0 => String::new(),
-        n => format!(
-            " {n} undescended region(s) in this tree are outside that limit; \
-             see `ctx doctor`."
-        ),
-    };
     format!(
         "\ncompleteness: no call site named `{name}` went unresolved anywhere in this tree —\n\
          this {subject} is complete to the limit of what ctx parses.{limit}\n"
@@ -3434,7 +3441,7 @@ export function run(s: S): number { return s.step(); }
             "{out}"
         );
         assert!(
-            out.contains("1 undescended region(s) in this tree are outside that limit"),
+            out.contains("At least 1 undescended region(s) in this tree were not read"),
             "the claim must count what was skipped: {out}"
         );
         // Deliberately a clause, not an alarm. Every real Rust tree has
@@ -3457,6 +3464,29 @@ export function run(s: S): number { return s.step(); }
         let out = callers(&g, "target", false);
         assert!(out.contains("complete to the limit"), "{out}");
         assert!(!out.contains("not descended into"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A review caught this one: the disclosure was only on the `complete`
+    /// branch. Two of ripgrep's four published rows take the external branch
+    /// and were labelled `name collision` with no hint that 3549 regions went
+    /// unread — the original silence wearing a different label.
+    #[test]
+    fn the_external_branch_discloses_regions_too() {
+        // `len` is a std name, so the call is classified external rather than
+        // resolved, which routes through the second branch.
+        let (g, dir) = graph(&[(
+            "src/a.rs",
+            "pub fn len() -> usize { 0 }\n\
+             pub fn run() { let v: Vec<u32> = Vec::new(); v.len(); assert_eq!(1, 1); }\n",
+        )]);
+        let out = callers(&g, "len", false);
+        if out.contains("classified external") {
+            assert!(
+                out.contains("undescended region"),
+                "the external branch must disclose too: {out}"
+            );
+        }
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -38,14 +38,26 @@ pub fn extract(src: &str) -> Result<FileFacts> {
 /// machinery built to make missing edges enumerable, so the regions are
 /// counted even though their contents cannot be.
 ///
-/// Every macro invocation counts, including those whose token tree holds no
-/// calls. Filtering to the ones that "look like they contain a call" would put
-/// a guess inside the single mechanism that exists to avoid guessing, and the
-/// filter would itself be unverifiable. The cost is a larger number than
-/// strictly necessary; the benefit is that it is a fact.
+/// Invocations whose token tree holds no calls are counted too. Filtering to
+/// the ones that "look like they contain a call" would put a guess inside the
+/// single mechanism that exists to avoid guessing, and the filter would itself
+/// be unverifiable.
 ///
-/// On ripgrep this counts 3549 regions, which is the scale behind
-/// `ctx callers arg` reporting 2 callers where ~357 real call sites exist.
+/// The count is a FLOOR, not a total, and in two directions at once. It is
+/// high because an invocation containing no call still counts. It is low
+/// because a nested invocation is not a node: the inner `format!` in
+///
+///     println!("{}", format!("{}", a()));
+///
+/// lives inside the outer macro's token tree, so this reports 1 region where
+/// two were written. Both errors are acceptable here and neither is
+/// correctable without parsing token trees as code, which is the thing ctx
+/// declines to do. What matters is that the number is never zero when regions
+/// were skipped — the claim it qualifies is "something was not entered", not
+/// "exactly this many things".
+///
+/// On ripgrep this reports 3549 regions, which is the scale behind
+/// `ctx callers arg` returning 2 callers where ~357 real call sites exist.
 fn count_macro_invocations(root: Node) -> usize {
     let mut n = 0;
     let mut stack = vec![root];

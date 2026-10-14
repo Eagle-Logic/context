@@ -231,6 +231,41 @@ impl Lang {
         }
     }
 
+    /// Compile-time proof that [`Lang::ALL`] lists every variant.
+    ///
+    /// `name`, `sep` and `exts` are exhaustive matches, so a new variant fails
+    /// to compile in each. `ALL` is a hand-written array, so it does not — and
+    /// everything routes through it: `from_ext`, `all_exts`, `--lang code`.
+    ///
+    /// A variant missing from `ALL` fails silently and completely. `from_ext`
+    /// returns `None` for its extensions, so `source_files` never walks those
+    /// files, `build_graph` skips them, `unsupported_census` reports the
+    /// language as a *blind spot*, `--lang code` excludes it, and `--lang <it>`
+    /// yields an empty graph. No error anywhere.
+    ///
+    /// Tests cannot catch this, which is the point of doing it here: every
+    /// test iterates `ALL`, so an entry that was never added is invisible to
+    /// all of them. This match is exhaustive, so adding a variant forces an
+    /// arm; the arm indexes `ALL`, so if `ALL` was not grown the index is out
+    /// of bounds on a fixed-size array and rustc rejects it outright. Both
+    /// halves of the mistake become compile errors.
+    //
+    // Verified by adding a sixth variant: omitting the arm gives E0004, and an
+    // arm pointing past the end of `ALL` gives "index out of bounds: the
+    // length is 5 but the index is 5" under the deny-by-default
+    // `unconditional_panic` lint. Never called — the guarantee is a property
+    // of compiling the body, not of running it.
+    #[allow(dead_code)]
+    const fn all_is_exhaustive(self) -> &'static Lang {
+        match self {
+            Lang::Rust => &Lang::ALL[0],
+            Lang::Python => &Lang::ALL[1],
+            Lang::TypeScript => &Lang::ALL[2],
+            Lang::Go => &Lang::ALL[3],
+            Lang::Markdown => &Lang::ALL[4],
+        }
+    }
+
     /// The language that parses `ext`, or `None` if none does.
     ///
     /// `ext` is the bare extension, without a leading dot.
@@ -432,6 +467,22 @@ mod tests {
                     lang.name()
                 );
             }
+        }
+    }
+
+    /// The compile-time check guarantees `ALL` has an entry per variant; this
+    /// guarantees each arm points at its OWN entry. A transposed index would
+    /// otherwise satisfy the compiler and silently mis-order the array that
+    /// `all_exts` and the `doctor` footer are built from.
+    #[test]
+    fn each_language_maps_to_its_own_slot_in_all() {
+        for l in Lang::ALL {
+            assert_eq!(
+                l.all_is_exhaustive().name(),
+                l.name(),
+                "the ALL arm for {} points at the wrong entry",
+                l.name()
+            );
         }
     }
 

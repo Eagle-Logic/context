@@ -47,13 +47,27 @@ fi
 # one, and the `got` recall row was corrected in a later commit. A measured
 # number from a stale binary is worse than no number, because it looks exactly
 # like a real one.
-if [ -d "$ROOT/src" ]; then
-  stale=$(find "$ROOT/src" -name '*.rs' -newer "$CTX" -print -quit 2>/dev/null || true)
-  if [ -n "$stale" ]; then
-    echo "stale binary: $stale is newer than $CTX" >&2
-    echo "run: cargo build --release --locked" >&2
-    exit 1
+#
+# Cargo.toml and Cargo.lock count, not just sources. A grammar bump changes
+# measured recall without touching a single .rs file — which is exactly the
+# 0.24.0 failure this guard exists to prevent, and a src-only check would have
+# sailed straight past it. A version-only Cargo.toml bump also makes the
+# `ctx version:` stamp below wrong, and that is precisely when the release
+# convention says to regenerate.
+stale=""
+for f in "$ROOT/Cargo.toml" "$ROOT/Cargo.lock"; do
+  if [ -f "$f" ] && [ "$f" -nt "$CTX" ]; then
+    stale="$f"
+    break
   fi
+done
+if [ -z "$stale" ] && [ -d "$ROOT/src" ]; then
+  stale=$(find "$ROOT/src" -name '*.rs' -newer "$CTX" -print -quit 2>/dev/null || true)
+fi
+if [ -n "$stale" ]; then
+  echo "stale binary: $stale is newer than $CTX" >&2
+  echo "run: cargo build --release --locked" >&2
+  exit 1
 fi
 
 # The `grep --include` list, read from the binary instead of restated here.
