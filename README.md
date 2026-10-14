@@ -20,13 +20,17 @@ and it builds in ~100 ms, so every query runs against current source.
 $ ctx callers resolve_call
 1 caller(s) of 'resolve_call':
 
-extract::Walk::rec  (src/extract/mod.rs:2265-2359  #ab0418a77d9f)  → resolve_call
+extract::Walk::rec  (src/extract/mod.rs:2368-2462  #ab0418a77d9f)  → resolve_call
 
-completeness: no call site named `resolve_call` went unresolved anywhere in this
-tree — this blast radius is complete to the limit of what ctx parses.
+completeness: no call site named `resolve_call` went unresolved anywhere in this tree —
+this blast radius is complete to the limit of what ctx parses. At least 1005 undescended region(s) in this tree were not read; see `ctx doctor`.
 ```
 
-That last line is the whole idea. **Every other code graph tells you what it
+That last line is the whole idea, and it does two jobs. It claims completeness
+for what ctx read, and it bounds that claim by counting what it never read —
+macro bodies and `static`/`const` initializers, whose contents are not parsed as
+code. A call hiding in one is absent rather than unresolved, so nothing else
+would have revealed it. **Every other code graph tells you what it
 found. `ctx` tells you what it missed** — per edge, in aggregate, and with the
 grep list to check it yourself.
 
@@ -45,7 +49,7 @@ Including the row where it finds a limitation in ctx.
 
 **→ [What the integration itself costs](#measuring-what-it-costs)** — ctx's own
 MCP tool definitions sit in every turn whether a tool is ever called or not,
-which makes them 2.2× the standing cost of the CLI instructions block. That is
+which makes them 2.4× the standing cost of the CLI instructions block. That is
 the shape this project objects to, measured on itself.
 
 ## Four things you won't find elsewhere
@@ -62,18 +66,19 @@ branch of a dynamic-dispatch fan-out is marked `*`. And `ctx doctor` names
 
 ```
 ## Internal recall — the number to trust
-  1355/1422 = 95.3%   of call sites that could be internal, ctx pinned this many.
+  1397/1467 = 95.2%   of call sites that could be internal, ctx pinned this many.
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
-     45  walk
+     49  walk
       9  context
+      3  est_tokens
       3  path
-      2  est_tokens
 
 ## Low-confidence zones (edges to distrust — grep to confirm)
   parity                           18% heuristic (11/61 edges)
   refactor                         5% heuristic (1/20 edges)
+  crate                            4% heuristic (6/154 edges)
 ```
 
 The recall number comes with the exact grep list for everything it doesn't
@@ -448,6 +453,13 @@ used to make one module unreachable and silently drop its reverse edges. Code no
 keeps the bare name, prose is renamed to `name@stem`, and every rename is reported
 on stderr.
 
+`ctx supported-exts` prints every extension ctx parses, one per line, and
+`--code` drops Markdown. It is the machine-readable form of the
+`(supported: …)` line in `ctx doctor`, and it exists so tooling derives the set
+instead of restating it — `bench/run.sh` builds its `grep --include` list from
+it. A restated copy is how the benchmark harness came to measure JavaScript
+repos without opening their `.js` files.
+
 ### Execution tracing
 
 `callers` answers "who calls this" for exactly one hop. `trace` walks the call
@@ -791,10 +803,10 @@ turn whether or not a tool is ever called:
 
 | | resident tokens |
 |---|---|
-| `ctx snippet` block | **616** |
-| MCP tool definitions (10 tools) | **1,363** |
+| `ctx snippet` block | **617** |
+| MCP tool definitions (10 tools) | **1,485** |
 
-2.2x, before either has answered anything. An MCP tool list is itself a blob
+2.4x, before either has answered anything. An MCP tool list is itself a blob
 injected at boot — the shape this project objects to — so the honest advice is
 to use MCP when you want structured calls and no shell permission prompts, and
 the CLI when you want the cheapest possible standing cost.
@@ -1124,23 +1136,34 @@ the value. `src/extract/python.rs` is the smallest complete example and the
 template worth copying; note that `TypeEnv` (local-binding type tracking) is
 deliberately per-language, not shared, so that part is written fresh each time.
 
-**2. Add the `Lang` variant**, then run `cargo check`. Nine exhaustive matches
+**2. Add the `Lang` variant**, then run `cargo check`. Eleven exhaustive matches
 will fail to compile, and each is a real decision:
 
 | site | decision |
 |---|---|
+| `model.rs` `Lang::name()` | display string |
+| `model.rs` `Lang::sep()` | path separator (`::` vs `.`) |
+| `model.rs` `Lang::exts()` | your file extensions — the single definition every other site derives from |
+| `model.rs` `Lang::all_is_exhaustive()` | forces the variant into `Lang::ALL`; see below |
 | `extract/mod.rs` `build_graph` | call your `extract()` |
 | `extract/mod.rs` `module_name` stem collapse | which filename collapses to its directory (`mod`/`lib`/`main`, `__init__`, `index`; nothing, in Go) |
 | `extract/mod.rs` `module_name` root | the name of the root module (`crate` vs `root`) |
 | `extract/mod.rs` `candidates()` | import string → absolute module segments — by name (Rust/Python), by path (TypeScript), or from a manifest (Go's `go.mod`) |
 | `extract/mod.rs` `filter_note()` | how `--lang` describes your language |
-| `main.rs` `LangArg` | the `--lang` value, and whether `--lang code` includes it |
-| `model.rs` `Lang::name()` | display string |
-| `model.rs` `Lang::sep()` | path separator (`::` vs `.`) |
 | `query.rs` fence | the language tag for `--include-source` code fences |
 | `view.rs` `is_public()` | what "public" means: a keyword, a naming convention, an `export`, a capital letter |
 
 Only `candidates()` and the visibility rule are real design work.
+
+`Lang::ALL` is worth a note of its own. It is a hand-written array, and
+`from_ext`, `all_exts` and `--lang code` all route through it — so a variant
+missing from it fails silently and completely: the walk never takes your files,
+`ctx doctor` reports your language as a *blind spot*, and `--lang <yours>`
+returns an empty graph, with no error anywhere. No test can catch it, because
+every test iterates `ALL`. `Lang::all_is_exhaustive()` closes it at compile
+time instead: omitting its arm is a non-exhaustive match, and an arm indexing
+past the end of `ALL` is rejected outright by the deny-by-default
+`unconditional_panic` lint.
 
 **If your language's module is not the file**, budget for more than an extractor.
 A directory-scoped language (Go) needs `resolve_name` set to the package, a
@@ -1149,16 +1172,23 @@ than the one that sorts first, and same-package lookup for bare names — see
 `go_packages`, `go_match` and `go_sibling`. That was the bulk of Go's work, and
 none of it is in the extractor.
 
-**3. Four places the compiler will _not_ catch** — each has a `_` fallback, so
-missing one fails silently rather than loudly:
+**3. Three places the compiler will _not_ catch** — each has a `_` fallback, or
+no match on `Lang` at all, so missing one fails silently rather than loudly:
 
-- the extension allowlist in `build_graph` — miss it and your files are never
-  walked, and the map is simply empty
-- the extension → `Lang` mapping (`_ => continue`)
-- `is_package` (`_ => false`)
-- `NON_SOURCE_EXTS` and the `supported` list in `unsupported_census` — miss
-  either and `ctx doctor` keeps reporting the language as a blind spot after
-  you have added it, or stops reporting a genuine one
+- `main.rs` `LangArg` — a *separate* enum, so adding a `Lang` variant does not
+  force an arm here. Miss it and there is no `--lang <yours>` selector at all,
+  though `--lang code` does include your language automatically, because that
+  list is derived from `Lang::ALL`
+- `is_package` (`_ => false`) — whether one of your filenames means "this
+  directory", the way `mod.rs` and `__init__.py` do
+- `NON_SOURCE_EXTS` — if one of your extensions sits in that denylist, `ctx
+  doctor` will not report it as a blind spot while your extractor is still
+  missing, so a half-finished language looks finished
+
+The extension allowlist in `build_graph`, the extension → `Lang` mapping, and
+the `supported` list in `unsupported_census` were all on this list until they
+drifted apart and published four wrong benchmark rows. All three derive from
+`Lang::exts()` now, so they fail loudly instead of quietly.
 
 Grammars are compiled into the binary, so a new grammar crate is a real
 binary-size decision, not just a dependency.
