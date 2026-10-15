@@ -106,6 +106,10 @@ jobs:
       # debug build would produce the same text more slowly.
       - run: cargo build --release --locked
       - run: python3 scripts/regen-examples.py --check
+      # The README's standing-cost table moved four times in one day — 2.2x,
+      # 2.4x, 2.6x, 2.8x — as tools gained ceilings and the server gained
+      # instructions. Each move needed someone to remember a Markdown edit.
+      - run: python3 scripts/check-readme-figures.py
 
   dogfood:
     name: dogfood (ctx on ctx)
