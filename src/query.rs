@@ -1358,6 +1358,7 @@ fn source_span(root: &str, file: &str, line: usize, end_line: usize, lang: Lang)
         Lang::Python => "python",
         Lang::TypeScript => "typescript",
         Lang::Go => "go",
+        Lang::Java => "java",
         Lang::Markdown => "markdown",
     };
     Some(format!("```{fence}\n{}\n```\n", lines[from..to].join("\n")))

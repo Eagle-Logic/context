@@ -220,6 +220,22 @@ pub fn is_public(it: &Item, lang: Lang) -> bool {
         // Exported top-level items are prefixed `export`; a non-exported
         // top-level declaration starts with a declaration keyword. Anything
         // else (a public class method like `compute()`) is interface.
+        // A keyword prefix, like Rust — but `public` is the only one that
+        // crosses a package boundary. Package-private (no modifier) is the
+        // Java default and is NOT API, which is the same trap `pub(crate)` is
+        // in Rust: counting it would pad `--view interface` and make
+        // `changed --api` report breaking changes over package-internal edits.
+        //
+        // `protected` is deliberately included: it is part of the contract a
+        // subclass outside the package depends on, so removing one breaks
+        // callers the same way removing a `public` does.
+        Lang::Java => {
+            let s = it.signature.as_str();
+            s.starts_with("public")
+                || s.starts_with("protected")
+                || s.contains(" public ")
+                || s.contains(" protected ")
+        }
         Lang::TypeScript => {
             let s = it.signature.as_str();
             s.starts_with("export")

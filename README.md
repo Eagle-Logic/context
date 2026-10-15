@@ -12,7 +12,7 @@ here, what breaks if I change it, what must a move touch, does my port still
 match the original.*
 
 One Rust binary. Tree-sitter for Rust, Python, TypeScript/TSX, JavaScript/JSX,
-Go, and Markdown. No language servers, no embeddings, no index to warm. The
+Go, Java, and Markdown. No language servers, no embeddings, no index to warm. The
 graph is a pure function of the source tree — same code in, same answer out —
 and it builds in ~100 ms, so every query runs against current source.
 
@@ -229,7 +229,7 @@ Against it, `ctx` trades semantic precision for two things:
 | startup | ~100 ms graph build, per query | server warm-up, project indexing |
 | determinism | pure function of the source tree | depends on server state, versions, build artifacts |
 | uncertainty | marked per edge (`~`, `*`) + a miss census | resolved or absent, silently |
-| coverage | 6 languages (today), one graph across all of them | as many as you install servers for |
+| coverage | 7 languages (today), one graph across all of them | as many as you install servers for |
 
 If you need type-perfect resolution inside one language, use an LSP. If you
 want the same graph across a polyglot repo with nothing to install and answers
@@ -813,7 +813,7 @@ what the rest of this README argues. Both the tool definitions and the server's
 
 | | resident tokens |
 |---|---|
-| `ctx snippet` block | **582** |
+| `ctx snippet` block | **583** |
 | MCP tool definitions (10 tools) | 1,485 |
 | MCP server instructions | 153 |
 | **MCP total** | **1,638** |

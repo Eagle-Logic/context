@@ -176,6 +176,15 @@ pub struct FileFacts {
     /// unconditional total in [`FileFacts::undescended`] is what `ctx doctor`
     /// reports, and it is unaffected by this.
     pub undescended_mentions: BTreeMap<String, usize>,
+    /// The module path this file declares for itself, overriding the one the
+    /// path implies.
+    ///
+    /// Java is the first language here that needs it: `package com.foo;` plus
+    /// the type name is the fully-qualified name every import spells, and the
+    /// path only mirrors that by Maven convention. Trusting the path would
+    /// produce `service_a.src.main.java.com.foo.Bar` in a multi-module build —
+    /// a name no import can match, so no edge could ever resolve.
+    pub declared_module: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +194,7 @@ pub enum Lang {
     Python,
     TypeScript,
     Go,
+    Java,
     Markdown,
 }
 
@@ -195,6 +205,7 @@ impl Lang {
             Lang::Python => "python",
             Lang::TypeScript => "typescript",
             Lang::Go => "go",
+            Lang::Java => "java",
             Lang::Markdown => "markdown",
         }
     }
@@ -207,7 +218,7 @@ impl Lang {
     pub fn sep(self) -> &'static str {
         match self {
             Lang::Rust => "::",
-            Lang::Python | Lang::TypeScript | Lang::Go | Lang::Markdown => ".",
+            Lang::Python | Lang::TypeScript | Lang::Go | Lang::Java | Lang::Markdown => ".",
         }
     }
 
@@ -219,11 +230,12 @@ impl Lang {
     /// [`Lang::name`], so that is alphabetical (`markdown 4, rust 15`) — and
     /// not the order `--lang` reports either, which echoes what the caller
     /// typed.
-    pub const ALL: [Lang; 5] = [
+    pub const ALL: [Lang; 6] = [
         Lang::Rust,
         Lang::Python,
         Lang::TypeScript,
         Lang::Go,
+        Lang::Java,
         Lang::Markdown,
     ];
 
@@ -248,6 +260,7 @@ impl Lang {
             Lang::Python => &["py"],
             Lang::TypeScript => &["ts", "tsx", "js", "jsx", "mjs", "cjs"],
             Lang::Go => &["go"],
+            Lang::Java => &["java"],
             Lang::Markdown => &["md", "markdown"],
         }
     }
@@ -283,7 +296,8 @@ impl Lang {
             Lang::Python => &Lang::ALL[1],
             Lang::TypeScript => &Lang::ALL[2],
             Lang::Go => &Lang::ALL[3],
-            Lang::Markdown => &Lang::ALL[4],
+            Lang::Java => &Lang::ALL[4],
+            Lang::Markdown => &Lang::ALL[5],
         }
     }
 
@@ -518,7 +532,7 @@ mod tests {
 
     #[test]
     fn unknown_extensions_resolve_to_nothing() {
-        for ext in ["cpp", "java", "cs", "rb", "", "RS"] {
+        for ext in ["cpp", "cs", "rb", "", "RS"] {
             assert!(Lang::from_ext(ext).is_none(), ".{ext} must not be claimed");
         }
     }
