@@ -197,7 +197,14 @@ impl Lang {
         }
     }
 
-    /// Every language, in the order `doctor` and `--lang` report them.
+    /// Every language, in the order [`Lang::all_exts`] emits extensions.
+    ///
+    /// That order reaches exactly two places: the `(supported: ...)` footer on
+    /// `ctx doctor` and the `Searched:` line in BENCHMARK.md. It is NOT the
+    /// order `doctor` lists languages — `coverage_report` keys a `BTreeMap` on
+    /// [`Lang::name`], so that is alphabetical (`markdown 4, rust 15`) — and
+    /// not the order `--lang` reports either, which echoes what the caller
+    /// typed.
     pub const ALL: [Lang; 5] = [
         Lang::Rust,
         Lang::Python,
