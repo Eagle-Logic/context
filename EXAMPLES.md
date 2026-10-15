@@ -12,7 +12,7 @@ current — this file had drifted a whole minor version before anyone noticed.
 Regenerate it in the release commit instead.
 
 The repo under analysis: **15 Rust files, 4 Markdown files, 2 Python files, 21 modules,
-6,554 call sites.** Small enough to read in a sitting, which makes it a fair place to
+6,628 call sites.** Small enough to read in a sitting, which makes it a fair place to
 check whether the answers are actually right.
 
 Timings are best-of-five on a warm page cache. The graph is rebuilt from source
@@ -33,17 +33,18 @@ it is precise where a text grep floods.
 
 ```
 $ ctx callers coverage_report
-9 caller(s) of 'coverage_report':
+10 caller(s) of 'coverage_report':
 
 mcp::dispatch  (src/mcp.rs:485-676  #d4e2b7020c89)  → query::coverage_report
-query::tests::a_broken_link_reports_its_own_line_not_its_headings  (src/query.rs:3414-3426  #f94b64f4da35)  → coverage_report
-query::tests::coverage_separates_internal_external_and_blind_spots  (src/query.rs:3560-3571  #adf073f295c1)  → coverage_report
-query::tests::doctor_footer_lists_every_supported_extension  (src/query.rs:3550-3557  #38fa4b0b746a)  → coverage_report
-query::tests::doctor_json_carries_the_undescended_counts  (src/query.rs:3522-3528  #0185c75f6370)  → coverage_report
-query::tests::doctor_names_what_it_could_not_pin  (src/query.rs:2555-2564  #6cd4660b675e)  → coverage_report
-query::tests::doctor_recall_excludes_provably_external_calls  (src/query.rs:2530-2542  #6c3b7200040d)  → coverage_report
-query::tests::doctor_separates_undescended_regions_from_blind_spots  (src/query.rs:3531-3544  #7f365f67e68f)  → coverage_report
-query::tests::markdown_links_resolve_headings_and_flag_broken  (src/query.rs:3387-3411  #839e24537089)  → coverage_report
+query::tests::a_broken_link_reports_its_own_line_not_its_headings  (src/query.rs:3447-3459  #f94b64f4da35)  → coverage_report
+query::tests::a_region_that_does_not_name_the_symbol_stays_silent  (src/query.rs:3496-3512  #03b9d31eb397)  → coverage_report
+query::tests::coverage_separates_internal_external_and_blind_spots  (src/query.rs:3620-3631  #adf073f295c1)  → coverage_report
+query::tests::doctor_footer_lists_every_supported_extension  (src/query.rs:3610-3617  #38fa4b0b746a)  → coverage_report
+query::tests::doctor_json_carries_the_undescended_counts  (src/query.rs:3582-3588  #0185c75f6370)  → coverage_report
+query::tests::doctor_names_what_it_could_not_pin  (src/query.rs:2588-2597  #6cd4660b675e)  → coverage_report
+query::tests::doctor_recall_excludes_provably_external_calls  (src/query.rs:2563-2575  #6c3b7200040d)  → coverage_report
+query::tests::doctor_separates_undescended_regions_from_blind_spots  (src/query.rs:3591-3604  #7f365f67e68f)  → coverage_report
+query::tests::markdown_links_resolve_headings_and_flag_broken  (src/query.rs:3420-3444  #839e24537089)  → coverage_report
 
 completeness: no call site named `coverage_report` went unresolved anywhere in this tree —
 this blast radius is complete to the limit of what ctx parses. 1 undescended region(s) mention `coverage_report` and were not read; grep it to rule them out, and see `ctx doctor`.
@@ -69,7 +70,7 @@ crate::main  [src/main.rs:507]
     → mcp::handle_method  [src/mcp.rs:260]
       → mcp::tools_call  [src/mcp.rs:469]
         → mcp::dispatch  [src/mcp.rs:485]
-          → query::coverage_report  [src/query.rs:1870]
+          → query::coverage_report  [src/query.rs:1903]
 ```
 
 ---
@@ -85,19 +86,19 @@ $ ctx trace build_graph --depth 2
 ~ heuristic edge (verify) · * one branch of a dispatch fan-out
 
 extract::build_graph  [src/extract/mod.rs:237]  [+1 outside graph]
-├─ extract::disambiguate_module_names  [src/extract/mod.rs:377]
+├─ extract::disambiguate_module_names  [src/extract/mod.rs:378]
 ├─ extract::go::extract  [src/extract/go.rs:9]  [+1 outside graph]
 │  ├─ extract::go::function  [src/extract/go.rs:669]  (depth limit)
 │  ├─ extract::go::imports  [src/extract/go.rs:238]  (depth limit)
 │  ├─ extract::go::interfaces_in  [src/extract/go.rs:168]  (depth limit)
-│  ├─ model::content_hash  [src/model.rs:290]
+│  ├─ model::content_hash  [src/model.rs:311]
 │  ├─ extract::go::package_level_item  [src/extract/go.rs:197]  (depth limit)
 │  ├─ extract::go::receiver_of_method  [src/extract/go.rs:499]  (depth limit)
 │  ├─ extract::go::returns_in  [src/extract/go.rs:115]  (depth limit)
 │  ├─ extract::go::types  [src/extract/go.rs:320]  (depth limit)
 │  └─ extract::go::values  [src/extract/go.rs:468]  (depth limit)
-├─ extract::go_modules  [src/extract/mod.rs:962]
-│  ├─ extract::go_segs  [src/extract/mod.rs:950]
+├─ extract::go_modules  [src/extract/mod.rs:963]
+│  ├─ extract::go_segs  [src/extract/mod.rs:951]
 │  └─ extract::walker  [src/extract/mod.rs:120]  (depth limit)
 ├─ extract::markdown::extract  [src/extract/markdown.rs:45]  [+1 outside graph]
 │  ├─ extract::markdown::assign_lines  [src/extract/markdown.rs:139]  (depth limit)
@@ -114,26 +115,26 @@ extract::build_graph  [src/extract/mod.rs:237]  [+1 outside graph]
 │  ├─ extract::markdown::setext_heading  [src/extract/markdown.rs:296]
 │  ├─ extract::markdown::slug  [src/extract/markdown.rs:13]
 │  └─ extract::markdown::strip_inline  [src/extract/markdown.rs:460]
-├─ extract::module_name  [src/extract/mod.rs:606]
-│  └─ model::Lang::sep  [src/model.rs:193]
-├─ extract::nearest_go_module  [src/extract/mod.rs:1007]
+├─ extract::module_name  [src/extract/mod.rs:607]
+│  └─ model::Lang::sep  [src/model.rs:207]
+├─ extract::nearest_go_module  [src/extract/mod.rs:1008]
 ├─ extract::needs_jsx  [src/extract/mod.rs:233]
 ├─ extract::python::extract  [src/extract/python.rs:9]  [+1 outside graph]
 │  ├─ extract::python::module_level_item  [src/extract/python.rs:35]  (depth limit)
 │  └─ extract::python::visit  [src/extract/python.rs:73]  (depth limit)
-├─ extract::resolve_deps  [src/extract/mod.rs:681]
-│  ├─ extract::apply_calls  [src/extract/mod.rs:2518]  (depth limit)
-│  ├─ extract::build_universe  [src/extract/mod.rs:1528]  (depth limit)
-│  ├─ extract::compute_calls  [src/extract/mod.rs:2345]  (depth limit)
-│  ├─ extract::display_reexport  [src/extract/mod.rs:2535]  (depth limit)
-│  ├─ extract::go_mod_index  [src/extract/mod.rs:1024]
-│  ├─ extract::go_packages  [src/extract/mod.rs:1068]  (depth limit)
-│  ├─ model::Module::resolve_segs~  [src/model.rs:431]  (depth limit)
-│  └─ extract::resolve_from  [src/extract/mod.rs:1198]  (depth limit)
+├─ extract::resolve_deps  [src/extract/mod.rs:682]
+│  ├─ extract::apply_calls  [src/extract/mod.rs:2519]  (depth limit)
+│  ├─ extract::build_universe  [src/extract/mod.rs:1529]  (depth limit)
+│  ├─ extract::compute_calls  [src/extract/mod.rs:2346]  (depth limit)
+│  ├─ extract::display_reexport  [src/extract/mod.rs:2536]  (depth limit)
+│  ├─ extract::go_mod_index  [src/extract/mod.rs:1025]
+│  ├─ extract::go_packages  [src/extract/mod.rs:1069]  (depth limit)
+│  ├─ model::Module::resolve_segs~  [src/model.rs:452]  (depth limit)
+│  └─ extract::resolve_from  [src/extract/mod.rs:1199]  (depth limit)
 ├─ extract::rust::extract  [src/extract/rust.rs:9]  [+1 outside graph]
-│  ├─ extract::rust::count_macro_invocations  [src/extract/rust.rs:61]
-│  └─ extract::rust::visit  [src/extract/rust.rs:123]  (depth limit)
-├─ extract::slash_path  [src/extract/mod.rs:576]
+│  ├─ extract::rust::scan_macro_invocations  [src/extract/rust.rs:62]  (depth limit)
+│  └─ extract::rust::visit  [src/extract/rust.rs:177]  (depth limit)
+├─ extract::slash_path  [src/extract/mod.rs:577]
 ├─ extract::source_files  [src/extract/mod.rs:153]
 │  ├─ extract::lang_selected  [src/extract/mod.rs:142]  (depth limit)
 │  └─ extract::walker  [src/extract/mod.rs:120]  (depth limit)
@@ -265,16 +266,16 @@ $ ctx doctor
 Modules: 21  (markdown 4, python 2, rust 15)
 
 ## Internal recall — the number to trust
-  1408/1479 = 95.2%   of call sites that could be internal, ctx pinned this many.
+  1417/1488 = 95.2%   of call sites that could be internal, ctx pinned this many.
 
 A call site is "could be internal" when the callee name is defined somewhere
 under this root. Calls into std or a third-party crate are excluded, because no
 internal edge could exist for them however good the resolver gets.
 
 ## Every call site, bucketed
-call sites:            6554
-  internal edges:      1408   [25 heuristic (~), 0 dispatch fan-out (*)]
-  external (provable): 5075   (77.4%)  callee defined nowhere here — std/extern
+call sites:            6628
+  internal edges:      1417   [28 heuristic (~), 0 dispatch fan-out (*)]
+  external (provable): 5140   (77.5%)  callee defined nowhere here — std/extern
   unresolved internal: 71     (1.1%)  the real misses — see below
 
 ## What ctx missed (callee names that exist here but went unpinned)
@@ -301,13 +302,13 @@ grep these; every other edge in the map is one ctx could prove.
 
 ## Low-confidence zones (edges to distrust — grep to confirm)
   parity                           18% heuristic (11/61 edges)
+  crate                            6% heuristic (9/157 edges)
   refactor                         5% heuristic (1/20 edges)
-  crate                            4% heuristic (6/154 edges)
   extract                          1% heuristic (3/223 edges)
-  query                            0% heuristic (1/256 edges)
+  query                            0% heuristic (1/260 edges)
 
 ## Not descended into (regions never read as code)
-  macro invocation         1004   in 15 module(s)
+  macro invocation         1011   in 15 module(s)
   module-level initializer     10   in 8 module(s)
   A call site inside one of these was never seen. It is absent, not
   unresolved, so it appears in NEITHER side of the recall figure above —
@@ -323,7 +324,7 @@ grep these; every other edge in the map is one ctx could prove.
 95.2% recall comes with **the exact grep list for the other 4.8%** — nine
 names, with counts and the modules they live in.
 
-The denominator is honest too. 5,075 of 6,554 call sites go into `std` or a
+The denominator is honest too. 5,140 of 6,628 call sites go into `std` or a
 third-party crate, where no internal edge could ever exist, so they're excluded
 rather than quietly inflating the percentage. That classification is by evidence
 — *is this name defined anywhere under the root?* — not a hardcoded list.
@@ -351,7 +352,7 @@ Ranked by dependency centrality (PageRank); higher = more depended-upon.
   0.1447    11    1  extract  [103 items]
   0.0570     4    2  render  [13 items]
   0.0444     3    3  view  [11 items]
-  0.0425     2    4  query  [151 items]
+  0.0425     2    4  query  [153 items]
   0.0365     1    0  BENCHMARK  [4 items]
   0.0365     1    0  EXAMPLES  [13 items]
   0.0256     0    0  SECURITY  [6 items]
@@ -375,7 +376,7 @@ Jump-to-def without knowing the file, across languages.
 $ ctx def Universe
 1 definition(s) of 'Universe':
 
-extract::Universe   [struct]   src/extract/mod.rs:1509-1526  #85eadbaee90b
+extract::Universe   [struct]   src/extract/mod.rs:1510-1527  #85eadbaee90b
     struct Universe { methods: MethodIndex, all_names: BTreeSet<String>, module_segs: BTreeSet<String>, implementors: HashMap<String, BTreeSet<(String, String)>>, fields: HashMap<String, BTreeMap<String, String>> }  — Whole-tree symbol evidence, built once and shared by every module's
 ```
 
@@ -395,18 +396,18 @@ $ ctx context signature_types
 # Context: query::signature_types
 
 ## Definition
-query::signature_types   [fn]   src/query.rs:1190-1209  #4ac8c94b6d61
+query::signature_types   [fn]   src/query.rs:1196-1215  #4ac8c94b6d61
     fn signature_types<'a>( sig: &str, self_name: &str, idx: &'a HashMap<String, DefLite>, ) -> Vec<&'a DefLite>  — The type-like definitions referenced by a signature: PascalCase
 
 ## Signature types
-- query::DefLite [struct]  src/query.rs:1067-1081  #c81b24d6be3b
+- query::DefLite [struct]  src/query.rs:1073-1087  #c81b24d6be3b
     struct DefLite { qualname: String, kind: String, file: String, line: usize, end_line: usize, hash: String, doc: Option<String>, signature: String, lang: Lang }
 
 ## Calls — dependencies (1, sites in src/query.rs)
-- identifiers  @ 1195
+- identifiers  @ 1201
 
 ## Callers — dependents (1)
-- query::context  (src/query.rs:1355-1645  #a3aa6d8a0554)  @ 1400, 1481
+- query::context  (src/query.rs:1387-1678  #b4f89fdba932)  @ 1432, 1514
 
 completeness: no call site named `signature_types` went unresolved anywhere in this tree —
 this caller list is complete to the limit of what ctx parses. 1 undescended region(s) mention `signature_types` and were not read; grep it to rule them out, and see `ctx doctor`.
@@ -427,7 +428,7 @@ $ ctx context Receiver --include-source
 # Context: model::Receiver
 
 ## Definition
-model::Receiver   [enum]   src/model.rs:378-407  #eaedf052414f
+model::Receiver   [enum]   src/model.rs:399-428  #eaedf052414f
     pub enum Receiver { Free | SelfType | SelfField | Typed | Dyn | Returned | Unknown }  — How a callee was referenced — governs how confidently a receiver method
 
 ```rust
@@ -464,7 +465,7 @@ pub enum Receiver {
 ```
 
 ## Referenced by — dependents (14 signature(s))
-- extract  (src/extract/mod.rs:1951)
+- extract  (src/extract/mod.rs:1952)
     fn field_receiver(ty: &str, uni: &Universe) -> Receiver
 - extract::go  (src/extract/go.rs:520)
     struct TypeEnv { vars: HashMap<String, Receiver> }
@@ -482,15 +483,15 @@ pub enum Receiver {
     fn new_arg_type(v: Node, src: &str, ifaces: &BTreeSet<String>) -> Option<Receiver>
 - extract::go  (src/extract/go.rs:965)
     let push = |path: String, recv: Receiver, out: &mut Vec<RawCall>|
-- extract::rust  (src/extract/rust.rs:246)
+- extract::rust  (src/extract/rust.rs:300)
     struct TypeEnv { vars: HashMap<String, Receiver> }
-- extract::rust  (src/extract/rust.rs:350)
+- extract::rust  (src/extract/rust.rs:404)
     fn classify_type(raw: &str, generics: &HashMap<String, String>) -> Option<Receiver>
-- extract::rust  (src/extract/rust.rs:582)
+- extract::rust  (src/extract/rust.rs:636)
     fn let_binding(n: Node, src: &str, env: &TypeEnv) -> Option<(String, Receiver)>
-- extract::rust  (src/extract/rust.rs:680)
+- extract::rust  (src/extract/rust.rs:734)
     fn receiver_of(v: Node, src: &str, env: &TypeEnv) -> Receiver
-- model  (src/model.rs:413)
+- model  (src/model.rs:434)
     pub struct RawCall { pub path: String, pub recv: Receiver, pub line: usize, pub end_line: usize }
 Signature references only: uses inside function BODIES are not indexed.
 
