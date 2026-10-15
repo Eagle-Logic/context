@@ -49,7 +49,7 @@ Including the row where it finds a limitation in ctx.
 
 **→ [What the integration itself costs](#measuring-what-it-costs)** — ctx's own
 MCP tool definitions sit in every turn whether a tool is ever called or not,
-which makes them 2.6× the standing cost of the CLI instructions block. That is
+which makes them 2.8× the standing cost of the CLI instructions block. That is
 the shape this project objects to, measured on itself.
 
 ## Four things you won't find elsewhere
@@ -798,15 +798,17 @@ Each tool takes a `path` argument (default `.`); `def`/`callers`/`context` also
 take `name`, and `subtree` takes `module`.
 
 **It costs more standing context than the CLI**, which is worth knowing given
-what the rest of this README argues. Tool definitions are resident in every
-turn whether or not a tool is ever called:
+what the rest of this README argues. Both the tool definitions and the server's
+`instructions` are resident in every turn whether or not a tool is ever called:
 
 | | resident tokens |
 |---|---|
 | `ctx snippet` block | **582** |
-| MCP tool definitions (10 tools) | **1,485** |
+| MCP tool definitions (10 tools) | 1,485 |
+| MCP server instructions | 153 |
+| **MCP total** | **1,638** |
 
-2.6x, before either has answered anything. An MCP tool list is itself a blob
+2.8x, before either has answered anything. An MCP tool list is itself a blob
 injected at boot — the shape this project objects to — so the honest advice is
 to use MCP when you want structured calls and no shell permission prompts, and
 the CLI when you want the cheapest possible standing cost.
