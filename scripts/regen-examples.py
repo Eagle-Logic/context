@@ -23,6 +23,38 @@ CTX = "./target/release/ctx"
 PINNED = ("changed", "move-plan", "parity")
 CHECK = "--check" in sys.argv
 
+
+def refuse_if_stale() -> None:
+    """Refuse to run against a binary older than the sources.
+
+    `bench/run.sh` has carried this guard since the morning it was written,
+    after a stale binary published two wrong figures. This script was written
+    later, regenerates the other published artifact, and shipped without it —
+    and then did exactly the same thing: switching branches without rebuilding
+    wrote one branch's output into another branch's EXAMPLES.md, and CI caught
+    it rather than a human.
+
+    Cargo.toml and Cargo.lock count too: a grammar bump moves measured output
+    without touching a single .rs file.
+    """
+    ctx = pathlib.Path(CTX)
+    if not ctx.exists():
+        print(f"no binary at {CTX}; cargo build --release --locked", file=sys.stderr)
+        sys.exit(1)
+    cutoff = ctx.stat().st_mtime
+    newer = [
+        str(f)
+        for f in [*pathlib.Path("src").rglob("*.rs"), pathlib.Path("Cargo.toml"), pathlib.Path("Cargo.lock")]
+        if f.exists() and f.stat().st_mtime > cutoff
+    ]
+    if newer:
+        print(f"stale binary: {newer[0]} is newer than {CTX}", file=sys.stderr)
+        print("run: cargo build --release --locked", file=sys.stderr)
+        sys.exit(1)
+
+
+refuse_if_stale()
+
 p = pathlib.Path("EXAMPLES.md")
 lines = p.read_text().split("\n")
 out, i, done, skipped = [], 0, [], []
