@@ -263,6 +263,7 @@ fn handle_method(method: &str, req: &Value) -> Option<Value> {
             "protocolVersion": "2024-11-05",
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "ctx", "version": env!("CARGO_PKG_VERSION") },
+            "instructions": SERVER_INSTRUCTIONS,
         })),
         "tools/list" => Some(json!({ "tools": tools() })),
         "tools/call" => Some(tools_call(req)),
@@ -270,6 +271,27 @@ fn handle_method(method: &str, req: &Value) -> Option<Value> {
         _ => None,
     }
 }
+
+/// What the server says about itself, returned once from `initialize`.
+///
+/// Clients typically fold this into the system prompt, so it is resident per
+/// turn exactly like the tool definitions are — it is not free, and it is
+/// measured alongside them. Every sentence has to earn its place.
+///
+/// It says the two things the tool schemas cannot. First the protocol: reach
+/// for a symbol, not a map, because an agent handed ten tools will otherwise
+/// call the most general one. Second the calibration, which is the whole
+/// reason to prefer ctx over grep and the one thing no tool description has
+/// room to explain — an answer that states its own completeness can be acted
+/// on, and one that does not has to be verified by hand.
+const SERVER_INSTRUCTIONS: &str = "\
+Start from a symbol — `def`, `callers`, `context` — not from `map`.\n\
+\n\
+Every answer states its own completeness. An edge is proven, marked `~` when \
+inferred from a receiver whose type the source never states, marked `*` as one \
+dispatch branch, or absent: a call ctx cannot pin is dropped, never guessed. So \
+`callers` is a floor, not a total — read the completeness line before acting on \
+it, and call `doctor` for every name that went unresolved, each with a grep.";
 
 fn tool(name: &str, desc: &str, props: Value, required: &[&str]) -> Value {
     json!({
@@ -662,6 +684,40 @@ mod tests {
         let r = handle_method("initialize", &json!({"id": 1, "method": "initialize"})).unwrap();
         assert_eq!(r["serverInfo"]["name"], "ctx");
         assert!(r["capabilities"]["tools"].is_object());
+    }
+
+    /// The server had no self-description at all: `serverInfo` carried a name
+    /// and a version, and `instructions` — the one field where a server can
+    /// say what it is for — went unsent. The tool schemas describe ten
+    /// commands without ever saying why an answer from ctx is worth more than
+    /// the same answer from grep.
+    #[test]
+    fn initialize_tells_the_client_what_ctx_is_for() {
+        let r = handle_method("initialize", &json!({"id": 1, "method": "initialize"})).unwrap();
+        let ins = r["instructions"]
+            .as_str()
+            .expect("instructions must be sent");
+        // The protocol, which an agent handed ten tools otherwise ignores.
+        assert!(ins.contains("Start from a symbol"), "{ins}");
+        // The differentiator. No tool description has room for it.
+        assert!(ins.contains("states its own completeness"), "{ins}");
+        assert!(ins.contains("never guessed"), "{ins}");
+        assert!(ins.contains("floor"), "{ins}");
+    }
+
+    /// Clients fold `instructions` into the system prompt, so it is resident
+    /// per turn exactly like the tool definitions. 0.21.1 spent real effort
+    /// trimming that standing cost; this keeps a ceiling on the field that
+    /// could quietly undo it.
+    #[test]
+    fn server_instructions_stay_within_their_budget() {
+        let r = handle_method("initialize", &json!({"id": 1, "method": "initialize"})).unwrap();
+        let ins = r["instructions"].as_str().unwrap();
+        let tokens = crate::est_tokens(ins);
+        assert!(
+            tokens <= 200,
+            "server instructions are resident every turn: {tokens} tokens"
+        );
     }
 
     #[test]
