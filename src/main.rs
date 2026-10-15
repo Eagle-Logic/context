@@ -408,22 +408,34 @@ fn snippet_for(g: &Graph) -> String {
         .sum();
     let prose_pct = (prose_bytes * 100).checked_div(all_bytes).unwrap_or(0);
 
-    let (sites, resolved): (usize, usize) = g.modules.iter().fold((0, 0), |(s, r), m| {
-        (s + m.diag.call_sites, r + m.diag.resolved)
+    // Internal recall — `resolved / (resolved + unresolved)` — and NOT
+    // `resolved / call_sites`, which is what this used to report. That
+    // denominator counts every call into std or a third-party crate, where no
+    // internal edge could ever exist, so it understated the graph by 2-7x on
+    // every repo measured: cobra read 50% at 99.8% recall, ctx itself 21% at
+    // 95.2%. `Diagnostics` has said so in a doc comment the whole time.
+    //
+    // It mattered more here than anywhere else. This block is what an agent
+    // reads before deciding whether to use ctx at all, so a figure that
+    // understates the tool by 4x is the most expensive wrong number in the
+    // project.
+    let (resolved, unresolved): (usize, usize) = g.modules.iter().fold((0, 0), |(r, u), m| {
+        (r + m.diag.resolved, u + m.diag.unresolved)
     });
-    let resolve_pct = (resolved * 100).checked_div(sites).unwrap_or(0);
+    let resolvable = resolved + unresolved;
+    let recall_pct = (resolved * 100).checked_div(resolvable).unwrap_or(0);
 
     let mut out = String::from("<!-- ctx:begin — regenerate with `ctx snippet` -->\n");
     out.push_str("## Codebase Discovery\n\n");
     out.push_str(
-        "`ctx` is a deterministic structural index (Rust/Python/TS/Go/Markdown). Use it to locate \
+        "`ctx` is a deterministic structural index (Rust/Python/TS/JS/Go/Markdown). Use it to locate \
          and orient; read raw files for implementation bodies. `ctx <cmd> --help` for detail.\n\n",
     );
 
     out.push_str(&format!(
         "**This repo:** {modules} modules · unbudgeted map ~{full_tok} tok (skeleton \
-         ~{skeleton_tok}) · {prose_pct}% of the map is prose · {resolve_pct}% of call sites \
-         resolve internally.\n\n"
+         ~{skeleton_tok}) · {prose_pct}% of the map is prose · {recall_pct}% internal recall \
+         ({unresolved} unresolved).\n\n"
     ));
 
     // Targeted lookups lead. An orientation-first protocol reads well and does not
@@ -473,10 +485,16 @@ fn snippet_for(g: &Graph) -> String {
     // Only warn when there is a real measurement to warn about: a repo with no
     // call sites scores 0% and would otherwise be told its call graph is
     // untrustworthy, which is noise, not calibration.
-    if sites >= 50 && resolve_pct < 30 {
+    // Fires on genuinely low recall, not on std-heavy code. At the old
+    // threshold this triggered on ctx (95.2%) and preact (78.1%) while staying
+    // silent on ripgrep (64.9%) — anti-correlated with quality, which is worse
+    // than no signal. `ctx doctor` names every miss, so point at the list
+    // rather than telling the agent to be vaguely suspicious.
+    if resolvable >= 50 && recall_pct < 80 {
         out.push_str(&format!(
-            "Only {resolve_pct}% of call sites resolve internally here, so calibrate with \
-             `ctx doctor` before leaning on call edges.\n"
+            "Internal recall here is {recall_pct}%: {unresolved} call site(s) that could have \
+             resolved did not. `ctx doctor` names every one, with a grep — read it before \
+             leaning on call edges.\n"
         ));
     }
     out.push_str(
@@ -1742,9 +1760,23 @@ mod tests {
             "a tiny repo should not be told to budget: {small}"
         );
         assert!(
-            !small.contains("calibrate with"),
-            "no call sites means no resolution verdict to give: {small}"
+            !small.contains("Internal recall here is"),
+            "too few resolvable calls to give a recall verdict: {small}"
         );
+        // The headline figure must be internal recall, never the
+        // share-of-all-call-sites number this used to print. That denominator
+        // counts std/extern traffic, so it read 21% on this repo at 95.2%
+        // recall — a 4x understatement in the one artifact an agent reads
+        // before deciding whether to use ctx at all.
+        assert!(
+            small.contains("internal recall"),
+            "the headline must be recall, not resolved/call_sites: {small}"
+        );
+        assert!(
+            !small.contains("of call sites resolve internally"),
+            "the discredited denominator must not come back: {small}"
+        );
+
         assert!(
             small.contains("INCOMPLETE") && small.contains("NOT INDEXED"),
             "the callers caveat is safety-critical and must always be present"
