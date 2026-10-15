@@ -508,9 +508,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     // Scan scope is fixed by argv, so install it before any graph is built.
     render::set_verbose_edges(cli.verbose_edges);
+    let selected: Vec<model::Lang> = cli.lang.iter().flat_map(|l| l.expand()).collect();
     extract::set_filter(extract::Filter {
         exclude: cli.exclude.clone(),
-        langs: cli.lang.iter().flat_map(|l| l.expand()).collect(),
+        langs: selected.clone(),
     });
     match cli.cmd {
         Cmd::Map {
@@ -866,11 +867,25 @@ fn main() -> Result<()> {
             print!("{}", snippet_for(&g));
         }
         Cmd::SupportedExts { code } => {
-            let langs = if code {
-                LangArg::Code.expand()
-            } else {
+            // Honor the global `--lang`, which this silently discarded:
+            // `ctx --lang python supported-exts` printed all eleven extensions.
+            // Every other command narrows to the filter, and a command that
+            // accepts a flag and ignores it gives a wrong answer rather than
+            // missing a feature — the failure mode this project treats as the
+            // most serious one it can have.
+            //
+            // The two compose rather than competing: `--lang` picks the set,
+            // `--code` drops Markdown from whatever that set is. So
+            // `--lang code` and `--code` agree, and both together still mean
+            // what each means alone.
+            let mut langs = if selected.is_empty() {
                 model::Lang::ALL.to_vec()
+            } else {
+                selected.clone()
             };
+            if code {
+                langs.retain(|l| !matches!(l, model::Lang::Markdown));
+            }
             for e in langs.iter().flat_map(|l| l.exts().iter()) {
                 println!("{e}");
             }
@@ -1577,6 +1592,41 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// `supported-exts` accepted the global `--lang` and discarded it, so
+    /// `ctx --lang python supported-exts` printed all eleven extensions. Every
+    /// other command narrows to the filter; this one gave a wrong answer while
+    /// looking like it had honored the flag.
+    #[test]
+    fn supported_exts_honors_the_language_filter() {
+        use crate::model::Lang;
+        // The expansion the dispatch arm performs, with `--lang python`.
+        let selected = [Lang::Python];
+        let exts: Vec<&str> = selected
+            .iter()
+            .flat_map(|l| l.exts().iter().copied())
+            .collect();
+        assert_eq!(exts, ["py"], "only the selected language's extensions");
+    }
+
+    /// `--lang` picks the set and `--code` drops Markdown from it, so the two
+    /// compose instead of competing and `--lang code` agrees with `--code`.
+    #[test]
+    fn lang_and_code_compose() {
+        use crate::model::Lang;
+        let via_flag: Vec<&str> = LangArg::Code
+            .expand()
+            .iter()
+            .flat_map(|l| l.exts().iter().copied())
+            .collect();
+        let mut via_lang = Lang::ALL.to_vec();
+        via_lang.retain(|l| !matches!(l, Lang::Markdown));
+        let via_lang: Vec<&str> = via_lang
+            .iter()
+            .flat_map(|l| l.exts().iter().copied())
+            .collect();
+        assert_eq!(via_flag, via_lang, "`--code` and `--lang code` must agree");
+    }
 
     /// What `bench/run.sh` builds its `grep --include` list from. Markdown is
     /// out because prose mentioning `foo(` is not a call site; JavaScript must
