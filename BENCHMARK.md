@@ -53,10 +53,10 @@ callers, not a list of lines.
 
 | repo | symbol | grep lines | grep tok | ctx tok | ratio | callers | ctx says |
 |---|---|---|---|---|---|---|---|
-| ripgrep | `new` | 1216 | 35975 | 17621 | 2.0x | 359 | name collision |
-| ripgrep | `unwrap` | 1147 | 33526 | 438 | 76.5x | 5 | name collision |
-| ripgrep | `arg` | 357 | 9270 | 187 | 49.6x | 2 | regions skipped |
-| ripgrep | `parse_low_raw` | 565 | 17467 | 135 | 129.4x | 0 | incomplete |
+| ripgrep | `new` | 1216 | 35975 | 17629 | 2.0x | 359 | name collision |
+| ripgrep | `unwrap` | 1147 | 33526 | 447 | 75.0x | 5 | name collision |
+| ripgrep | `arg` | 357 | 9270 | 195 | 47.5x | 2 | regions skipped |
+| ripgrep | `parse_low_raw` | 565 | 17467 | 146 | 119.6x | 0 | incomplete |
 | requests | `get` | 180 | 4812 | 4266 | 1.1x | 89 | name collision |
 | requests | `httpbin` | 156 | 4503 | 100 | 45.0x | 0 | incomplete |
 | requests | `prepare` | 59 | 1423 | 2008 | 0.7x | 36 | ambiguous |

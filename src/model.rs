@@ -84,6 +84,9 @@ pub struct Module {
     /// silently dropped there.
     #[serde(skip)]
     pub undescended: BTreeMap<String, usize>,
+    /// Carried from [`FileFacts::undescended_mentions`].
+    #[serde(skip)]
+    pub undescended_mentions: BTreeMap<String, usize>,
     /// Call-edge resolution stats for this module (for `ctx doctor`).
     #[serde(skip)]
     pub diag: Diagnostics,
@@ -162,6 +165,17 @@ pub struct FileFacts {
     /// and unmeasured: Python `exec`/`eval`, and TypeScript or JavaScript
     /// calls built from template strings.
     pub undescended: BTreeMap<String, usize>,
+    /// Identifier -> how many undescended regions mention it textually.
+    ///
+    /// What makes the disclosure answerable per name instead of per tree. A
+    /// tree-wide count fires on every Rust repo, which an agent learns to skip;
+    /// "three regions mention `arg`" is a fact about the question asked.
+    ///
+    /// Textual, and a floor in consequence: a macro that builds a name by
+    /// pasting tokens never spells it, so it will not be counted here. The
+    /// unconditional total in [`FileFacts::undescended`] is what `ctx doctor`
+    /// reports, and it is unaffected by this.
+    pub undescended_mentions: BTreeMap<String, usize>,
 }
 
 #[derive(Serialize, Clone, Copy, PartialEq, Eq)]

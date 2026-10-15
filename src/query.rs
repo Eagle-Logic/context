@@ -336,7 +336,11 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
     // and `lower_bound: false` on a tree full of macro bodies was simply
     // false — the text output said so while the JSON denied it.
     let undescended = undescended_count(g);
-    let lower_bound = ambiguous || suppressed || undescended > 0;
+    // Keyed on regions that mention THIS name, not on the tree-wide total.
+    // Tree-wide, the flag was true on every Rust repo, and a boolean that is
+    // always set carries no more information than one that is never set.
+    let mentioning = undescended_mentions_of(g, bare_name);
+    let lower_bound = ambiguous || suppressed || mentioning > 0;
     // A type is never "called", so call edges alone answer the wrong question.
     let kinds = definition_kinds(g, &q);
     let is_type = !kinds.is_empty() && kinds.iter().all(|k| is_type_kind(k));
@@ -372,11 +376,13 @@ pub fn callers(g: &Graph, query: &str, json_out: bool) -> String {
             "lower_bound": lower_bound,
             "ambiguous_name": ambiguous,
             "suppressed_common_name": suppressed,
-            // Tree-wide, not per-name: regions no extractor entered, any of
-            // which could hold a call to this name. Outside `completeness`
-            // below because that block answers a per-name question and this
-            // cannot be attributed to a name at all.
+            // Both numbers, because they answer different questions. The
+            // tree-wide total is what `ctx doctor` reports and is never
+            // hidden; the per-name count is what sets `lower_bound` and is
+            // the one worth acting on. Textual, so a floor: a macro that
+            // pastes a name together never spells it.
             "undescended_regions": undescended,
+            "undescended_regions_mentioning_query": mentioning,
             // Measured, per-name: how many call sites bearing this name ctx
             // could not pin, and how many it proved external. `complete` is
             // scoped to that question — it is not a claim about the three flags
@@ -1254,11 +1260,22 @@ fn completeness_note(g: &Graph, name: &str, subject: &str) -> String {
     // "at least": a nested macro invocation is not a node, so the count is a
     // floor. Overstating certainty about the size of a gap is the same error
     // as not reporting it.
-    let limit = match undescended_count(g) {
+    // Name-specific, not tree-wide. The unconditional version was true on
+    // every Rust repo — 954 regions announced on a query with no plausible
+    // macro involvement — and a caveat that always fires is one an agent
+    // learns to skip within a session, which is worse than a quiet one.
+    //
+    // So it fires only when an undescended region actually spells this name,
+    // which is both rarer and actionable: silent for `coverage_report`, loud
+    // for ripgrep's `arg`. The check is textual, so it is a floor in the same
+    // way everything else here is — a macro that pastes a name together never
+    // spells it and will not be counted. `ctx doctor` still reports the
+    // unconditional total, which is unaffected.
+    let limit = match undescended_mentions_of(g, name) {
         0 => String::new(),
         n => format!(
-            " At least {n} undescended region(s) in this tree were not read; \
-             see `ctx doctor`."
+            " {n} undescended region(s) mention `{name}` and were not read; \
+             grep it to rule them out, and see `ctx doctor`."
         ),
     };
 
@@ -1286,6 +1303,21 @@ fn completeness_note(g: &Graph, name: &str, subject: &str) -> String {
         "\ncompleteness: no call site named `{name}` went unresolved anywhere in this tree —\n\
          this {subject} is complete to the limit of what ctx parses.{limit}\n"
     )
+}
+
+/// How many undescended regions textually mention `name`.
+///
+/// The per-name counterpart to [`undescended_count`]. Textual by construction:
+/// these regions were never parsed as code, so the only question answerable
+/// about their contents is whether a given spelling appears in them — which is
+/// exactly the `grep` the answer goes on to recommend.
+fn undescended_mentions_of(g: &Graph, name: &str) -> usize {
+    let bare = name.rsplit("::").next().unwrap_or(name);
+    let bare = bare.rsplit('.').next().unwrap_or(bare);
+    g.modules
+        .iter()
+        .filter_map(|m| m.undescended_mentions.get(bare))
+        .sum()
 }
 
 /// Total undescended regions across the graph, all kinds.
@@ -1432,8 +1464,9 @@ pub fn context(
             // Same reasoning as `callers`: a region no extractor entered can
             // hold a call to this name, so the answer is a floor and the JSON
             // has to say so rather than leaving it to the text rendering.
-            "lower_bound": undescended_count(g) > 0,
+            "lower_bound": undescended_mentions_of(g, last) > 0,
             "undescended_regions": undescended_count(g),
+            "undescended_regions_mentioning_query": undescended_mentions_of(g, last),
             "completeness": {
                 "unresolved_call_sites_with_this_name": unresolved,
                 "external_call_sites_with_this_name": external,
@@ -3431,9 +3464,10 @@ export function run(s: S): number { return s.step(); }
     /// reported against ~357 real call sites, with no warning.
     #[test]
     fn a_complete_claim_discloses_undescended_regions() {
+        // The macro MENTIONS `target`, which is what makes it worth saying.
         let (g, dir) = graph(&[(
             "src/a.rs",
-            "pub fn target() {}\npub fn run() { target(); assert_eq!(1, 1); }\n",
+            "pub fn target() {}\npub fn run() { target(); assert_eq!(target(), 1); }\n",
         )]);
         let out = callers(&g, "target", false);
         assert!(
@@ -3441,8 +3475,8 @@ export function run(s: S): number { return s.step(); }
             "{out}"
         );
         assert!(
-            out.contains("At least 1 undescended region(s) in this tree were not read"),
-            "the claim must count what was skipped: {out}"
+            out.contains("1 undescended region(s) mention `target`"),
+            "the claim must count the regions naming this symbol: {out}"
         );
         // Deliberately a clause, not an alarm. Every real Rust tree has
         // macros, so a multi-line warning here fires on every complete answer
@@ -3451,6 +3485,29 @@ export function run(s: S): number { return s.step(); }
             out.lines().count() < 10,
             "the disclosure must stay a footnote: {out}"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The point of making it per-name. A region exists here — `doctor` counts
+    /// it — but it does not mention `target`, so there is nothing to say about
+    /// `target`. The tree-wide version said "954 regions" on queries like this
+    /// one, every time, which is how an agent learns to skip the line.
+    #[test]
+    fn a_region_that_does_not_name_the_symbol_stays_silent() {
+        let (g, dir) = graph(&[(
+            "src/a.rs",
+            "pub fn target() {}\npub fn run() { target(); assert_eq!(other(), 1); }\n\
+             pub fn other() -> u32 { 1 }\n",
+        )]);
+        let out = callers(&g, "target", false);
+        assert!(out.contains("complete to the limit"), "{out}");
+        assert!(
+            !out.contains("undescended region"),
+            "no region names `target`, so there is nothing to disclose: {out}"
+        );
+        // The region is still real and still counted where the total belongs.
+        let cov = coverage_report(&g, &[], false, false);
+        assert!(cov.contains("Not descended into"), "{cov}");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -3498,11 +3555,14 @@ export function run(s: S): number { return s.step(); }
     fn callers_json_discloses_undescended_regions() {
         let (g, dir) = graph(&[(
             "src/a.rs",
-            "pub fn target() {}\npub fn run() { target(); assert_eq!(1, 1); }\n",
+            "pub fn target() {}\npub fn run() { target(); assert_eq!(target(), 1); }\n",
         )]);
         let json = callers(&g, "target", true);
         assert!(json.contains("\"lower_bound\": true"), "{json}");
-        assert!(json.contains("\"undescended_regions\": 1"), "{json}");
+        assert!(
+            json.contains("\"undescended_regions_mentioning_query\": 1"),
+            "{json}"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

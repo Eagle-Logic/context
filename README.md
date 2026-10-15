@@ -503,12 +503,22 @@ Three loss channels are knowable and reported in band:
   sites bearing this name that ctx could not pin, and says where. When it reports
   none, the confirming grep can be skipped.
 
-The first two set `lower_bound: true`, and so does a third cause that is not
-per-name: **undescended regions**. Any region no extractor entered — Rust macro
-bodies and `static`/`const` initializers today — can hold a call to the queried
-name, so the count rides alongside as `undescended_regions` and the text output
-closes with it. The absence of a flag means "no *known* reason to distrust this"
-— not a guarantee: a call through a function-local import can still be missed.
+The first two set `lower_bound: true`, and so does a third: **an undescended
+region that mentions this name**. Rust macro bodies and `static`/`const`
+initializers are parsed as items and never read as code, so a call inside one is
+absent rather than unresolved. The check is textual — these regions were never
+parsed, so whether a spelling appears in them is the only question answerable
+about their contents, and it is exactly the `grep` the answer recommends. A
+macro that pastes a name together never spells it, so this is a floor like
+everything else here.
+
+Both counts ride in the JSON: `undescended_regions` is the tree-wide total that
+`ctx doctor` reports, and `undescended_regions_mentioning_query` is the one that
+sets the flag. The per-name count is deliberate — tree-wide, the flag was true
+on every Rust repo, and a boolean that is always set carries no more
+information than one that is never set. The absence of a flag means "no *known*
+reason to distrust this" — not a guarantee: a call through a function-local
+import can still be missed.
 
 That module-level channel is **not uniform across languages**, which is worth
 stating plainly. Python, TypeScript and Go each synthesize a module-level

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
@@ -19,11 +19,12 @@ pub fn extract(src: &str) -> Result<FileFacts> {
     let mut items = Vec::new();
     visit(tree.root_node(), src, &mut items, &mut facts, true);
     facts.items = items;
-    let macros = count_macro_invocations(tree.root_node());
+    let (macros, mentions) = scan_macro_invocations(tree.root_node(), src);
     if macros > 0 {
         facts
             .undescended
             .insert("macro invocation".to_string(), macros);
+        facts.undescended_mentions = mentions;
     }
     Ok(facts)
 }
@@ -58,19 +59,72 @@ pub fn extract(src: &str) -> Result<FileFacts> {
 ///
 /// On ripgrep this reports 3549 regions, which is the scale behind
 /// `ctx callers arg` returning 2 callers where ~357 real call sites exist.
-fn count_macro_invocations(root: Node) -> usize {
+fn scan_macro_invocations(root: Node, src: &str) -> (usize, BTreeMap<String, usize>) {
     let mut n = 0;
+    // identifier -> how many distinct regions mention it. Same shape as
+    // `unresolved_names`, and used the same way: to answer a question about one
+    // name rather than to editorialize about the tree.
+    let mut mentions: BTreeMap<String, usize> = BTreeMap::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.kind() == "macro_invocation" {
             n += 1;
+            // Only the token tree, not the macro's own name: `vec!` mentioning
+            // `vec` is the macro being invoked, not a call to something called
+            // `vec`, and counting it would answer the wrong question.
+            // Indexed rather than via a cursor: the child iterator borrows the
+            // cursor for longer than the cursor lives, and the range is all
+            // that is wanted out of it.
+            let mut tt = None;
+            for i in 0..node.named_child_count() as u32 {
+                match node.named_child(i) {
+                    Some(ch) if ch.kind() == "token_tree" => {
+                        tt = Some(ch.byte_range());
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(range) = tt {
+                let mut seen: BTreeSet<&str> = BTreeSet::new();
+                seen.extend(identifiers(&src[range]));
+                for id in seen {
+                    *mentions.entry(id.to_string()).or_default() += 1;
+                }
+            }
         }
         let mut c = node.walk();
         for ch in node.named_children(&mut c) {
             stack.push(ch);
         }
     }
-    n
+    (n, mentions)
+}
+
+/// Every identifier-shaped run in `text`, in order, with duplicates.
+///
+/// Deliberately a byte scan rather than a parse: the whole point is that this
+/// text was never parsed as code. It over-collects — keywords, field names and
+/// the contents of string literals all look like identifiers here — and that is
+/// the right direction to be wrong in, because the result is only ever used to
+/// decide whether a region is worth mentioning for a given name.
+fn identifiers(text: &str) -> impl Iterator<Item = &str> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b.is_ascii_alphabetic() || b == b'_' {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                return Some(&text[start..i]);
+            }
+            i += 1;
+        }
+        None
+    })
 }
 
 /// Whether this subtree contains a call expression.
