@@ -11,7 +11,7 @@ tree they were run against, so a version string dates them without making them
 current — this file had drifted a whole minor version before anyone noticed.
 Regenerate it in the release commit instead.
 
-The repo under analysis: **15 Rust files, 4 Markdown files, 19 modules, 6,476
+The repo under analysis: **15 Rust files, 4 Markdown files, 19 modules, 6,485
 call sites.** Small enough to read in a sitting, which makes it a fair place to
 check whether the answers are actually right.
 
@@ -35,7 +35,7 @@ it is precise where a text grep floods.
 $ ctx callers coverage_report
 9 caller(s) of 'coverage_report':
 
-mcp::dispatch  (src/mcp.rs:463-654  #d4e2b7020c89)  → query::coverage_report
+mcp::dispatch  (src/mcp.rs:485-676  #d4e2b7020c89)  → query::coverage_report
 query::tests::a_broken_link_reports_its_own_line_not_its_headings  (src/query.rs:3414-3426  #f94b64f4da35)  → coverage_report
 query::tests::coverage_separates_internal_external_and_blind_spots  (src/query.rs:3560-3571  #adf073f295c1)  → coverage_report
 query::tests::doctor_footer_lists_every_supported_extension  (src/query.rs:3550-3557  #38fa4b0b746a)  → coverage_report
@@ -46,7 +46,7 @@ query::tests::doctor_separates_undescended_regions_from_blind_spots  (src/query.
 query::tests::markdown_links_resolve_headings_and_flag_broken  (src/query.rs:3387-3411  #839e24537089)  → coverage_report
 
 completeness: no call site named `coverage_report` went unresolved anywhere in this tree —
-this blast radius is complete to the limit of what ctx parses. At least 1005 undescended region(s) in this tree were not read; see `ctx doctor`.
+this blast radius is complete to the limit of what ctx parses. At least 1014 undescended region(s) in this tree were not read; see `ctx doctor`.
 ```
 
 That last line is the point. The answer states its own limits, so you know
@@ -64,11 +64,11 @@ $ ctx path main coverage_report
 # path: main → coverage_report  (5 hop(s))
 ~ heuristic edge (verify) · * one branch of a dispatch fan-out
 
-crate::main  [src/main.rs:489]
+crate::main  [src/main.rs:507]
   → mcp::run  [src/mcp.rs:191]
     → mcp::handle_method  [src/mcp.rs:260]
-      → mcp::tools_call  [src/mcp.rs:447]
-        → mcp::dispatch  [src/mcp.rs:463]
+      → mcp::tools_call  [src/mcp.rs:469]
+        → mcp::dispatch  [src/mcp.rs:485]
           → query::coverage_report  [src/query.rs:1870]
 ```
 
@@ -265,23 +265,23 @@ $ ctx doctor
 Modules: 19  (markdown 4, rust 15)
 
 ## Internal recall — the number to trust
-  1397/1467 = 95.2%   of call sites that could be internal, ctx pinned this many.
+  1399/1470 = 95.2%   of call sites that could be internal, ctx pinned this many.
 
 A call site is "could be internal" when the callee name is defined somewhere
 under this root. Calls into std or a third-party crate are excluded, because no
 internal edge could exist for them however good the resolver gets.
 
 ## Every call site, bucketed
-call sites:            6476
-  internal edges:      1397   [25 heuristic (~), 0 dispatch fan-out (*)]
-  external (provable): 5009   (77.3%)  callee defined nowhere here — std/extern
-  unresolved internal: 70     (1.1%)  the real misses — see below
+call sites:            6485
+  internal edges:      1399   [25 heuristic (~), 0 dispatch fan-out (*)]
+  external (provable): 5015   (77.3%)  callee defined nowhere here — std/extern
+  unresolved internal: 71     (1.1%)  the real misses — see below
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
      49  walk
       9  context
-      3  est_tokens
+      4  est_tokens
       3  path
       2  flatten
       1  as_path
@@ -294,7 +294,7 @@ grep these; every other edge in the map is one ctx could prove.
   extract::rust                      13 unresolved   (module recall 92%)
   extract::typescript                13 unresolved   (module recall 91%)
   extract::python                    10 unresolved   (module recall 85%)
-  mcp                                 6 unresolved   (module recall 92%)
+  mcp                                 7 unresolved   (module recall 91%)
   extract                             5 unresolved   (module recall 98%)
   git                                 1 unresolved   (module recall 97%)
   query                               1 unresolved   (module recall 100%)
@@ -307,7 +307,7 @@ grep these; every other edge in the map is one ctx could prove.
   query                            0% heuristic (1/256 edges)
 
 ## Not descended into (regions never read as code)
-  macro invocation          995   in 15 module(s)
+  macro invocation         1004   in 15 module(s)
   module-level initializer     10   in 8 module(s)
   A call site inside one of these was never seen. It is absent, not
   unresolved, so it appears in NEITHER side of the recall figure above —
@@ -323,7 +323,7 @@ grep these; every other edge in the map is one ctx could prove.
 95.2% recall comes with **the exact grep list for the other 4.8%** — nine
 names, with counts and the modules they live in.
 
-The denominator is honest too. 5,009 of 6,476 call sites go into `std` or a
+The denominator is honest too. 5,015 of 6,485 call sites go into `std` or a
 third-party crate, where no internal edge could ever exist, so they're excluded
 rather than quietly inflating the percentage. That classification is by evidence
 — *is this name defined anywhere under the root?* — not a hardcoded list.
@@ -409,7 +409,7 @@ query::signature_types   [fn]   src/query.rs:1190-1209  #4ac8c94b6d61
 - query::context  (src/query.rs:1355-1645  #a3aa6d8a0554)  @ 1400, 1481
 
 completeness: no call site named `signature_types` went unresolved anywhere in this tree —
-this caller list is complete to the limit of what ctx parses. At least 1005 undescended region(s) in this tree were not read; see `ctx doctor`.
+this caller list is complete to the limit of what ctx parses. At least 1014 undescended region(s) in this tree were not read; see `ctx doctor`.
 ```
 
 Two things to notice. The callee list says **where** each call happens
@@ -495,7 +495,7 @@ pub enum Receiver {
 Signature references only: uses inside function BODIES are not indexed.
 
 completeness: no call site named `Receiver` went unresolved anywhere in this tree —
-this caller list is complete to the limit of what ctx parses. At least 1005 undescended region(s) in this tree were not read; see `ctx doctor`.
+this caller list is complete to the limit of what ctx parses. At least 1014 undescended region(s) in this tree were not read; see `ctx doctor`.
 ````
 
 The enum is the case that earns this flag. Shown `Receiver` with no variants, a
