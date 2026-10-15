@@ -12,7 +12,7 @@ current — this file had drifted a whole minor version before anyone noticed.
 Regenerate it in the release commit instead.
 
 The repo under analysis: **15 Rust files, 4 Markdown files, 2 Python files, 21 modules,
-6,550 call sites.** Small enough to read in a sitting, which makes it a fair place to
+6,554 call sites.** Small enough to read in a sitting, which makes it a fair place to
 check whether the answers are actually right.
 
 Timings are best-of-five on a warm page cache. The graph is rebuilt from source
@@ -265,16 +265,16 @@ $ ctx doctor
 Modules: 21  (markdown 4, python 2, rust 15)
 
 ## Internal recall — the number to trust
-  1404/1475 = 95.2%   of call sites that could be internal, ctx pinned this many.
+  1408/1479 = 95.2%   of call sites that could be internal, ctx pinned this many.
 
 A call site is "could be internal" when the callee name is defined somewhere
 under this root. Calls into std or a third-party crate are excluded, because no
 internal edge could exist for them however good the resolver gets.
 
 ## Every call site, bucketed
-call sites:            6550
-  internal edges:      1404   [25 heuristic (~), 0 dispatch fan-out (*)]
-  external (provable): 5075   (77.5%)  callee defined nowhere here — std/extern
+call sites:            6554
+  internal edges:      1408   [25 heuristic (~), 0 dispatch fan-out (*)]
+  external (provable): 5075   (77.4%)  callee defined nowhere here — std/extern
   unresolved internal: 71     (1.1%)  the real misses — see below
 
 ## What ctx missed (callee names that exist here but went unpinned)
@@ -323,7 +323,7 @@ grep these; every other edge in the map is one ctx could prove.
 95.2% recall comes with **the exact grep list for the other 4.8%** — nine
 names, with counts and the modules they live in.
 
-The denominator is honest too. 5,075 of 6,550 call sites go into `std` or a
+The denominator is honest too. 5,075 of 6,554 call sites go into `std` or a
 third-party crate, where no internal edge could ever exist, so they're excluded
 rather than quietly inflating the percentage. That classification is by evidence
 — *is this name defined anywhere under the root?* — not a hardcoded list.

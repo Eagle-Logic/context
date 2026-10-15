@@ -17,7 +17,7 @@ leaves the remainder of the old output in place. That produced a block with two
 The three git-ref-dependent blocks are pinned at 0.20.0 by the file's own
 header and are left untouched.
 """
-import pathlib, subprocess, sys
+import pathlib, re, subprocess, sys
 
 CTX = "./target/release/ctx"
 PINNED = ("changed", "move-plan", "parity")
@@ -60,8 +60,27 @@ while i < len(lines):
     done.append(" ".join(argv))
     i = j
 fresh = "\n".join(out)
+
+
+def normalize(text: str) -> str:
+    """Blank the one value that is environment-specific, not a figure.
+
+    `doctor` and `core` print the canonicalized scan root in their header, so
+    the committed file carries the author's path and CI carries the runner's.
+    Comparing those is comparing checkout locations; everything else in the
+    file is a measurement. Only the comparison is normalized — regeneration
+    still writes real output, because the file's header promises verbatim.
+    """
+    return re.sub(
+        r"^(# (?:ctx coverage report|Core modules) — ).*$",
+        r"\1<root>",
+        text,
+        flags=re.M,
+    )
+
+
 if CHECK:
-    if fresh == p.read_text():
+    if normalize(fresh) == normalize(p.read_text()):
         print(f"EXAMPLES.md is current ({len(done)} blocks checked, {len(skipped)} pinned)")
         sys.exit(0)
     print(
@@ -72,7 +91,7 @@ if CHECK:
     import difflib
     for line in list(
         difflib.unified_diff(
-            p.read_text().split("\n"), fresh.split("\n"),
+            normalize(p.read_text()).split("\n"), normalize(fresh).split("\n"),
             fromfile="EXAMPLES.md (committed)", tofile="EXAMPLES.md (regenerated)",
             lineterm="", n=1,
         )
