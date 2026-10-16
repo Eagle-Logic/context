@@ -1,6 +1,23 @@
 //! A minimal, dependency-free MCP server over stdio: newline-delimited
 //! JSON-RPC 2.0 exposing ctx's read-only commands as tools. No async, no
 //! framework — a `read_line` loop and a dispatch table.
+//!
+//! Nothing here touches the scan filter, and that is not an omission. `main`
+//! installs `--lang`, `--exclude` and `--verbose-edges` from argv before
+//! dispatching to this server, and the filter is a `OnceLock`, so every tool
+//! call inherits whatever the operator registered the server with:
+//!
+//!     claude mcp add ctx -- ctx --lang code --exclude 'vendor/**' mcp
+//!
+//! Which is why there are no per-call `lang`/`exclude` properties. Scope is an
+//! operator's decision about what the server may look at, not a model's
+//! decision per question, and ten more schema properties would be resident in
+//! every turn for something that cannot vary within a session.
+//!
+//! Verified by hand rather than by test: the filter is process-global and set
+//! once, so a test that installed one would change the scope of every other
+//! test in the binary. `ctx --lang rust mcp` reports 16 modules against 22
+//! unfiltered on this repo, and a filtered `doctor` carries `SCOPE: FILTERED`.
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
