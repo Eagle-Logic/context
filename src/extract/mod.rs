@@ -1,4 +1,5 @@
 pub mod go;
+pub mod java;
 pub mod markdown;
 pub mod python;
 pub mod rust;
@@ -105,6 +106,7 @@ pub fn filter_note() -> Option<String> {
                 Lang::Python => "python",
                 Lang::TypeScript => "ts",
                 Lang::Go => "go",
+                Lang::Java => "java",
                 Lang::Markdown => "md",
             })
             .collect();
@@ -266,6 +268,9 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
             Lang::TypeScript => typescript::extract(&src, needs_jsx(ext))
                 .with_context(|| format!("parsing {}", rel.display()))?,
             Lang::Go => go::extract(&src).with_context(|| format!("parsing {}", rel.display()))?,
+            Lang::Java => {
+                java::extract(&src).with_context(|| format!("parsing {}", rel.display()))?
+            }
             Lang::Markdown => {
                 markdown::extract(&src).with_context(|| format!("parsing {}", rel.display()))?
             }
@@ -324,6 +329,34 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
                 go_module = mod_path;
             }
         }
+        // A file that declares its own module path wins over the path-derived
+        // name. Java is the only language that does this today: `package
+        // com.foo;` plus the type name is what every import spells, and the
+        // directory layout only mirrors it by convention. In a multi-module
+        // build the path would yield a name no import could match.
+        //
+        // The type name comes from the path (the file stem), because Java
+        // requires the public type to be named after its file — so the
+        // declaration supplies the package and the filename supplies the rest.
+        let (name, path_segs) = match facts.declared_module.take() {
+            Some(pkg) if !pkg.is_empty() => {
+                // The NAME carries the type, so it is unique and matches the
+                // fully-qualified name an import spells. `path_segs` stays the
+                // package, so every file in it shares one resolution key and a
+                // same-package reference can find its sibling — the same split
+                // Go uses between a package directory and the files in it.
+                let mut name_segs = pkg.clone();
+                if let Some(stem) = rel
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    name_segs.push(stem.to_string());
+                }
+                (name_segs.join(lang.sep()), pkg)
+            }
+            _ => (name, path_segs),
+        };
         modules.push(Module {
             name,
             path_segs,
@@ -633,6 +666,10 @@ fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>, Vec<String>) {
             // No filename collapses to its directory in Go: every file in a
             // package is a peer, and the package itself is `path_segs`.
             Lang::Go => false,
+            // Nor in Java: a file is one compilation unit named after its
+            // public type, and the package it belongs to is declared inside
+            // the file rather than implied by the filename.
+            Lang::Java => false,
             Lang::Markdown => {
                 stem.eq_ignore_ascii_case("readme") || stem.eq_ignore_ascii_case("index")
             }
@@ -645,7 +682,9 @@ fn module_name(rel: &Path, lang: Lang) -> (String, Vec<String>, Vec<String>) {
     let name = if segs.is_empty() {
         match lang {
             Lang::Rust => "crate".to_string(),
-            Lang::Python | Lang::TypeScript | Lang::Go | Lang::Markdown => "root".to_string(),
+            Lang::Python | Lang::TypeScript | Lang::Go | Lang::Java | Lang::Markdown => {
+                "root".to_string()
+            }
         }
     } else {
         segs.join(lang.sep())
@@ -661,7 +700,7 @@ struct Ctx<'a> {
     by_name: HashMap<String, usize>,
     /// Go only: package directory segments -> the files that make up that
     /// package. Empty for a tree with no Go in it.
-    go_pkgs: HashMap<Vec<String>, Vec<usize>>,
+    pkgs: HashMap<Vec<String>, Vec<usize>>,
     /// Go only: every go.mod in the tree as (its directory, its module path),
     /// longest module path first so a nested module wins over its parent.
     go_mods: Vec<(Vec<String>, Vec<String>)>,
@@ -701,13 +740,13 @@ fn resolve_deps(modules: &mut [Module], root: &Path) {
         Diagnostics,
     );
     let results: Vec<ModuleResult> = {
-        let go_pkgs = go_packages(modules);
+        let pkgs = package_index(modules);
         let go_mods = go_mod_index(modules);
         let ctx = Ctx {
             modules: &*modules,
             index,
             by_name,
-            go_pkgs,
+            pkgs,
             go_mods,
             root,
         };
@@ -879,6 +918,27 @@ fn candidates(imp: &str, m: &Module, ctx: &Ctx) -> (Vec<Vec<String>>, bool) {
                 }
                 (cands, false)
             }
+        }
+        // Java imports are absolute fully-qualified names — there is no
+        // relative form — so the segments ARE the candidate, and nothing here
+        // is explicitly internal: `java.util.List` and `com.yourco.Thing` are
+        // spelled identically, and only the universe can tell them apart.
+        //
+        // A wildcard (`import com.foo.*;`) names a package, and a package is
+        // not a module here: every .java file is its own module, named by the
+        // fully-qualified type it declares. So the `*` is dropped and the
+        // remaining prefix matches no module, which reports as external rather
+        // than inventing an edge to a type the import never actually named.
+        Lang::Java => {
+            let raw: Vec<String> = imp
+                .split('.')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && s != "*")
+                .collect();
+            if raw.is_empty() {
+                return (Vec::new(), false);
+            }
+            (vec![raw], false)
         }
         Lang::Go => {
             let segs = go_segs(imp);
@@ -1066,10 +1126,27 @@ fn go_abs(segs: &[String], ctx: &Ctx) -> Vec<Vec<String>> {
 /// An import names a directory, and a symbol in it may be defined in any of the
 /// directory's files, so package-qualified resolution has to look across all of
 /// them. Built once per graph.
-fn go_packages(modules: &[Module]) -> HashMap<Vec<String>, Vec<usize>> {
+/// Is this language's unit of import a *directory or package* rather than a
+/// file?
+///
+/// Go and Java both are, for different reasons that land in the same place.
+/// Every `.go` file in a directory is a peer of the others; every `.java` file
+/// in a package is visible to the others without an import. Either way several
+/// modules share one set of resolution segments, so a longest-prefix match
+/// would pick whichever file sorts first and the symbol has to decide instead.
+///
+/// The plan for Java said this cost centre did not apply, on the grounds that
+/// `package a.b.c;` IS the import path. It is — for imports. It says nothing
+/// about same-package references, which need no import at all and are most of
+/// what real Java code does.
+pub fn package_scoped(lang: Lang) -> bool {
+    matches!(lang, Lang::Go | Lang::Java)
+}
+
+fn package_index(modules: &[Module]) -> HashMap<Vec<String>, Vec<usize>> {
     let mut out: HashMap<Vec<String>, Vec<usize>> = HashMap::new();
     for (i, m) in modules.iter().enumerate() {
-        if m.lang == Lang::Go {
+        if package_scoped(m.lang) {
             out.entry(m.resolve_segs()).or_default().push(i);
         }
     }
@@ -1084,9 +1161,9 @@ fn go_packages(modules: &[Module]) -> HashMap<Vec<String>, Vec<usize>> {
 /// When no file defines the wanted symbol this yields None rather than the
 /// first file in the package: a confident edge onto the wrong file of the right
 /// package is worse than a reported miss.
-fn go_match(abs: &[String], want: Option<&str>, ctx: &Ctx) -> Option<(String, usize)> {
+fn package_match(abs: &[String], want: Option<&str>, ctx: &Ctx) -> Option<(String, usize)> {
     for len in (1..=abs.len()).rev() {
-        let Some(files) = ctx.go_pkgs.get(&abs[..len]) else {
+        let Some(files) = ctx.pkgs.get(&abs[..len]) else {
             continue;
         };
         let Some(sym) = want.or_else(|| abs.get(len).map(String::as_str)) else {
@@ -1127,8 +1204,8 @@ fn resolve_path(path: &str, m: &Module, ctx: &Ctx) -> Option<(String, Vec<String
         // Every file of a Go package shares the package's segments, so a plain
         // longest-prefix match would land on whichever file sorts first. The
         // symbol decides instead.
-        let hit = if m.lang == Lang::Go {
-            go_match(c, None, ctx)
+        let hit = if package_scoped(m.lang) {
+            package_match(c, None, ctx)
         } else {
             match_prefix(c, &ctx.index)
         };
@@ -1165,7 +1242,7 @@ fn go_resolve_import(imp: &str, m: &Module, ctx: &Ctx) -> Resolved {
         if c.is_empty() {
             continue;
         }
-        if let Some(files) = ctx.go_pkgs.get(c.as_slice()) {
+        if let Some(files) = ctx.pkgs.get(c.as_slice()) {
             return Resolved::Package(files.iter().map(|&i| ctx.modules[i].name.clone()).collect());
         }
     }
@@ -1451,6 +1528,47 @@ const STD_METHODS: &[&str] = &[
     "windows",
 ];
 
+/// Java-only suppressions, kept apart from [`STD_METHODS`] because that list is
+/// consulted for every language and these names are not Java-shaped enough to
+/// be safe there.
+///
+/// Measured, not guessed: every one appeared in the commons-lang miss census as
+/// an "unresolved internal" only because the repo also defines a method spelled
+/// the same way. `toString` alone was 1,068.
+///
+/// Adding them globally cost ripgrep 55 real Rust edges — `apply`, `accept`,
+/// `test`, `negate`, `equals` and `iterator` are all plausible Rust method
+/// names, and suppressing a name that resolves is strictly worse than leaving a
+/// miss in the census. Hence the gate.
+const JAVA_STD_METHODS: &[&str] = &[
+    "toString",
+    "length",
+    "size",
+    "hashCode",
+    "equals",
+    "getClass",
+    "getComponentType",
+    "charAt",
+    "toCharArray",
+    "substring",
+    "startsWith",
+    "indexOf",
+    "isEmpty",
+    "intValue",
+    "compareTo",
+    "iterator",
+    "hasNext",
+    "toArray",
+    "forEach",
+    "getCause",
+    "getMessage",
+    "getRawOffset",
+    "apply",
+    "accept",
+    "test",
+    "negate",
+];
+
 /// Free-call names that always belong to the language, not to the repo:
 /// enum constructors and macro-ish builtins. Like `STD_METHODS` these are
 /// classified external on a resolution failure, so the miss census stays
@@ -1665,11 +1783,14 @@ impl Resolution {
 /// Classify a call site ctx could not edge, using whole-tree evidence rather
 /// than a hardcoded list: if the name is defined nowhere here, the miss is
 /// provably external.
-fn miss(name: &str, uni: &Universe) -> Resolution {
+fn miss(name: &str, uni: &Universe, lang: Lang) -> Resolution {
     // A ubiquitous std name that failed to resolve is std, not a miss —
     // whatever internal symbol happens to share the spelling. Classifying
     // these as misses buries the real ones under `.push()` and `Err(..)`.
     if STD_METHODS.contains(&name) || STD_FREE.contains(&name) {
+        return Resolution::External(name.to_string());
+    }
+    if lang == Lang::Java && JAVA_STD_METHODS.contains(&name) {
         return Resolution::External(name.to_string());
     }
     if uni.all_names.contains(name) {
@@ -1684,7 +1805,7 @@ fn miss(name: &str, uni: &Universe) -> Resolution {
 fn finished(fm: &str, fr: &[String], m: &Module, ctx: &Ctx, uni: &Universe) -> Resolution {
     match finish_call(fm, fr, m, ctx) {
         Some((display, dep)) => Resolution::one(EdgeOut::plain(display, dep)),
-        None => miss(fr.last().map(String::as_str).unwrap_or(""), uni),
+        None => miss(fr.last().map(String::as_str).unwrap_or(""), uni, m.lang),
     }
 }
 
@@ -1766,20 +1887,20 @@ fn resolve_call(
                 return Resolution::one(EdgeOut::plain(display.clone(), None));
             }
             // Go: the rest of this file's own package is in scope unqualified.
-            if m.lang == Lang::Go {
-                if let Some(r) = go_sibling(name, m, ctx) {
+            if package_scoped(m.lang) {
+                if let Some(r) = package_sibling(name, m, ctx) {
                     return r;
                 }
             }
             // `use crate::core::build; build()` / `from x import f; f()`
             let Some(b) = m.raw_reexports.iter().find(|b| b.name == name) else {
-                return miss(name, uni);
+                return miss(name, uni, m.lang);
             };
             let Some((n2, r2)) = resolve_path(&b.path, m, ctx) else {
                 if binding_is_external(&b.path, m, ctx) {
                     return Resolution::External(name.to_string());
                 }
-                return miss(name, uni);
+                return miss(name, uni, m.lang);
             };
             let (fm, fr) = chase(&n2, &r2, ctx, CHASE_DEPTH);
             finished(&fm, &fr, m, ctx, uni)
@@ -1818,7 +1939,7 @@ fn resolve_call(
                     {
                         return Resolution::External(last.to_string());
                     }
-                    return miss(last, uni);
+                    return miss(last, uni, m.lang);
                 };
                 let (fm, fr) = chase(&n2, &r2, ctx, CHASE_DEPTH);
                 return finished(&fm, &fr, m, ctx, uni);
@@ -1838,7 +1959,7 @@ fn resolve_call(
             if is_external_root(segs[0], m, uni) {
                 return Resolution::External(segs[0].to_string());
             }
-            miss(last, uni)
+            miss(last, uni, m.lang)
         }
     }
 }
@@ -1877,7 +1998,7 @@ fn go_return_lookup(callee: &str, m: &Module, ctx: &Ctx) -> Option<String> {
     if let Some(t) = m.returns.get(callee) {
         return Some(t.clone());
     }
-    if let Some(files) = ctx.go_pkgs.get(&m.resolve_segs()) {
+    if let Some(files) = ctx.pkgs.get(&m.resolve_segs()) {
         if let Some(t) = files
             .iter()
             .find_map(|&i| ctx.modules[i].returns.get(callee))
@@ -1923,8 +2044,8 @@ fn go_return_lookup(callee: &str, m: &Module, ctx: &Ctx) -> Option<String> {
 /// package by the language's own scoping rule, and two files of one package
 /// cannot both define it and still compile. Without this, every cross-file call
 /// inside a package reads as a miss, which is most call sites in real Go.
-fn go_sibling(name: &str, m: &Module, ctx: &Ctx) -> Option<Resolution> {
-    let files = ctx.go_pkgs.get(&m.resolve_segs())?;
+fn package_sibling(name: &str, m: &Module, ctx: &Ctx) -> Option<Resolution> {
+    let files = ctx.pkgs.get(&m.resolve_segs())?;
     let &i = files
         .iter()
         .find(|&&i| ctx.modules[i].name != m.name && ctx.modules[i].defined_names.contains(name))?;
@@ -1937,8 +2058,8 @@ fn go_sibling(name: &str, m: &Module, ctx: &Ctx) -> Option<Resolution> {
 
 /// Go: the sibling file of `m`'s package that defines method `name` on
 /// `container`. Same scoping rule as `go_sibling`, for methods.
-fn go_sibling_method(container: &str, name: &str, m: &Module, ctx: &Ctx) -> Option<String> {
-    let files = ctx.go_pkgs.get(&m.resolve_segs())?;
+fn package_sibling_method(container: &str, name: &str, m: &Module, ctx: &Ctx) -> Option<String> {
+    let files = ctx.pkgs.get(&m.resolve_segs())?;
     files
         .iter()
         .find(|&&i| {
@@ -2155,7 +2276,7 @@ fn method_edge(
         // so the enclosing container may own this method in a sibling file.
         // Still the package's own scoping rule, so confidence is unchanged.
         if m.lang == Lang::Go {
-            if let Some(om) = go_sibling_method(c, name, m, ctx) {
+            if let Some(om) = package_sibling_method(c, name, m, ctx) {
                 let display = format!("{om}{s}{c}{s}{name}");
                 let dep = Some(om);
                 return Resolution::one(if receiver_unknown {
@@ -2175,17 +2296,17 @@ fn method_edge(
         return Resolution::External(name.to_string());
     }
     let Some(owners) = uni.methods.get(name) else {
-        return miss(name, uni);
+        return miss(name, uni, m.lang);
     };
     if owners.len() != 1 {
-        return miss(name, uni);
+        return miss(name, uni, m.lang);
     }
     // Resolved purely because the method name is unique codebase-wide — a
     // heuristic, since the receiver type was never confirmed.
     let (om, oc) = owners.iter().next().unwrap();
     match owner_edge(om, oc, name, m, ctx) {
         Some((display, dep)) => Resolution::one(EdgeOut::guess(display, dep)),
-        None => miss(name, uni),
+        None => miss(name, uni, m.lang),
     }
 }
 
@@ -2240,7 +2361,7 @@ fn typed_edge(name: &str, ty: &str, m: &Module, ctx: &Ctx, uni: &Universe) -> Re
         return dispatch_edge(name, ty, m, uni);
     }
     let Some(owners) = uni.methods.get(name) else {
-        return miss(name, uni);
+        return miss(name, uni, m.lang);
     };
     let matching: Vec<&(String, String)> = owners.iter().filter(|(_, c)| c == ty).collect();
     // Prefer an owner in this module when the type name is not unique.
@@ -2249,7 +2370,7 @@ fn typed_edge(name: &str, ty: &str, m: &Module, ctx: &Ctx, uni: &Universe) -> Re
         .find(|(om, _)| om == &m.name)
         .or_else(|| matching.first());
     let Some((om, oc)) = pick else {
-        return miss(name, uni);
+        return miss(name, uni, m.lang);
     };
     match owner_edge(om, oc, name, m, ctx) {
         // The receiver type is declared in source, so this is not a guess —
@@ -2260,7 +2381,7 @@ fn typed_edge(name: &str, ty: &str, m: &Module, ctx: &Ctx, uni: &Universe) -> Re
             heuristic: matching.len() > 1,
             dispatch: false,
         }),
-        None => miss(name, uni),
+        None => miss(name, uni, m.lang),
     }
 }
 
@@ -2273,10 +2394,10 @@ fn dispatch_edge(name: &str, abstraction: &str, m: &Module, uni: &Universe) -> R
         return Resolution::External(format!("{abstraction}::{name}"));
     }
     let Some(impls) = uni.implementors.get(abstraction) else {
-        return miss(name, uni);
+        return miss(name, uni, m.lang);
     };
     let Some(owners) = uni.methods.get(name) else {
-        return miss(name, uni);
+        return miss(name, uni, m.lang);
     };
     let os = Lang::sep(m.lang);
     let edge_to = |om: &String, ty: &String| {
@@ -2308,7 +2429,7 @@ fn dispatch_edge(name: &str, abstraction: &str, m: &Module, uni: &Universe) -> R
             .collect();
     }
     if edges.is_empty() {
-        return miss(name, uni);
+        return miss(name, uni, m.lang);
     }
     if edges.len() > DISPATCH_FANOUT {
         // Too many branches to be readable: name the abstraction instead, and

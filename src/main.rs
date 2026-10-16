@@ -48,6 +48,7 @@ enum LangArg {
     Python,
     Ts,
     Go,
+    Java,
     Md,
     /// Every supported language except Markdown.
     Code,
@@ -61,6 +62,7 @@ impl LangArg {
             LangArg::Python => vec![Lang::Python],
             LangArg::Ts => vec![Lang::TypeScript],
             LangArg::Go => vec![Lang::Go],
+            LangArg::Java => vec![Lang::Java],
             LangArg::Md => vec![Lang::Markdown],
             // Derived, so a new language joins `code` by default instead of
             // being silently left out of it. Adding one therefore changes
@@ -428,7 +430,7 @@ fn snippet_for(g: &Graph) -> String {
     let mut out = String::from("<!-- ctx:begin — regenerate with `ctx snippet` -->\n");
     out.push_str("## Codebase Discovery\n\n");
     out.push_str(
-        "`ctx` is a deterministic structural index (Rust/Python/TS/JS/Go/Markdown). Use it to locate \
+        "`ctx` is a deterministic structural index (Rust/Python/TS/JS/Go/Java/Markdown). Use it to locate \
          and orient; read raw files for implementation bodies. `ctx <cmd> --help` for detail.\n\n",
     );
 
