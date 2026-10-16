@@ -35,7 +35,7 @@ it is precise where a text grep floods.
 $ ctx callers coverage_report
 10 caller(s) of 'coverage_report':
 
-mcp::dispatch  (src/mcp.rs:485-676  #d4e2b7020c89)  → query::coverage_report
+mcp::dispatch  (src/mcp.rs:502-693  #d4e2b7020c89)  → query::coverage_report
 query::tests::a_broken_link_reports_its_own_line_not_its_headings  (src/query.rs:3448-3460  #f94b64f4da35)  → coverage_report
 query::tests::a_region_that_does_not_name_the_symbol_stays_silent  (src/query.rs:3497-3513  #03b9d31eb397)  → coverage_report
 query::tests::coverage_separates_internal_external_and_blind_spots  (src/query.rs:3621-3632  #adf073f295c1)  → coverage_report
@@ -66,10 +66,10 @@ $ ctx path main coverage_report
 ~ heuristic edge (verify) · * one branch of a dispatch fan-out
 
 crate::main  [src/main.rs:509]
-  → mcp::run  [src/mcp.rs:191]
-    → mcp::handle_method  [src/mcp.rs:260]
-      → mcp::tools_call  [src/mcp.rs:469]
-        → mcp::dispatch  [src/mcp.rs:485]
+  → mcp::run  [src/mcp.rs:208]
+    → mcp::handle_method  [src/mcp.rs:277]
+      → mcp::tools_call  [src/mcp.rs:486]
+        → mcp::dispatch  [src/mcp.rs:502]
           → query::coverage_report  [src/query.rs:1904]
 ```
 

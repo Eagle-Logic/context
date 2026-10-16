@@ -804,6 +804,39 @@ standard protocol, so any MCP client works:
 claude mcp add ctx -- ctx mcp     # or your client's equivalent
 ```
 
+**The global flags work here, and they belong on the server rather than on each
+call.** Scan scope is fixed by argv before the server starts, so set it once
+where you register the server:
+
+```sh
+claude mcp add ctx -- ctx --lang code --exclude 'vendor/**' mcp
+```
+
+`--lang`, `--exclude` and `--verbose-edges` all apply to every subsequent tool
+call, and a filtered `doctor` says `SCOPE: FILTERED` in band so a narrowed
+report cannot read as a whole-repo one. They are deliberately *not* per-call
+arguments: scope is an operator's decision about what the server may look at,
+not a model's decision per question, and ten more schema properties would be
+paid in every turn for something that never varies within a session.
+
+### What the server does not expose, and why
+
+Seven CLI commands have no tool, each for its own reason — not one rule:
+
+| command | why |
+|---|---|
+| `changed`, `diff` | need a git ref and build a second graph in a worktree; stateful and slow for a per-call tool |
+| `core --churn` | git-backed. Every tool here is a pure function of the source tree, and that is worth keeping |
+| `parity` | takes two paths and an alias table — a different shape from "one path, one name" |
+| `move-plan`, `move-verify` | emit a plan for someone to carry out; the useful output is a checklist, not a query result |
+| `snippet` | produces text for a human to paste into AGENTS.md |
+| `mcp` | the server itself |
+
+`--format json` is also absent on purpose. Every tool returns the markdown an
+LLM reads, which already carries its own legend; a JSON variant would duplicate
+it and cost a `format` property on all ten schemas, paid every turn, for
+consumers that an MCP client does not have.
+
 Each tool takes a `path` argument (default `.`); `def`/`callers`/`context` also
 take `name`, and `subtree` takes `module`.
 
