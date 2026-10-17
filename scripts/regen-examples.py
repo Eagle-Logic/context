@@ -17,6 +17,7 @@ leaves the remainder of the old output in place. That produced a block with two
 The three git-ref-dependent blocks are pinned at 0.20.0 by the file's own
 header and are left untouched.
 """
+from _staleness import refuse_if_stale
 import pathlib, re, subprocess, sys
 
 CTX = "./target/release/ctx"
@@ -24,50 +25,7 @@ PINNED = ("changed", "move-plan", "parity")
 CHECK = "--check" in sys.argv
 
 
-def refuse_if_stale() -> None:
-    """Refuse to run against a binary that does not match the sources.
-
-    `bench/run.sh` carries the same checks for the same failure modes, and the
-    reasoning lives there. In short: `--version` against Cargo.toml is a
-    CONTENT check, and it replaced an mtime test that fired on every release —
-    a release commit touches Cargo.toml, cargo relinks a cached binary carrying
-    its original mtime, and a correct binary read as stale. Source mtimes stay,
-    because a branch switch can fool cargo's own fingerprint, which is the
-    0.24.0 failure this guard exists for.
-    """
-    ctx = pathlib.Path(CTX)
-    if not ctx.exists():
-        print(f"no binary at {CTX}; cargo build --release --locked", file=sys.stderr)
-        sys.exit(1)
-
-    manifest = pathlib.Path("Cargo.toml")
-    if manifest.exists():
-        want = next(
-            (
-                line.split('"')[1]
-                for line in manifest.read_text().splitlines()
-                if line.startswith("version = ")
-            ),
-            None,
-        )
-        out = subprocess.run([CTX, "--version"], capture_output=True, text=True).stdout.split()
-        have = out[1] if len(out) > 1 else None
-        if want and want != have:
-            print(
-                f"stale binary: Cargo.toml says {want}, {CTX} reports {have or 'nothing'}",
-                file=sys.stderr,
-            )
-            print("run: cargo build --release --locked", file=sys.stderr)
-            sys.exit(1)
-
-    cutoff = ctx.stat().st_mtime
-    newer = [str(f) for f in pathlib.Path("src").rglob("*.rs") if f.stat().st_mtime > cutoff]
-    if newer:
-        print(f"stale binary: {newer[0]} is newer than {CTX}", file=sys.stderr)
-        print("run: cargo build --release --locked", file=sys.stderr)
-        sys.exit(1)
-
-refuse_if_stale()
+refuse_if_stale(CTX)
 
 p = pathlib.Path("EXAMPLES.md")
 lines = p.read_text().split("\n")
