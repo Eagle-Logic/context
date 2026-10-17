@@ -12,7 +12,7 @@ current — this file had drifted a whole minor version before anyone noticed.
 Regenerate it in the release commit instead.
 
 The repo under analysis: **16 Rust files, 4 Markdown files, 2 Python files, 22 modules,
-6,970 call sites.** Small enough to read in a sitting, which makes it a fair place to
+6,978 call sites.** Small enough to read in a sitting, which makes it a fair place to
 check whether the answers are actually right.
 
 Timings are best-of-five on a warm page cache. The graph is rebuilt from source
@@ -278,9 +278,9 @@ under this root. Calls into std or a third-party crate are excluded, because no
 internal edge could exist for them however good the resolver gets.
 
 ## Every call site, bucketed
-call sites:            6970
+call sites:            6978
   internal edges:      1486   [29 heuristic (~), 0 dispatch fan-out (*)]
-  external (provable): 5411   (77.6%)  callee defined nowhere here — std/extern
+  external (provable): 5419   (77.7%)  callee defined nowhere here — std/extern
   unresolved internal: 73     (1.0%)  the real misses — see below
 
 ## What ctx missed (callee names that exist here but went unpinned)
@@ -329,7 +329,7 @@ grep these; every other edge in the map is one ctx could prove.
 95.3% recall comes with **the exact grep list for the other 4.7%** — nine
 names, with counts and the modules they live in.
 
-The denominator is honest too. 5,411 of 6,970 call sites go into `std` or a
+The denominator is honest too. 5,419 of 6,978 call sites go into `std` or a
 third-party crate, where no internal edge could ever exist, so they're excluded
 rather than quietly inflating the percentage. That classification is by evidence
 — *is this name defined anywhere under the root?* — not a hardcoded list.
