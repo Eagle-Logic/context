@@ -45,7 +45,7 @@ Copyright 2019 Kenneth Reitz
 
 ```
 Apache Commons Lang
-Copyright 2001-2024 The Apache Software Foundation
+Copyright 2001-2026 The Apache Software Foundation
 
 This product includes software developed at
 The Apache Software Foundation (https://www.apache.org/).

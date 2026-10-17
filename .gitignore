@@ -1,3 +1,4 @@
 /target
 CODEBASE_MAP.md
 .claude/settings.local.json
+__pycache__/
