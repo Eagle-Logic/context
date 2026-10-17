@@ -1,12 +1,17 @@
-mod extract;
 mod git;
 mod mcp;
-mod model;
 mod parity;
 mod query;
 mod refactor;
 mod render;
 mod view;
+
+// `extract` and `model` live in the library target so the fuzz crate can link
+// against them. Re-exported at this crate root, not merely imported, so that a
+// sibling module's `crate::model::` / `crate::extract::` path still resolves —
+// to the library's single copy, rather than to a second compilation of 9.8k
+// lines.
+pub use code_context::{extract, model};
 
 use std::collections::BTreeSet;
 use std::fs;
