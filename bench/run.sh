@@ -31,6 +31,7 @@ TO_STDOUT=0
 
 # Prefer an explicit binary, then a release build, then whatever is on PATH.
 CTX="${CTX:-}"
+CTX_EXPLICIT="$CTX"
 if [ -z "$CTX" ]; then
   if [ -x "$ROOT/target/release/ctx" ]; then CTX="$ROOT/target/release/ctx"
   elif [ -x "$ROOT/target/debug/ctx" ]; then CTX="$ROOT/target/debug/ctx"
@@ -48,26 +49,43 @@ fi
 # number from a stale binary is worse than no number, because it looks exactly
 # like a real one.
 #
-# Cargo.toml and Cargo.lock count, not just sources. A grammar bump changes
-# measured recall without touching a single .rs file — which is exactly the
-# 0.24.0 failure this guard exists to prevent, and a src-only check would have
-# sailed straight past it. A version-only Cargo.toml bump also makes the
-# `ctx version:` stamp below wrong, and that is precisely when the release
-# convention says to regenerate.
-stale=""
-for f in "$ROOT/Cargo.toml" "$ROOT/Cargo.lock"; do
-  if [ -f "$f" ] && [ "$f" -nt "$CTX" ]; then
-    stale="$f"
-    break
-  fi
-done
-if [ -z "$stale" ] && [ -d "$ROOT/src" ]; then
-  stale=$(find "$ROOT/src" -name '*.rs' -newer "$CTX" -print -quit 2>/dev/null || true)
+# Three checks, because the three known failure modes need different signals:
+#
+# 1. Build first, when we own the binary. Cargo catches a dependency change —
+#    a grammar bump moves measured recall without touching one .rs file — and
+#    a no-op costs 0.02s. Skipped when CTX was passed explicitly, since that
+#    binary is the caller's to vouch for.
+# 2. Compare `--version` against Cargo.toml. This is a CONTENT check and the
+#    reason the mtime test on Cargo.toml is gone: a release commit touches
+#    Cargo.toml, cargo then relinks a cached binary carrying its original
+#    mtime, and a correct binary reads as stale. That fired on every release
+#    and had to be cleared by hand with `touch src/main.rs`.
+# 3. Compare source mtimes. This is the one case mtime is genuinely good at —
+#    a branch switch that leaves cargo's own fingerprint fooled, which is
+#    exactly the 0.24.0 failure. Cargo is mtime-based too, so step 1 cannot be
+#    trusted alone.
+if [ -z "${CTX_EXPLICIT:-}" ] && [ -f "$ROOT/Cargo.toml" ]; then
+  ( cd "$ROOT" && cargo build --release --locked >&2 ) || {
+    echo "cargo build failed; refusing to measure" >&2
+    exit 1
+  }
 fi
-if [ -n "$stale" ]; then
-  echo "stale binary: $stale is newer than $CTX" >&2
+
+want_ver=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/Cargo.toml" | head -1)
+have_ver=$("$CTX" --version 2>/dev/null | awk '{print $2}')
+if [ -n "$want_ver" ] && [ "$want_ver" != "$have_ver" ]; then
+  echo "stale binary: Cargo.toml says $want_ver, $CTX reports ${have_ver:-nothing}" >&2
   echo "run: cargo build --release --locked" >&2
   exit 1
+fi
+
+if [ -d "$ROOT/src" ]; then
+  stale=$(find "$ROOT/src" -name '*.rs' -newer "$CTX" -print -quit 2>/dev/null || true)
+  if [ -n "$stale" ]; then
+    echo "stale binary: $stale is newer than $CTX" >&2
+    echo "run: cargo build --release --locked" >&2
+    exit 1
+  fi
 fi
 
 # The `grep --include` list, read from the binary instead of restated here.
