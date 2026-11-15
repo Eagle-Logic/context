@@ -48,7 +48,9 @@ pub fn extract(src: &str) -> Result<FileFacts> {
 /// high because an invocation containing no call still counts. It is low
 /// because a nested invocation is not a node: the inner `format!` in
 ///
-///     println!("{}", format!("{}", a()));
+/// ```text
+/// println!("{}", format!("{}", a()));
+/// ```
 ///
 /// lives inside the outer macro's token tree, so this reports 1 region where
 /// two were written. Both errors are acceptable here and neither is
@@ -156,10 +158,12 @@ fn contains_call(node: Node) -> bool {
 /// function are still call sites. Rust has none, so the initializer of a
 /// `static` or `const` is parsed as an item but never walked for calls:
 ///
-///     pub fn make() -> u32 { 7 }
-///     pub static X: u32 = make();   // not a call site
-///     pub const Y: u32 = make();    // not a call site
-///     pub fn seen() { make(); }     // a call site
+/// ```text
+/// pub fn make() -> u32 { 7 }
+/// pub static X: u32 = make();   // not a call site
+/// pub const Y: u32 = make();    // not a call site
+/// pub fn seen() { make(); }     // a call site
+/// ```
 ///
 /// `ctx doctor` reports `call sites: 1` there. All three calls are real. The
 /// two it misses are absent rather than unresolved, so they cannot lower

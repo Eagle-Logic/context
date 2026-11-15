@@ -34,6 +34,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets --locked
+      # `--all-targets` excludes doctests, so they need naming: the doc
+      # comments here carry illustrations of what ctx does and does not see,
+      # and an indented block among them is a doctest rustdoc will try to
+      # compile. Two had been failing unnoticed for exactly that reason.
+      - run: cargo test --doc --locked
 
   lint:
     name: fmt + clippy

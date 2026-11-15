@@ -5,7 +5,7 @@ pub mod python;
 pub mod rust;
 pub mod typescript;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -405,17 +405,26 @@ pub fn build_graph(root: &Path) -> Result<Graph> {
 /// `native/README.md` can take the name of the `src/native/mod.rs` it documents,
 /// which both misreports the top of `ctx core` and breaks `use crate::native::…`
 /// resolution. Within a tie, the first file in sorted order wins, so the result
-/// is deterministic. Losers get `name@stem`, falling back to `name@stem@N` if
-/// stems collide too. Renames are reported on stderr — a visibly renamed module
-/// is far better than a silently ambiguous graph.
+/// is deterministic. A loser whose collision follows from the language's layout
+/// rules gets a name that says so (`main`, `fuzz.README`); see
+/// [`structural_name`]. Anything else gets `name@stem`, falling back to
+/// `name@stem@N` if stems collide too, and is reported on stderr — a visibly
+/// renamed module is far better than a silently ambiguous graph, and confining
+/// the report to the ambiguous cases is what keeps it worth reading.
 fn disambiguate_module_names(modules: &mut [Module]) {
     // Visit code before prose so code claims the bare name; `modules` is already
     // in sorted-file order, which breaks ties.
     let mut order: Vec<usize> = (0..modules.len()).collect();
     order.sort_by_key(|&i| (modules[i].lang == Lang::Markdown, i));
 
+    // Every name a module arrived with. A structural rename may only take a
+    // name no module already owns — otherwise it would displace the legitimate
+    // owner into the `@` fallback, and which one lost would depend on scan
+    // order.
+    let taken: HashSet<String> = modules.iter().map(|m| m.name.clone()).collect();
+
     let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut renames: Vec<(String, String, String)> = Vec::new();
+    let mut ambiguous: Vec<(String, String, String)> = Vec::new();
     for i in order {
         let name = modules[i].name.clone();
         let count = seen.entry(name.clone()).or_insert(0);
@@ -428,21 +437,59 @@ fn disambiguate_module_names(modules: &mut [Module]) {
             .and_then(|s| s.to_str())
             .unwrap_or("dup")
             .to_string();
-        let mut candidate = format!("{name}@{stem}");
-        let mut n = 2;
-        while seen.contains_key(&candidate) {
-            candidate = format!("{name}@{stem}@{n}");
-            n += 1;
-        }
+        let free = |c: &String| !taken.contains(c) && !seen.contains_key(c);
+        let candidate = match structural_name(&name, &stem, modules[i].lang) {
+            Some(s) if free(&s) => s,
+            _ => {
+                let mut c = format!("{name}@{stem}");
+                let mut n = 2;
+                while !free(&c) {
+                    c = format!("{name}@{stem}@{n}");
+                    n += 1;
+                }
+                ambiguous.push((name.clone(), c.clone(), modules[i].file.clone()));
+                c
+            }
+        };
         seen.insert(candidate.clone(), 1);
-        renames.push((name.clone(), candidate.clone(), modules[i].file.clone()));
         // Display name only. Resolution keys on `path_segs`, which is derived
         // from the file's location and is deliberately not touched here — that
         // separation is why a rename can no longer cost an edge.
         modules[i].name = candidate;
     }
-    for (from, to, file) in &renames {
+    // Only the genuinely ambiguous renames are reported. A structural one is
+    // the language's own layout showing through, and its name already says so.
+    for (from, to, file) in &ambiguous {
         eprintln!("ctx: module name collision — {file} renamed '{from}' -> '{to}'");
+    }
+}
+
+/// A name for a collision that follows from the language's own layout rules,
+/// so it explains itself instead of carrying the `@` ambiguity marker.
+///
+/// Two collisions are structural rather than accidental, and both are common
+/// enough that flagging them as anomalies teaches the reader to ignore the
+/// flag — which costs more than the flag was ever worth, because the flag's
+/// whole job is to mark the graph ctx is genuinely unsure about.
+///
+/// - **A Rust binary root beside a library root.** Cargo compiles `src/lib.rs`
+///   and `src/main.rs` into two separate crates, so both roots are legitimately
+///   named `crate`. `main` is the only Rust stem that denotes a separate build
+///   target rather than an index file, which is why it is the only one renamed
+///   this way: a bare `mod` or `lib` would be a worse name than the marker.
+/// - **A README beside the code it documents.** Prose modules already spell
+///   their own stem (`fuzz.seeds.ATTRIBUTION`); collapsing a README into its
+///   directory is the exception, so on a collision it stops collapsing and
+///   rejoins the convention (`fuzz.README`).
+///
+/// Returns `None` for anything else, which keeps `name@stem` and is reported.
+/// This is a display name in both cases: see [`disambiguate_module_names`] for
+/// why resolution cannot be affected by the choice.
+fn structural_name(name: &str, stem: &str, lang: Lang) -> Option<String> {
+    match lang {
+        Lang::Rust if stem == "main" => Some(stem.to_string()),
+        Lang::Markdown => Some(format!("{name}{}{stem}", lang.sep())),
+        _ => None,
     }
 }
 
@@ -2673,6 +2720,97 @@ fn display_reexport(b: &Binding, m: &Module, ctx: &Ctx) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Rust package with both targets is the common case, not an anomaly.
+    ///
+    /// `src/lib.rs` and `src/main.rs` are two crate roots, so both derive the
+    /// name `crate`. Marking that as a collision fired on a large share of all
+    /// Rust repositories — including this one — which is exactly how a warning
+    /// stops being read. The binary root takes its stem instead, and nothing is
+    /// reported.
+    #[test]
+    fn a_rust_binary_root_is_named_main_not_flagged() {
+        let dir = std::env::temp_dir().join(format!("ctx_bin_lib_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/lib.rs"), "pub fn lib_entry() {}\n").unwrap();
+        fs::write(
+            dir.join("src/main.rs"),
+            "fn helper() {}\nfn main() { helper() }\n",
+        )
+        .unwrap();
+
+        let g = build_graph(&dir).unwrap();
+        let named = |n: &str| {
+            g.modules
+                .iter()
+                .find(|m| m.name == n)
+                .map(|m| m.file.clone())
+        };
+        assert_eq!(named("crate").as_deref(), Some("src/lib.rs"));
+        assert_eq!(named("main").as_deref(), Some("src/main.rs"));
+        assert!(
+            !g.modules.iter().any(|m| m.name.contains('@')),
+            "a lib/bin pair must not produce an `@` name: {:?}",
+            g.modules.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A README beside the code it documents rejoins the prose convention.
+    ///
+    /// Prose modules spell their own stem (`fuzz.seeds.ATTRIBUTION`); only a
+    /// README collapses into its directory. When that collapse collides with a
+    /// code module, it un-collapses rather than taking the `@` marker — and the
+    /// code keeps the bare name, which is the invariant that stops a README
+    /// from shadowing the module it describes.
+    #[test]
+    fn a_readme_beside_its_code_un_collapses() {
+        let dir = std::env::temp_dir().join(format!("ctx_readme_dup_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("engine/src")).unwrap();
+        fs::write(dir.join("engine/src/lib.rs"), "pub fn run() {}\n").unwrap();
+        fs::write(dir.join("engine/README.md"), "# Engine\n\nNotes.\n").unwrap();
+
+        let g = build_graph(&dir).unwrap();
+        let named = |n: &str| {
+            g.modules
+                .iter()
+                .find(|m| m.name == n)
+                .map(|m| m.file.clone())
+        };
+        assert_eq!(named("engine").as_deref(), Some("engine/src/lib.rs"));
+        assert_eq!(named("engine.README").as_deref(), Some("engine/README.md"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The `@` marker survives for collisions that are genuinely ambiguous,
+    /// and a structural name never displaces a module that already owns it.
+    ///
+    /// A tree with `src/main.rs`, `src/lib.rs` AND a real `src/main/mod.rs`
+    /// has two claims on `main`. The real module owns it because it arrived
+    /// with it, so the binary root falls back to the marker and is reported —
+    /// which is the case the report exists for.
+    #[test]
+    fn a_real_main_module_keeps_the_name_and_the_binary_root_is_flagged() {
+        let dir = std::env::temp_dir().join(format!("ctx_main_clash_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src/main")).unwrap();
+        fs::write(dir.join("src/lib.rs"), "pub mod main;\n").unwrap();
+        fs::write(dir.join("src/main/mod.rs"), "pub fn inner() {}\n").unwrap();
+        fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let g = build_graph(&dir).unwrap();
+        let named = |n: &str| {
+            g.modules
+                .iter()
+                .find(|m| m.name == n)
+                .map(|m| m.file.clone())
+        };
+        assert_eq!(named("main").as_deref(), Some("src/main/mod.rs"));
+        assert_eq!(named("crate@main").as_deref(), Some("src/main.rs"));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// Paths must render with `/` on every platform.
     ///
