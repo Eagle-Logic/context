@@ -1,0 +1,56 @@
+[package]
+name = "code-context-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.code-context]
+path = ".."
+
+[[bin]]
+name = "extract_rust"
+path = "fuzz_targets/extract_rust.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extract_python"
+path = "fuzz_targets/extract_python.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extract_typescript"
+path = "fuzz_targets/extract_typescript.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extract_go"
+path = "fuzz_targets/extract_go.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extract_java"
+path = "fuzz_targets/extract_java.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extract_markdown"
+path = "fuzz_targets/extract_markdown.rs"
+test = false
+doc = false
+bench = false

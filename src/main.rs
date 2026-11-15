@@ -1,12 +1,17 @@
-mod extract;
 mod git;
 mod mcp;
-mod model;
 mod parity;
 mod query;
 mod refactor;
 mod render;
 mod view;
+
+// `extract` and `model` live in the library target so the fuzz crate can link
+// against them. Re-exported at this crate root, not merely imported, so that a
+// sibling module's `crate::model::` / `crate::extract::` path still resolves —
+// to the library's single copy, rather than to a second compilation of 9.8k
+// lines.
+pub use code_context::{est_tokens, extract, model, BYTES_PER_TOKEN};
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -1415,19 +1420,6 @@ fn not_found_message(g: &Graph, query: &str) -> String {
          Run `ctx modules` for the full list, or `ctx core` for the ones that matter most.",
         suggestions.join("\n  ")
     )
-}
-
-/// Bytes per token for budget arithmetic.
-///
-/// `len/4` is the familiar rule of thumb, but measured against a real tokenizer
-/// on this tool's own output it under-counts by 5-23% — code and Markdown are
-/// denser than prose English. A cap that overshoots is not a cap, so budgets use
-/// a conservative divisor: better to under-fill than to blow the window.
-pub const BYTES_PER_TOKEN: usize = 3;
-
-/// Estimated tokens for rendered output.
-pub fn est_tokens(text: &str) -> usize {
-    text.len() / BYTES_PER_TOKEN
 }
 
 /// Most a budget-pruned map will spend on prose (Markdown) modules, as a share

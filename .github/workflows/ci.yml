@@ -106,9 +106,12 @@ jobs:
       # debug build would produce the same text more slowly.
       - run: cargo build --release --locked
       - run: python3 scripts/regen-examples.py --check
-      # The README's standing-cost table moved four times in one day — 2.2x,
-      # 2.4x, 2.6x, 2.8x — as tools gained ceilings and the server gained
-      # instructions. Each move needed someone to remember a Markdown edit.
+      # Two sets of README figures, both of which drifted while unwatched.
+      # The standing-cost table moved four times in one day — 2.2x, 2.4x, 2.6x,
+      # 2.8x — as tools gained ceilings and the server gained instructions. The
+      # `ctx doctor` excerpt, which is the evidence for the README's central
+      # claim, was stale for two releases and had dropped a low-confidence row.
+      # Each move needed someone to remember a Markdown edit.
       - run: python3 scripts/check-readme-figures.py
 
   dogfood:
@@ -145,8 +148,17 @@ jobs:
             exit 1
           fi
 
+      # --exclude scripts/** because ctx's public API is the CLI and the MCP
+      # server; the maintenance scripts are tooling, not anyone's API. Without
+      # it, moving a helper from regen-examples.py into the shared
+      # _staleness.py reads as a BREAKING REMOVAL — ctx tracks `def` sites, so
+      # the `from _staleness import refuse_if_stale` that keeps the name
+      # reachable does not count as a definition. A gate that fails on an
+      # internal file move is a gate maintainers learn to override, which
+      # costs more than the Python coverage was ever worth.
       - name: ctx changed --api --strict — public API removals vs the base
         if: github.event_name == 'pull_request'
         run: |
           ./target/debug/ctx changed --api --strict \
+            --exclude 'scripts/**' \
             --since "origin/${{ github.base_ref }}"

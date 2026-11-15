@@ -66,19 +66,20 @@ branch of a dynamic-dispatch fan-out is marked `*`. And `ctx doctor` names
 
 ```
 ## Internal recall — the number to trust
-  1397/1467 = 95.2%   of call sites that could be internal, ctx pinned this many.
+  1460/1541 = 94.7%   of call sites that could be internal, ctx pinned this many.
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
      49  walk
-      9  context
-      3  est_tokens
-      3  path
+     11  context
+      8  group
+      4  est_tokens
 
 ## Low-confidence zones (edges to distrust — grep to confirm)
   parity                           18% heuristic (11/61 edges)
+  crate@main                       7% heuristic (9/124 edges)
   refactor                         5% heuristic (1/20 edges)
-  crate                            4% heuristic (6/154 edges)
+  extract                          2% heuristic (4/229 edges)
 ```
 
 The recall number comes with the exact grep list for everything it doesn't
