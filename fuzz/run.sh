@@ -21,7 +21,7 @@ SECS="${1:-60}"
 shift || true
 TARGETS=("$@")
 if [ ${#TARGETS[@]} -eq 0 ]; then
-  TARGETS=(extract_rust extract_python extract_typescript extract_go extract_java extract_markdown)
+  TARGETS=(extract_rust extract_python extract_typescript extract_go extract_java extract_markdown root_containment build_graph)
 fi
 
 # `cargo fuzz` needs nightly for -Zsanitizer=address and does not select it

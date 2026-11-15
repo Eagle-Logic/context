@@ -11,8 +11,8 @@ tree they were run against, so a version string dates them without making them
 current — this file had drifted a whole minor version before anyone noticed.
 Regenerate it in the release commit instead.
 
-The repo under analysis: **24 Rust files, 6 Markdown files, 3 Python files, 33 modules,
-7,122 call sites.** Small enough to read in a sitting, which makes it a fair place to
+The repo under analysis: **27 Rust files, 6 Markdown files, 3 Python files, 36 modules,
+7,225 call sites.** Small enough to read in a sitting, which makes it a fair place to
 check whether the answers are actually right.
 
 Timings are best-of-five on a warm page cache. The graph is rebuilt from source
@@ -35,7 +35,7 @@ it is precise where a text grep floods.
 $ ctx callers coverage_report
 10 caller(s) of 'coverage_report':
 
-mcp::dispatch  (src/mcp.rs:546-795  #d7e434f0a5d2)  → query::coverage_report
+mcp::dispatch  (src/mcp.rs:532-781  #d7e434f0a5d2)  → query::coverage_report
 query::tests::a_broken_link_reports_its_own_line_not_its_headings  (src/query.rs:3448-3460  #f94b64f4da35)  → coverage_report
 query::tests::a_region_that_does_not_name_the_symbol_stays_silent  (src/query.rs:3497-3513  #03b9d31eb397)  → coverage_report
 query::tests::coverage_separates_internal_external_and_blind_spots  (src/query.rs:3621-3632  #adf073f295c1)  → coverage_report
@@ -66,10 +66,10 @@ $ ctx path main coverage_report
 ~ heuristic edge (verify) · * one branch of a dispatch fan-out
 
 crate@main::main  [src/main.rs:514]
-  → mcp::run  [src/mcp.rs:241]
-    → mcp::handle_method  [src/mcp.rs:310]
-      → mcp::tools_call  [src/mcp.rs:530]
-        → mcp::dispatch  [src/mcp.rs:546]
+  → mcp::run  [src/mcp.rs:227]
+    → mcp::handle_method  [src/mcp.rs:296]
+      → mcp::tools_call  [src/mcp.rs:516]
+        → mcp::dispatch  [src/mcp.rs:532]
           → query::coverage_report  [src/query.rs:1904]
 ```
 
@@ -268,19 +268,19 @@ The differentiator. Every tool guesses; this one tells you where.
 $ ctx doctor
 # ctx coverage report — /home/steve/projects/context
 
-Modules: 33  (markdown 6, python 3, rust 24)
+Modules: 36  (markdown 6, python 3, rust 27)
 
 ## Internal recall — the number to trust
-  1473/1557 = 94.6%   of call sites that could be internal, ctx pinned this many.
+  1483/1567 = 94.6%   of call sites that could be internal, ctx pinned this many.
 
 A call site is "could be internal" when the callee name is defined somewhere
 under this root. Calls into std or a third-party crate are excluded, because no
 internal edge could exist for them however good the resolver gets.
 
 ## Every call site, bucketed
-call sites:            7122
-  internal edges:      1473   [29 heuristic (~), 0 dispatch fan-out (*)]
-  external (provable): 5565   (78.1%)  callee defined nowhere here — std/extern
+call sites:            7225
+  internal edges:      1483   [29 heuristic (~), 0 dispatch fan-out (*)]
+  external (provable): 5658   (78.3%)  callee defined nowhere here — std/extern
   unresolved internal: 84     (1.2%)  the real misses — see below
 
 ## What ctx missed (callee names that exist here but went unpinned)
@@ -316,8 +316,8 @@ grep these; every other edge in the map is one ctx could prove.
   query                            0% heuristic (1/260 edges)
 
 ## Not descended into (regions never read as code)
-  macro invocation         1069   in 23 module(s)
-  module-level initializer     10   in 8 module(s)
+  macro invocation         1081   in 26 module(s)
+  module-level initializer     11   in 9 module(s)
   A call site inside one of these was never seen. It is absent, not
   unresolved, so it appears in NEITHER side of the recall figure above —
   not the numerator and not the denominator. Recall is a ratio over what
@@ -325,7 +325,7 @@ grep these; every other edge in the map is one ctx could prove.
 
 ## Not modeled (blind spots)
   source files present that ctx does not parse:
-  .seed     69
+  .seed     86
   .sh       2
   (supported: .rs .py .ts .tsx .js .jsx .mjs .cjs .go .java .md .markdown)
 ```
@@ -333,7 +333,7 @@ grep these; every other edge in the map is one ctx could prove.
 94.6% recall comes with **the exact grep list for the other 5.4%** — twelve
 names, with counts and the modules they live in.
 
-The denominator is honest too. 5,565 of 7,122 call sites go into `std` or a
+The denominator is honest too. 5,658 of 7,225 call sites go into `std` or a
 third-party crate, where no internal edge could ever exist, so they're excluded
 rather than quietly inflating the percentage. That classification is by evidence
 — *is this name defined anywhere under the root?* — not a hardcoded list.
@@ -341,7 +341,7 @@ rather than quietly inflating the percentage. That classification is by evidence
 The honest bit isn't that coverage is high. It's that the gaps are enumerable.
 
 > `ctx` treats Markdown as part of the graph, which is why this file counts
-> toward the 33 modules above — a document about the tool is a node in the
+> toward the 36 modules above — a document about the tool is a node in the
 > graph the tool builds.
 
 ---
@@ -357,14 +357,14 @@ $ ctx core --limit 8
 Ranked by dependency centrality (PageRank); higher = more depended-upon.
 
   score    in  out  module
-  0.2245    14    0  model  [30 items]
-  0.1163    12    1  extract  [105 items]
-  0.0426     4    2  render  [13 items]
-  0.0332     3    3  view  [11 items]
-  0.0318     2    4  query  [153 items]
-  0.0245     1    0  BENCHMARK  [4 items]
-  0.0245     1    0  EXAMPLES  [13 items]
-  0.0245     1    0  SECURITY  [6 items]
+  0.2109    14    0  model  [30 items]
+  0.1093    12    1  extract  [105 items]
+  0.0395     4    2  render  [13 items]
+  0.0308     3    3  view  [11 items]
+  0.0294     2    4  query  [153 items]
+  0.0233     1    0  BENCHMARK  [4 items]
+  0.0233     1    0  EXAMPLES  [13 items]
+  0.0233     1    0  SECURITY  [6 items]
 ```
 
 `model` on top with 13 inbound and 0 outbound is the right answer: it's the
