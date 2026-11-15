@@ -389,6 +389,14 @@ fn budget_prop(desc: &str) -> Value {
 /// every turn, whether or not a budget is ever hit — is the wrong trade.
 const BUDGET_DESC: &str = "Max output tokens (default 25000)";
 
+/// The `format` property, shared so the two tools that take it cannot describe
+/// it differently — and kept to four words, because every schema byte is
+/// resident in the caller's context on every turn whether the tool is called or
+/// not.
+fn fmt_prop() -> Value {
+    json!({ "type": "string", "enum": ["md", "json"], "description": "Default md" })
+}
+
 fn tools() -> Vec<Value> {
     let name_prop = json!({ "type": "string", "description": "Symbol name, bare or qualified" });
     vec![
@@ -399,6 +407,7 @@ fn tools() -> Vec<Value> {
             json!({
                 "path": path_prop(),
                 "view": {"type": "string", "enum": ["skeleton", "interface", "full"], "description": "Default skeleton"},
+                "format": fmt_prop(),
                 "max_tokens": budget_prop(BUDGET_DESC),
             }),
             &[],
@@ -419,6 +428,7 @@ fn tools() -> Vec<Value> {
                 "path": path_prop(),
                 "module": {"type": "string", "description": "Module name or suffix"},
                 "view": {"type": "string", "enum": ["skeleton", "interface", "full"], "description": "Default full"},
+                "format": fmt_prop(),
                 "max_tokens": budget_prop(BUDGET_DESC),
             }),
             &["module"],
@@ -451,6 +461,7 @@ fn tools() -> Vec<Value> {
             "core",
             "Modules ranked by dependency centrality.",
             json!({ "path": path_prop(), "limit": {"type": "integer", "description": "Default 30, max 200"},
+                    "churn": {"type": "boolean", "description": "Add git commit counts per module"},
                     "max_tokens": budget_prop(BUDGET_DESC) }),
             &[],
         ),
@@ -515,6 +526,13 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
     let uarg = |k: &str, d: u64| args.get(k).and_then(Value::as_u64).unwrap_or(d) as usize;
     let barg = |k: &str| args.get(k).and_then(Value::as_bool).unwrap_or(false);
 
+    // `md` or `json`. Terse on purpose: the enum documents the values, and a
+    // longer description is resident in every turn.
+    let format_arg = || match sarg("format") {
+        Some("json") => crate::Format::Json,
+        _ => crate::Format::Md,
+    };
+
     let view_arg = |d: View| match sarg("view") {
         Some("skeleton") => View::Skeleton,
         Some("interface") => View::Interface,
@@ -541,25 +559,57 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
             // is ~258k tokens on a large repo, and an MCP result lands straight
             // in the caller's context with no chance to pipe it anywhere.
             let v = view_arg(View::Skeleton);
+            let fmt = format_arg();
             match budget {
                 Some(b) => {
-                    let r = crate::render_budgeted(g, v, crate::Format::Md, b);
+                    let r = crate::render_budgeted(g, v, fmt, b);
                     // The CLI reports the view chosen and whether it fit on
                     // stderr; over MCP there is no stderr, so it goes in band or
-                    // it is lost.
-                    let mut text = r.text;
-                    if !r.fit {
-                        text.push_str(&format!(
-                            "\n[ctx] BUDGET NOT MET: emitted view '{}' still exceeds {b} tokens.\n",
-                            r.view.name()
-                        ));
+                    // it is lost. Under `json` it goes INSIDE the document:
+                    // appended text would make it unparseable, and dropping it
+                    // would leave the machine path more confident than the
+                    // Markdown one.
+                    let text = r.text;
+                    let text = if !r.fit {
+                        match fmt {
+                            crate::Format::Md => {
+                                let mut t = text;
+                                t.push_str(&format!(
+                                    "\n[ctx] BUDGET NOT MET: emitted view '{}' still exceeds {b} tokens.\n",
+                                    r.view.name()
+                                ));
+                                t
+                            }
+                            crate::Format::Json => crate::json_disclose(
+                                text,
+                                "budget_not_met",
+                                json!({ "view": r.view.name(), "budget": b }),
+                            ),
+                        }
                     } else if r.view != v || r.omitted > 0 {
-                        text.push_str(&format!(
-                            "\n[ctx] fitted to {b} tokens: '{}' view, {} module(s) omitted.\n",
-                            r.view.name(),
-                            r.omitted
-                        ));
-                    }
+                        match fmt {
+                            crate::Format::Md => {
+                                let mut t = text;
+                                t.push_str(&format!(
+                                    "\n[ctx] fitted to {b} tokens: '{}' view, {} module(s) omitted.\n",
+                                    r.view.name(),
+                                    r.omitted
+                                ));
+                                t
+                            }
+                            crate::Format::Json => crate::json_disclose(
+                                text,
+                                "fitted_to_budget",
+                                json!({
+                                    "view": r.view.name(),
+                                    "budget": b,
+                                    "modules_omitted": r.omitted,
+                                }),
+                            ),
+                        }
+                    } else {
+                        text
+                    };
                     (text, false)
                 }
                 None => {
@@ -568,7 +618,13 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
                     // when a caller explicitly opts out of the budget.
                     let mut g = g.clone();
                     view::apply(&mut g, v);
-                    (render::markdown(&g), false)
+                    match fmt {
+                        crate::Format::Md => (render::markdown(&g), false),
+                        crate::Format::Json => (
+                            serde_json::to_string_pretty(&g).unwrap_or_default() + "\n",
+                            false,
+                        ),
+                    }
                 }
             }
         }
@@ -584,7 +640,7 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
         "subtree" => match sarg("module") {
             // Same code path as the CLI, so the two cannot drift again.
             Some(m) => {
-                match crate::subtree_text(g, m, view_arg(View::Full), crate::Format::Md, budget) {
+                match crate::subtree_text(g, m, view_arg(View::Full), format_arg(), budget) {
                     Ok(t) => (t, false),
                     Err(e) => (format!("{e}"), true),
                 }
@@ -636,9 +692,22 @@ fn dispatch(name: &str, args: &Value) -> (String, bool) {
         },
         "core" => {
             let (limit, note) = capped(uarg("limit", 30), MAX_CORE_LIMIT, "limit");
+            // Opt-in, because it is the only argument here whose cost is
+            // outside the graph: it shells out to `git log` over the whole
+            // history, and it is meaningless in a tree that is not a git repo.
+            // A failure is reported rather than silently degrading to no
+            // churn, since a caller that asked for it would otherwise read a
+            // ranking that quietly answers a different question.
+            let churn = match barg("churn") {
+                false => None,
+                true => match crate::churn_map(path, g) {
+                    Ok(m) => Some(m),
+                    Err(e) => return (format!("churn unavailable: {e}"), true),
+                },
+            };
             (
                 clamp(
-                    format!("{note}{}", query::core(g, limit, None, false)),
+                    format!("{note}{}", query::core(g, limit, churn.as_ref(), false)),
                     budget,
                     "ctx core",
                     "a smaller `limit`",
@@ -1066,5 +1135,99 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A JSON path that omits a disclosure the Markdown path carries is MORE
+    /// confident than the text path, and an agent cannot eyeball the
+    /// difference the way a person scanning a report can. That exact defect
+    /// shipped in 0.25.0 and was caught in review; before this commit the
+    /// `subtree` JSON branch dropped BUDGET NOT MET entirely, so exposing
+    /// `format` over MCP would have published it on the surface that matters
+    /// most.
+    #[test]
+    fn json_output_parses_and_discloses_whatever_markdown_discloses() {
+        for (name, args) in [
+            ("map", json!({"path": ".", "max_tokens": 200})),
+            (
+                "subtree",
+                json!({"path": ".", "module": "query", "view": "full", "max_tokens": 50}),
+            ),
+        ] {
+            let mut md = args.clone();
+            md["format"] = json!("md");
+            let (md_text, err) = dispatch(name, &md);
+            assert!(!err, "{name} md errored: {md_text}");
+            assert!(
+                md_text.contains("BUDGET NOT MET") || md_text.contains("omitted"),
+                "{name} md disclosed nothing at a deliberately tiny budget, so this \
+                 test can no longer tell whether the json path is hiding something"
+            );
+
+            let mut js = args.clone();
+            js["format"] = json!("json");
+            let (js_text, err) = dispatch(name, &js);
+            assert!(!err, "{name} json errored: {js_text}");
+            let v: Value = serde_json::from_str(&js_text)
+                .unwrap_or_else(|e| panic!("{name} format=json did not parse: {e}\n{js_text}"));
+            let obj = v
+                .as_object()
+                .unwrap_or_else(|| panic!("{name} format=json was not an object"));
+            // Pair each Markdown disclosure with the SPECIFIC key that
+            // carries it. An earlier version of this test accepted any key
+            // containing "omitted", which `subtree` already emits as
+            // `neighbors_omitted` — so it passed with the budget disclosure
+            // reverted, and proved nothing.
+            if md_text.contains("BUDGET NOT MET") {
+                assert!(
+                    obj.contains_key("budget_not_met"),
+                    "{name} md said BUDGET NOT MET; json omitted `budget_not_met`. Keys: {:?}",
+                    obj.keys().collect::<Vec<_>>()
+                );
+            }
+            if md_text.contains("module(s) omitted") || md_text.contains("modules omitted") {
+                assert!(
+                    obj.keys().any(|k| k.ends_with("omitted")),
+                    "{name} md reported omitted modules; json omitted the count. Keys: {:?}",
+                    obj.keys().collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn format_and_churn_are_advertised() {
+        let ts = tools();
+        let has = |tool: &str, prop: &str| {
+            ts.iter()
+                .find(|t| t["name"] == tool)
+                .and_then(|t| t["inputSchema"]["properties"].get(prop))
+                .is_some()
+        };
+        assert!(has("map", "format"), "map does not advertise format");
+        assert!(
+            has("subtree", "format"),
+            "subtree does not advertise format"
+        );
+        assert!(has("core", "churn"), "core does not advertise churn");
+    }
+
+    /// `churn` shells out to `git log`, so it can fail for reasons the graph
+    /// cannot — no repo, no history. The one outcome that must never happen is
+    /// a ranking returned WITHOUT churn after a caller asked for it: that is a
+    /// different question answered silently.
+    #[test]
+    fn core_churn_either_works_or_says_why() {
+        let (text, is_error) = dispatch("core", &json!({"path": ".", "limit": 5, "churn": true}));
+        if is_error {
+            assert!(
+                text.contains("churn unavailable"),
+                "opaque churn failure: {text}"
+            );
+        } else {
+            assert!(
+                text.contains("churn"),
+                "churn=true returned a ranking with no churn column: {text}"
+            );
+        }
     }
 }

@@ -49,7 +49,7 @@ Including the row where it finds a limitation in ctx.
 
 **→ [What the integration itself costs](#measuring-what-it-costs)** — ctx's own
 MCP tool definitions sit in every turn whether a tool is ever called or not,
-which makes them 2.8× the standing cost of the CLI instructions block. That is
+which makes them 3.0× the standing cost of the CLI instructions block. That is
 the shape this project objects to, measured on itself.
 
 ## Four things you won't find elsewhere
@@ -66,7 +66,7 @@ branch of a dynamic-dispatch fan-out is marked `*`. And `ctx doctor` names
 
 ```
 ## Internal recall — the number to trust
-  1460/1541 = 94.7%   of call sites that could be internal, ctx pinned this many.
+  1472/1556 = 94.6%   of call sites that could be internal, ctx pinned this many.
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
@@ -77,7 +77,7 @@ grep these; every other edge in the map is one ctx could prove.
 
 ## Low-confidence zones (edges to distrust — grep to confirm)
   parity                           18% heuristic (11/61 edges)
-  crate@main                       7% heuristic (9/124 edges)
+  crate@main                       7% heuristic (9/127 edges)
   refactor                         5% heuristic (1/20 edges)
   extract                          2% heuristic (4/229 edges)
 ```
@@ -848,11 +848,11 @@ what the rest of this README argues. Both the tool definitions and the server's
 | | resident tokens |
 |---|---|
 | `ctx snippet` block | **583** |
-| MCP tool definitions (10 tools) | 1,485 |
+| MCP tool definitions (10 tools) | 1,567 |
 | MCP server instructions | 153 |
-| **MCP total** | **1,638** |
+| **MCP total** | **1,720** |
 
-2.8x, before either has answered anything. An MCP tool list is itself a blob
+3.0x, before either has answered anything. An MCP tool list is itself a blob
 injected at boot — the shape this project objects to — so the honest advice is
 to use MCP when you want structured calls and no shell permission prompts, and
 the CLI when you want the cheapest possible standing cost.
