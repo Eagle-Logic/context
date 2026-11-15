@@ -114,6 +114,65 @@ jobs:
       # Each move needed someone to remember a Markdown edit.
       - run: python3 scripts/check-readme-figures.py
 
+  # BENCHMARK.md was the last published artifact with nothing watching it, and
+  # it is the one whose whole purpose is credibility: every measured claim in
+  # the README, re-run on repositories that are not this one. It has been wrong
+  # twice — a stale binary understated the `got` recall row by 197 call sites,
+  # and four preact rows compared ctx over 232 files against a grep that opened
+  # 40 of them. Both were found by hand, late.
+  #
+  # Checking it is cheap enough that deferring it was the wrong call, though
+  # not as cheap as it first looked. The corpus is seven shallow fetches of
+  # exact pinned SHAs, 36 MB total. The harness takes ~26s warm and ~31s cold
+  # on a developer machine, but 115s on a GitHub runner — measured, after an
+  # earlier version of this comment quoted the local number as if it were the
+  # CI cost. With the release build the job is about 2m50s cold.
+  #
+  # Still worth running all seven rather than scoping to one repository, which
+  # was the plan while this looked expensive: it is comparable to `cargo audit`
+  # here, and a partial check on the repo's credibility artifact is close to no
+  # check. The figures are deterministic — verified byte-identical from both a
+  # warm corpus and a freshly fetched one — so the committed file must match a
+  # fresh run exactly.
+  benchmark:
+    name: BENCHMARK.md is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Not for speed. The fetches are `--depth 1` at an exact SHA and the
+      # whole corpus is 36 MB, so locally a cold run cost 30.6s against 26.4s
+      # warm — about four seconds. This is really about not making seven
+      # network round-trips per CI run, which is seven chances for an
+      # unrelated outage to turn this job red.
+      #
+      # Keyed on the manifest, so re-pinning a commit misses the cache on
+      # purpose — a new SHA has to be fetched, which is exactly when the
+      # figures are expected to move. The harness also re-fetches any repo
+      # whose HEAD is not already the pinned SHA, so a stale cache corrects
+      # itself rather than silently measuring the wrong tree.
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/ctx-bench
+          key: bench-corpus-${{ hashFiles('bench/repos.tsv') }}
+
+      - run: cargo build --release --locked
+
+      - name: BENCHMARK.md must match a fresh run of the harness
+        run: |
+          set -euo pipefail
+          # Absolute, because bench/run.sh reads BENCH_CACHE directly and the
+          # shell will not expand a `~` that arrives through the environment.
+          export BENCH_CACHE="$HOME/.cache/ctx-bench"
+          ./bench/run.sh --stdout > "$RUNNER_TEMP/bench-fresh.md"
+          if ! diff -u BENCHMARK.md "$RUNNER_TEMP/bench-fresh.md"; then
+            echo "::error::BENCHMARK.md does not match a fresh run. Regenerate it: cargo build --release --locked && ./bench/run.sh"
+            exit 1
+          fi
+          echo "BENCHMARK.md is current"
+
   dogfood:
     name: dogfood (ctx on ctx)
     runs-on: ubuntu-latest
