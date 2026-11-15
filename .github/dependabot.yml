@@ -31,6 +31,13 @@ updates:
   #    (`cargo-dist-version` in dist-workspace.toml, then `dist generate`) when
   #    those pins need to move.
   #
+  #    It recurred as #64 (actions/checkout 6 -> 7, October 2026), which touched
+  #    ONLY release.yml and so could never pass `plan`. Closed rather than
+  #    merged, and dist 0.34.0 still generates `checkout@v6` — so expect this
+  #    PR again, and close it again, until dist's own pins move. The
+  #    hand-written workflows are already on v7; a checkout PR that changes
+  #    nothing but release.yml is always the generated-file case.
+  #
   # 2. dtolnay/rust-toolchain is IGNORED below. Its ref doubles as a toolchain
   #    selector, so Dependabot read `@1.85` as an action version and helpfully
   #    "upgraded" the MSRV job to `@1.100` — a Rust release that does not
