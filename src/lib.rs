@@ -15,6 +15,7 @@
 //! `crate::model::` path resolves to this single copy instead of compiling a
 //! second one.
 
+pub mod contain;
 pub mod extract;
 pub mod model;
 

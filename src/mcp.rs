@@ -218,24 +218,10 @@ fn resolve_in_root(path: &str) -> std::result::Result<PathBuf, String> {
             .and_then(|d| d.canonicalize())
             .unwrap_or_default()
     });
-    let joined = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        root.join(path)
-    };
-    let real = joined
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve path {path:?}: {e}"))?;
-    if !real.starts_with(root) {
-        return Err(format!(
-            "refused: {path:?} resolves to {} which is outside this server's root ({}). \
-             The MCP server only reads the project it was started in. Start it with \
-             `ctx mcp --root <dir>` to point it somewhere else.",
-            real.display(),
-            root.display()
-        ));
-    }
-    Ok(real)
+    // The check itself lives in `contain`, taking its root as an argument, so
+    // the guarantee is a pure function that fuzz/fuzz_targets/root_containment
+    // can attack directly. This wrapper only supplies the process-global root.
+    crate::contain::contained(root, path)
 }
 
 pub fn run(root: Option<PathBuf>, metrics: Option<PathBuf>) -> Result<()> {

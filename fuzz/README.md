@@ -9,7 +9,7 @@ Each target drives one extractor's `extract(src: &str) -> Result<FileFacts>` —
 a pure function over a string, with no filesystem and no CLI in the way, which
 is what makes the extractors the right place to point a fuzzer.
 
-| target | extractor |
+| target | what it attacks |
 |---|---|
 | `extract_rust` | `src/extract/rust.rs` |
 | `extract_python` | `src/extract/python.rs` |
@@ -17,6 +17,8 @@ is what makes the extractors the right place to point a fuzzer.
 | `extract_go` | `src/extract/go.rs` |
 | `extract_java` | `src/extract/java.rs` |
 | `extract_markdown` | `src/extract/markdown.rs` |
+| `root_containment` | `src/contain.rs` — the guarantee `SECURITY.md` makes |
+| `build_graph` | the whole pipeline: walk, dispatch, and **resolution** |
 
 ## Running
 
@@ -82,27 +84,64 @@ extractor in the first place.
 
 ## Seeds and corpus
 
-`fuzz/seeds/` is committed: 69 small real source files taken from the pinned
-benchmark repositories in `bench/repos.tsv`, so the fuzzer starts from
-idiomatic syntax rather than spending its budget rediscovering that `fn` is a
-keyword. Only files under 4 KB — libFuzzer mutates and minimizes faster on
+`fuzz/seeds/` is committed. For the extractors it is 69 small real source files
+taken from the pinned benchmark repositories in `bench/repos.tsv`, so the
+fuzzer starts from idiomatic syntax rather than spending its budget
+rediscovering that `fn` is a keyword. Only files under 4 KB — libFuzzer mutates and minimizes faster on
 small inputs, and a 40 KB seed mostly buys repetition of syntax the grammar
 already covers.
+
+The other two targets are seeded by hand, because there is no corpus of
+idiomatic adversarial input to draw on: `root_containment` starts from the
+escapes worth trying (`..`, the symlink, the name-prefix sibling, an absolute
+path), and `build_graph` from minimal two-file trees in each language that
+actually resolve an edge, so a mutation has something to break.
 
 `fuzz/corpus/` is where libFuzzer accumulates its own inputs. It is
 `.gitignore`d, because it is a derived artifact that grows without bound; the
 seeds are the reproducible part.
 
-## Not covered
+## The two beyond the extractors
 
-Worth stating plainly, since the point of this directory is to know what has
-actually been tested:
+`root_containment` attacks the one thing `SECURITY.md` calls a vulnerability if
+broken: the MCP server pinning itself to a root and refusing any path that
+escapes, *"including via `..` or a symlink"*. The check moved into
+`src/contain.rs` to make this possible — it takes its root as an argument
+instead of reading a process-global, so the guarantee is a pure function of
+(root, path) and can be attacked directly. A guarantee nothing can exercise
+adversarially is a guarantee on trust.
 
-- **Resolution.** `build_graph` and everything in `extract/mod.rs` after the
-  per-file extract — candidate generation, package scoping, re-export chasing —
-  is where most of the logic lives and none of it is fuzzed here. It needs a
-  whole-tree input rather than one string, which is a different harness.
-- **The filesystem walk**, `--exclude` globs, and symlink handling.
-- **The MCP server**, including the root-containment guarantee `SECURITY.md`
-  makes and the output budgets. Those are the other two reportable areas and
-  they have tests, not fuzzing.
+The fixture is a fixed, hostile tree — a nested directory, a symlink out to a
+sibling the root must never reach, and a sibling whose name shares the root's
+prefix (which a textual comparison would wrongly accept). The fuzzer mutates
+the path string against that fixed layout, and the property has no third
+outcome: **either refused, or inside the root.**
+
+`build_graph` covers what the extractor targets cannot, because it needs a
+whole tree to mean anything: the filesystem walk, language dispatch, and above
+all resolution — candidate generation, package scoping, re-export chasing,
+which is where most of the logic lives. The input is split on NUL into
+alternating name and content, with names sanitised to one safe component: the
+point is to fuzz the analyser, not to discover that a fuzzer can ask to write
+to `/etc`.
+
+Beyond crashes it asserts the invariant `Diagnostics` documents —
+`call_sites == resolved + external + unresolved` — plus `heuristic <= resolved`
+and `dispatch <= resolved`. If those stop summing, every recall figure this
+project publishes is computed over a denominator that does not describe the
+tree, which is a worse failure than a panic.
+
+It is slower per iteration than the extractor targets, because each case writes
+a small tree and walks it. That is the price of covering the part that needs
+one.
+
+## Still not covered
+
+- **The MCP server's output budgets.** Every tool whose output scales with repo
+  size is capped, and that is one of `SECURITY.md`'s four reportable areas. It
+  has tests, including ones that assert a tool honours `max_tokens`, but no
+  fuzzing.
+- **`--exclude` glob handling** specifically. The walk is exercised by
+  `build_graph`, but the filter is installed from argv and is process-global,
+  so a fuzz target cannot vary it per iteration without changing scope for
+  every other case in the same process.
