@@ -18,6 +18,39 @@
 //! once, so a test that installed one would change the scope of every other
 //! test in the binary. `ctx --lang rust mcp` reports 16 modules against 22
 //! unfiltered on this repo, and a filtered `doctor` carries `SCOPE: FILTERED`.
+//!
+//! # Why ten tools and not eighteen
+//!
+//! The CLI has eighteen subcommands; ten are here. The eight that are not are
+//! excluded for reasons, not by oversight, and each reason is a property of
+//! the command rather than a gap waiting to be filled:
+//!
+//! - `parity <SOURCE> <TARGET>...` takes two or more roots. This server pins
+//!   itself to ONE root and refuses a path outside it, which `SECURITY.md`
+//!   states as a guarantee. A two-root command cannot honour that, so exposing
+//!   it would mean either breaking containment or inventing a second root for a
+//!   model to choose — and the containment guarantee exists precisely because a
+//!   model rather than a person is choosing.
+//! - `move-plan` and `move-verify` are write-adjacent: they exist to plan and
+//!   check an edit. `SECURITY.md` promises ctx does not write to the files it
+//!   analyses, and the cheapest way to keep that true is for the server not to
+//!   carry the commands whose whole subject is modification.
+//! - `changed` and `diff` are git-backed. `changed` builds the base ref in a
+//!   worktree, so it needs history the server may not have — a tree pinned by
+//!   `--root` need not be a repository at all — and it spends real time doing
+//!   it. A tool that is sometimes unavailable for reasons the caller cannot see
+//!   is worse than one that was never offered.
+//! - `snippet` is a setup step for a human: it emits the instructions block to
+//!   append to AGENTS.md. A model that can already call these tools has no use
+//!   for the text that tells it they exist.
+//! - `supported-exts` is introspection for `bench/run.sh`, which reads the
+//!   extension list from the binary rather than restating it.
+//! - `mcp` is this server. Exposing it would let a model start another one.
+//!
+//! The ten that remain are exactly the read-only, single-root queries. That is
+//! the line, and it is worth stating because the set looks arbitrary until the
+//! shared property is named: a tool here reads one tree and answers a question
+//! about it.
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
