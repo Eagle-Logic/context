@@ -12,7 +12,7 @@ current — this file had drifted a whole minor version before anyone noticed.
 Regenerate it in the release commit instead.
 
 The repo under analysis: **27 Rust files, 6 Markdown files, 3 Python files, 36 modules,
-7,291 call sites.** Small enough to read in a sitting, which makes it a fair place to
+7,383 call sites.** Small enough to read in a sitting, which makes it a fair place to
 check whether the answers are actually right.
 
 Timings are best-of-five on a warm page cache. The graph is rebuilt from source
@@ -144,8 +144,9 @@ extract::build_graph  [src/extract/mod.rs:239]  [+1 outside graph]
 │  ├─ extract::lang_selected  [src/extract/mod.rs:144]  (depth limit)
 │  └─ extract::walker  [src/extract/mod.rs:122]  (depth limit)
 └─ extract::typescript::extract  [src/extract/typescript.rs:12]  [+1 outside graph]
-   ├─ extract::typescript::module_level_item  [src/extract/typescript.rs:43]  (depth limit)
-   └─ extract::typescript::visit  [src/extract/typescript.rs:84]  (depth limit)
+   ├─ extract::typescript::module_level_item  [src/extract/typescript.rs:46]  (depth limit)
+   ├─ extract::typescript::prototype_impls  [src/extract/typescript.rs:415]  (depth limit)
+   └─ extract::typescript::visit  [src/extract/typescript.rs:87]  (depth limit)
 ```
 
 Three annotations carry the honesty:
@@ -271,21 +272,21 @@ $ ctx doctor
 Modules: 36  (markdown 6, python 3, rust 27)
 
 ## Internal recall — the number to trust
-  1497/1581 = 94.7%   of call sites that could be internal, ctx pinned this many.
+  1515/1600 = 94.7%   of call sites that could be internal, ctx pinned this many.
 
 A call site is "could be internal" when the callee name is defined somewhere
 under this root. Calls into std or a third-party crate are excluded, because no
 internal edge could exist for them however good the resolver gets.
 
 ## Every call site, bucketed
-call sites:            7291
-  internal edges:      1497   [29 heuristic (~), 0 dispatch fan-out (*)]
-  external (provable): 5710   (78.3%)  callee defined nowhere here — std/extern
-  unresolved internal: 84     (1.2%)  the real misses — see below
+call sites:            7383
+  internal edges:      1515   [29 heuristic (~), 0 dispatch fan-out (*)]
+  external (provable): 5783   (78.3%)  callee defined nowhere here — std/extern
+  unresolved internal: 85     (1.2%)  the real misses — see below
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
-     49  walk
+     50  walk
      11  context
       8  group
       4  est_tokens
@@ -300,8 +301,8 @@ grep these; every other edge in the map is one ctx could prove.
 
 ## Where the misses are
   extract::go                        21 unresolved   (module recall 89%)
+  extract::typescript                14 unresolved   (module recall 91%)
   extract::rust                      13 unresolved   (module recall 92%)
-  extract::typescript                13 unresolved   (module recall 91%)
   extract::python                    10 unresolved   (module recall 85%)
   mcp                                10 unresolved   (module recall 89%)
   scripts.regen-examples              7 unresolved   (module recall 42%)
@@ -316,7 +317,7 @@ grep these; every other edge in the map is one ctx could prove.
   query                            0% heuristic (1/274 edges)
 
 ## Not descended into (regions never read as code)
-  macro invocation         1091   in 26 module(s)
+  macro invocation         1108   in 26 module(s)
   module-level initializer     11   in 9 module(s)
   A call site inside one of these was never seen. It is absent, not
   unresolved, so it appears in NEITHER side of the recall figure above —
@@ -333,7 +334,7 @@ grep these; every other edge in the map is one ctx could prove.
 94.7% recall comes with **the exact grep list for the other 5.3%** — twelve
 names, with counts and the modules they live in.
 
-The denominator is honest too. 5,710 of 7,291 call sites go into `std` or a
+The denominator is honest too. 5,783 of 7,383 call sites go into `std` or a
 third-party crate, where no internal edge could ever exist, so they're excluded
 rather than quietly inflating the percentage. That classification is by evidence
 — *is this name defined anywhere under the root?* — not a hardcoded list.
