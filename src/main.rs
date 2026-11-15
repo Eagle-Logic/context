@@ -647,20 +647,8 @@ fn main() -> Result<()> {
             format,
         } => {
             let g = extract::build_graph(&path)?;
-            // Map git's repo-relative churn counts onto module names.
-            let churn_map = if churn {
-                let raw = git::churn(&path)?;
-                let repo = git::repo_root(&path)?;
-                let scan = path.canonicalize()?;
-                let prefix = scan.strip_prefix(&repo).unwrap_or(std::path::Path::new(""));
-                let mut mm = std::collections::HashMap::new();
-                for m in &g.modules {
-                    let rel = prefix.join(&m.file);
-                    if let Some(&c) = raw.get(rel.to_string_lossy().as_ref()) {
-                        mm.insert(m.name.clone(), c);
-                    }
-                }
-                Some(mm)
+            let churn_counts = if churn {
+                Some(churn_map(&path, &g)?)
             } else {
                 None
             };
@@ -669,7 +657,7 @@ fn main() -> Result<()> {
                 query::core(
                     &g,
                     limit,
-                    churn_map.as_ref(),
+                    churn_counts.as_ref(),
                     matches!(format, Format::Json)
                 )
             );
@@ -1159,14 +1147,22 @@ fn impact_text(
         // report and are never dropped, so say the cap was not met rather than
         // implying this output fits.
         let mut text = bare;
-        if matches!(format, Format::Md) {
-            let n = est_tokens(&text);
-            text.push_str(&format!(
-                "\n---\n[ctx] BUDGET NOT MET: the changed modules alone are ~{n} tokens, over \
-                 the {budget}-token budget. All neighbors were dropped. Narrow the diff, or use \
-                 `--view interface`.\n"
-            ));
-        }
+        let n = est_tokens(&text);
+        text = match format {
+            Format::Md => {
+                text.push_str(&format!(
+                    "\n---\n[ctx] BUDGET NOT MET: the changed modules alone are ~{n} tokens, over \
+                     the {budget}-token budget. All neighbors were dropped. Narrow the diff, or use \
+                     `--view interface`.\n"
+                ));
+                text
+            }
+            Format::Json => json_disclose(
+                text,
+                "budget_not_met",
+                serde_json::json!({ "est_tokens": n, "budget": budget, "neighbors_dropped": true }),
+            ),
+        };
         return text;
     }
     let (mut lo, mut hi) = (0usize, max_neighbors);
@@ -1347,14 +1343,77 @@ fn subtree_text(
     // Not satisfiable at any rung: the target module alone is over budget. Emit
     // the coarsest form and say so in band rather than implying a fit.
     let mut text = best.unwrap_or_else(|| render_at(View::Skeleton, Some(0)));
-    if matches!(format, Format::Md) {
-        text.push_str(&format!(
-            "\n---\n[ctx] BUDGET NOT MET: the target module alone is ~{} tokens, over the \
-             {budget}-token budget. Use `ctx def`/`ctx context <symbol>` for a smaller slice.\n",
-            est_tokens(&text)
-        ));
-    }
+    let over = est_tokens(&text);
+    text = match format {
+        Format::Md => {
+            text.push_str(&format!(
+                "\n---\n[ctx] BUDGET NOT MET: the target module alone is ~{over} tokens, over the \
+                 {budget}-token budget. Use `ctx def`/`ctx context <symbol>` for a smaller slice.\n"
+            ));
+            text
+        }
+        Format::Json => json_disclose(
+            text,
+            "budget_not_met",
+            serde_json::json!({ "est_tokens": over, "budget": budget }),
+        ),
+    };
     Ok(text)
+}
+
+/// Map git's repo-relative churn counts onto module names.
+///
+/// Shared by the CLI and the MCP server so the two cannot drift. The part worth
+/// sharing is the path arithmetic: `git log` reports paths relative to the REPO
+/// root, module files are relative to the SCAN root, and those differ whenever
+/// the scan root is a subdirectory — which is the case an MCP server pinned to
+/// a subtree hits by default.
+fn churn_map(
+    path: &std::path::Path,
+    g: &Graph,
+) -> Result<std::collections::HashMap<String, usize>> {
+    let raw = git::churn(path)?;
+    let repo = git::repo_root(path)?;
+    let scan = path.canonicalize()?;
+    let prefix = scan.strip_prefix(&repo).unwrap_or(std::path::Path::new(""));
+    let mut mm = std::collections::HashMap::new();
+    for m in &g.modules {
+        let rel = prefix.join(&m.file);
+        if let Some(&c) = raw.get(rel.to_string_lossy().as_ref()) {
+            mm.insert(m.name.clone(), c);
+        }
+    }
+    Ok(mm)
+}
+
+/// Attach a disclosure to an already-rendered JSON document.
+///
+/// The budget notices are the calibration claim in machine-readable form, and a
+/// JSON path that omits one is MORE confident than the Markdown path that
+/// carries it — the exact defect that shipped in 0.25.0 and was caught in
+/// review. So the note goes INSIDE the object rather than after it, where it
+/// would make the document unparseable.
+///
+/// The input is always this crate's own `to_string_pretty` output, so the parse
+/// cannot fail in practice. If it ever did, the note is appended as text: the
+/// result is invalid JSON that a consumer rejects loudly, which is strictly
+/// better than valid JSON quietly claiming a fit it never achieved.
+fn json_disclose(text: String, key: &str, value: serde_json::Value) -> String {
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(mut v) if v.is_object() => {
+            v.as_object_mut()
+                .expect("checked is_object")
+                .insert(key.to_string(), value);
+            match serde_json::to_string_pretty(&v) {
+                Ok(out) => out + "\n",
+                Err(_) => text,
+            }
+        }
+        _ => {
+            debug_assert!(false, "rendered JSON was not a parseable object");
+            text + &format!("\n[ctx] {key}: {value}\n")
+        }
+    }
 }
 
 /// Parse `--alias Old=New` into a container rename pair.
