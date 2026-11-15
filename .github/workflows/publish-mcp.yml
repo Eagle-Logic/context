@@ -7,12 +7,14 @@
 # So the real precondition is "crates.io serves this version" — not "this run
 # published it".
 #
-# Written as `needs: publish` first, which would have made the FIRST listing
-# impossible: 0.28.0 is already on crates.io, so a dispatch would fail at
-# `cargo publish` on a version that exists and the registry job would never
-# run. Gating on the artifact instead of on the job that produced it means a
-# dispatch works for a version published at any point in the past, which is
-# exactly what is needed to list a crate that is already four releases old.
+# Gated on the artifact rather than on the job that produced it, so a retry
+# does not need a tag moved. Note what that does NOT buy: a version already on
+# crates.io cannot be listed retroactively. The ownership token lives in the
+# README *baked into a published crate version*, so the first listing needs a
+# release carrying it, however current the repository's own README is. That was
+# learned the hard way — a dispatch for 0.28.0 failed with
+# "ownership validation failed ... must appear as 'mcp-name: ...' in the
+# package README", because 0.28.0 shipped before the token was added.
 #
 # Worth doing at all because the registry is the fan-out point: Glama, mcp.so,
 # PulseMCP, lobehub, playbooks and mcpservers.org mirror it. ctx was in none of
@@ -107,6 +109,42 @@ jobs:
           done
           echo "::error::crates.io never served $version, so the registry would fail ownership verification. Check that publish-crate.yml succeeded." >&2
           exit 1
+
+      # The check that actually predicts the registry's answer, and the one
+      # whose absence turned a plan into a failed release.
+      #
+      # scripts/check-server-json.py asserts the token is in THIS README, which
+      # is necessary and not sufficient: the registry reads the README embedded
+      # in the published crate version, and a version published before the
+      # token was added can never pass however correct the repository looks.
+      # Checking it here converts an opaque registry 400 into a message that
+      # names the fix.
+      #
+      # `-L` is load-bearing: crates.io answers this endpoint with a 302 to its
+      # CDN. Without it the body is empty, which the status check below catches
+      # — but a bare `grep` on that empty body "finds the token absent" and
+      # looks like a real answer. That is how the absence was first confirmed
+      # by hand, from a 0-byte file, before the redirect was noticed. Hence
+      # both the follow and the explicit 200 assertion.
+      - name: The published crate's README must carry the ownership token
+        run: |
+          set -euo pipefail
+          version='${{ steps.version.outputs.version }}'
+          name=$(jq -r '.name' server.json)
+          readme=$(mktemp)
+          code=$(curl -sSL --max-time 30 \
+            -H 'User-Agent: ctx-release (https://github.com/Eagle-Logic/context)' \
+            -o "$readme" -w '%{http_code}' \
+            "https://crates.io/api/v1/crates/code-context/$version/readme")
+          if [ "$code" != "200" ]; then
+            echo "::error::crates.io returned HTTP $code for the $version README; cannot verify the ownership token" >&2
+            exit 1
+          fi
+          if ! grep -q "mcp-name: $name" "$readme"; then
+            echo "::error::the published $version README does not contain 'mcp-name: $name', so the registry will reject this publish. The token must be in the README of a PUBLISHED crate version — add it, then cut a release. An already-published version cannot be fixed retroactively." >&2
+            exit 1
+          fi
+          echo "the published $version README carries the ownership token"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
