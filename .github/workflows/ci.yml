@@ -34,6 +34,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets --locked
+      # `--all-targets` excludes doctests, so they need naming: the doc
+      # comments here carry illustrations of what ctx does and does not see,
+      # and an indented block among them is a doctest rustdoc will try to
+      # compile. Two had been failing unnoticed for exactly that reason.
+      - run: cargo test --doc --locked
 
   lint:
     name: fmt + clippy
@@ -113,6 +118,10 @@ jobs:
       # claim, was stale for two releases and had dropped a low-confidence row.
       # Each move needed someone to remember a Markdown edit.
       - run: python3 scripts/check-readme-figures.py
+      # The MCP registry listing points at crates.io and proves ownership from
+      # a token in the rendered README. Both halves live in files nothing else
+      # watches, and the only error surfaces as a failed release days later.
+      - run: python3 scripts/check-server-json.py
 
   # BENCHMARK.md was the last published artifact with nothing watching it, and
   # it is the one whose whole purpose is credibility: every measured claim in

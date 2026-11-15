@@ -66,7 +66,7 @@ branch of a dynamic-dispatch fan-out is marked `*`. And `ctx doctor` names
 
 ```
 ## Internal recall — the number to trust
-  1515/1600 = 94.7%   of call sites that could be internal, ctx pinned this many.
+  1521/1606 = 94.7%   of call sites that could be internal, ctx pinned this many.
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
@@ -77,9 +77,9 @@ grep these; every other edge in the map is one ctx could prove.
 
 ## Low-confidence zones (edges to distrust — grep to confirm)
   parity                           18% heuristic (11/61 edges)
-  crate@main                       7% heuristic (9/127 edges)
+  main                             7% heuristic (9/127 edges)
   refactor                         5% heuristic (1/20 edges)
-  extract                          2% heuristic (4/229 edges)
+  extract                          2% heuristic (4/235 edges)
 ```
 
 The recall number comes with the exact grep list for everything it doesn't
@@ -804,6 +804,11 @@ standard protocol, so any MCP client works:
 ```sh
 claude mcp add ctx -- ctx mcp     # or your client's equivalent
 ```
+
+Registry name: `mcp-name: io.github.Eagle-Logic/ctx` — listed in the [official
+MCP registry](https://registry.modelcontextprotocol.io), which verifies crate
+ownership from this line. It is visible text rather than a comment because
+crates.io strips HTML comments when it renders this file.
 
 **The global flags work here, and they belong on the server rather than on each
 call.** Scan scope is fixed by argv before the server starts, so set it once
