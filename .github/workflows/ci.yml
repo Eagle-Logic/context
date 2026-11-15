@@ -118,6 +118,10 @@ jobs:
       # claim, was stale for two releases and had dropped a low-confidence row.
       # Each move needed someone to remember a Markdown edit.
       - run: python3 scripts/check-readme-figures.py
+      # The MCP registry listing points at crates.io and proves ownership from
+      # a token in the rendered README. Both halves live in files nothing else
+      # watches, and the only error surfaces as a failed release days later.
+      - run: python3 scripts/check-server-json.py
 
   # BENCHMARK.md was the last published artifact with nothing watching it, and
   # it is the one whose whole purpose is credibility: every measured claim in

@@ -3,12 +3,12 @@ name = "code-context"
 version = "0.28.0"
 edition = "2021"
 rust-version = "1.90"
-description = "ctx — a queryable code graph for coding agents: call graphs, blast radius, API breakage, cross-language port parity"
+description = "ctx — a queryable code graph for coding agents (CLI + MCP server): call graphs, blast radius, API-breakage gates, port parity. Rust, Python, TypeScript, Go, Java. Every answer reports its own completeness."
 license = "MIT"
 repository = "https://github.com/Eagle-Logic/context"
 homepage = "https://github.com/Eagle-Logic/context"
 readme = "README.md"
-keywords = ["ctx", "call-graph", "agent", "llm", "tree-sitter"]
+keywords = ["mcp", "call-graph", "static-analysis", "tree-sitter", "llm"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]

@@ -805,6 +805,11 @@ standard protocol, so any MCP client works:
 claude mcp add ctx -- ctx mcp     # or your client's equivalent
 ```
 
+Registry name: `mcp-name: io.github.Eagle-Logic/ctx` — listed in the [official
+MCP registry](https://registry.modelcontextprotocol.io), which verifies crate
+ownership from this line. It is visible text rather than a comment because
+crates.io strips HTML comments when it renders this file.
+
 **The global flags work here, and they belong on the server rather than on each
 call.** Scan scope is fixed by argv before the server starts, so set it once
 where you register the server:

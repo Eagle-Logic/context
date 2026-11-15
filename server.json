@@ -1,0 +1,37 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Eagle-Logic/ctx",
+  "title": "ctx — queryable code graph",
+  "description": "Call graphs, blast radius and API-breakage gates. Every answer reports its own completeness.",
+  "version": "0.28.0",
+  "repository": {
+    "url": "https://github.com/Eagle-Logic/context",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/Eagle-Logic/context#readme",
+  "packages": [
+    {
+      "registryType": "cargo",
+      "identifier": "code-context",
+      "version": "0.28.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "valueHint": "subcommand",
+          "value": "mcp",
+          "description": "Run as an MCP server over stdio. The crate installs one binary, `ctx`, whose other subcommands are the same queries on a terminal."
+        },
+        {
+          "type": "named",
+          "name": "--root",
+          "description": "Directory the server is allowed to read. Every path argument resolves against it and one that escapes it is refused, including via `..` or a symlink. Defaults to the working directory, which is correct for clients that launch the server in the project.",
+          "format": "filepath",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}
