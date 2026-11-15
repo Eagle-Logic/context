@@ -41,6 +41,33 @@ jobs:
             exit 1
           fi
 
+      # crates.io rejects a bad token with a 401 at UPLOAD — after packaging
+      # and a full verification build — and the message reads as "failed to
+      # publish" when it means "your token is wrong". That happened on the
+      # first real tag and cost two confused re-runs.
+      #
+      # /api/v1/me is read-only and answers the same question in two seconds,
+      # with no side effect and nothing published either way. crates.io also
+      # requires a User-Agent and 403s without one.
+      - name: Token is accepted by crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set on this repository" >&2
+            exit 1
+          fi
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: $CARGO_REGISTRY_TOKEN" \
+            -H 'User-Agent: ctx-release (https://github.com/Eagle-Logic/context)' \
+            https://crates.io/api/v1/me)
+          if [ "$code" != "200" ]; then
+            echo "::error::crates.io rejected the token (HTTP $code). Generate a new one at https://crates.io/me scoped to publish-update, then: gh secret set CARGO_REGISTRY_TOKEN --repo Eagle-Logic/context" >&2
+            exit 1
+          fi
+          echo "crates.io accepted the token"
+
       # --locked so the published crate builds against the lockfile that was
       # tested, not whatever resolves on the day.
       - name: Publish
