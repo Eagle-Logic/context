@@ -2302,6 +2302,75 @@ fn fmt_callers(names: &[String]) -> String {
 /// gate that cries wolf gets switched off, which is worse than no gate.
 ///
 /// Counts are returned rather than left for callers to parse out of the prose.
+/// Pair removals with additions that are the same item under a new name.
+///
+/// The public surface is keyed on the QUALIFIED name, so an item whose module
+/// is renamed reads as a removal plus an addition: identical kind, identical
+/// signature, identical bare name, in two places. Reporting that as breaking is
+/// a confidently wrong answer, and it fires on the commonest layout in Rust
+/// there is — adding a `src/lib.rs` beside a `src/main.rs` renames the binary's
+/// module, and with it every public item the binary exposes (#68).
+///
+/// Only a UNIQUE pairing counts. If two removals and two additions share a key
+/// there is no way to say which became which, and guessing would convert a
+/// reported breakage into a silent one. An ambiguous group therefore stays
+/// reported as removed and added, exactly as before — the same rule the rest of
+/// this tool follows, which is that an unprovable edge is disclosed rather than
+/// invented.
+#[allow(clippy::type_complexity)]
+fn split_moves<'a>(
+    removed: Vec<(&'a String, &'a Surface)>,
+    added: Vec<(&'a String, &'a Surface)>,
+) -> (
+    Vec<(&'a String, &'a String, &'a Surface)>,
+    Vec<(&'a String, &'a Surface)>,
+    Vec<(&'a String, &'a Surface)>,
+) {
+    // Bare name, because the qualified name is precisely what changed. Both
+    // separators, since `Lang::sep()` is `::` for Rust and `.` elsewhere.
+    let bare = |q: &str| q.rsplit([':', '.']).next().unwrap_or(q).to_string();
+    let key = |q: &str, s: &Surface| (s.kind.clone(), s.signature.clone(), bare(q));
+
+    let mut adds: HashMap<(String, String, String), Vec<usize>> = HashMap::new();
+    for (i, (q, c)) in added.iter().enumerate() {
+        adds.entry(key(q, c)).or_default().push(i);
+    }
+    let mut rems: HashMap<(String, String, String), Vec<usize>> = HashMap::new();
+    for (i, (q, b)) in removed.iter().enumerate() {
+        rems.entry(key(q, b)).or_default().push(i);
+    }
+
+    let mut moved = Vec::new();
+    let mut paired_r = vec![false; removed.len()];
+    let mut paired_a = vec![false; added.len()];
+    for (k, ris) in &rems {
+        let Some(ais) = adds.get(k) else { continue };
+        // One on each side, or it is not decidable.
+        if ris.len() != 1 || ais.len() != 1 {
+            continue;
+        }
+        let (ri, ai) = (ris[0], ais[0]);
+        paired_r[ri] = true;
+        paired_a[ai] = true;
+        moved.push((removed[ri].0, added[ai].0, added[ai].1));
+    }
+    moved.sort_by(|a, b| a.1.cmp(b.1));
+
+    let kept_removed = removed
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !paired_r[*i])
+        .map(|(_, e)| *e)
+        .collect();
+    let kept_added = added
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !paired_a[*i])
+        .map(|(_, e)| *e)
+        .collect();
+    (moved, kept_removed, kept_added)
+}
+
 pub fn api_report(
     base: &Graph,
     current: &Graph,
@@ -2322,26 +2391,32 @@ pub fn api_report(
     }
     let added: Vec<(&String, &Surface)> = cs.iter().filter(|(q, _)| !bs.contains_key(*q)).collect();
 
+    // A rename is not a deletion. Separated before anything is counted, so
+    // `--strict` fails on removals that are actually gone.
+    let (moved, removed, added) = split_moves(removed, added);
+
     if json_out {
         return (serde_json::to_string_pretty(&json!({
             "since": label,
             "removed": removed.iter().map(|(q, b)| json!({"name": q, "kind": b.kind, "signature": b.signature, "callers": caller_names(base, &b.match_q)})).collect::<Vec<_>>(),
             "changed": changed.iter().map(|(q, b, c)| json!({"name": q, "kind": c.kind, "was": b.signature, "now": c.signature, "callers": caller_names(current, &c.match_q)})).collect::<Vec<_>>(),
+            "moved": moved.iter().map(|(from, to, c)| json!({"from": from, "to": to, "kind": c.kind, "signature": c.signature})).collect::<Vec<_>>(),
             "added": added.iter().map(|(q, c)| json!({"name": q, "kind": c.kind, "signature": c.signature})).collect::<Vec<_>>(),
         }))
         .unwrap_or_default()
             + "\n", removed.len(), changed.len());
     }
 
-    if removed.is_empty() && changed.is_empty() && added.is_empty() {
+    if removed.is_empty() && changed.is_empty() && added.is_empty() && moved.is_empty() {
         return (format!("no public API changes vs {label}\n"), 0, 0);
     }
 
     let mut out = format!("# API changes vs {label}\n");
     out.push_str(&format!(
-        "{} removed, {} changed, {} added.\n",
+        "{} removed, {} changed, {} moved, {} added.\n",
         removed.len(),
         changed.len(),
+        moved.len(),
         added.len()
     ));
 
@@ -2360,6 +2435,17 @@ pub fn api_report(
             out.push_str(&format!("    was: {}\n", b.signature));
             out.push_str(&format!("    now: {}\n", c.signature));
             out.push_str(&fmt_callers(&caller_names(current, &c.match_q)));
+        }
+    }
+    if !moved.is_empty() {
+        // Same epistemic position as a signature change, and treated the same
+        // way: reported, not failed. ctx cannot see whether the old path is
+        // still reachable through a re-export, nor whether the item moved or
+        // its module was renamed underneath it.
+        out.push_str("\n## Moved — potentially breaking\n");
+        for (from, to, c) in &moved {
+            out.push_str(&format!("- {from} -> {to}  [{}]\n", c.kind));
+            out.push_str(&format!("    same: {}\n", c.signature));
         }
     }
     if !added.is_empty() {
@@ -3703,5 +3789,70 @@ export function run(s: S): number { return s.step(); }
             .nth(1)
             .map(|t| t.split_whitespace().next().unwrap_or("").to_string())
             .unwrap_or_default()
+    }
+
+    /// #68: adding a `src/lib.rs` beside a `src/main.rs` makes two files want
+    /// the module name `crate`, so `main.rs` is collision-renamed and every
+    /// public item in it changes qualified name. Before moves were detected,
+    /// `--strict` failed on that — on the commonest layout for a Rust CLI that
+    /// wants its logic testable.
+    #[test]
+    fn a_renamed_module_reads_as_a_move_not_a_removal() {
+        const MAIN: &str = "pub fn entry_point() -> usize { 42 }\nfn main() {}\n";
+        let (base, d1) = graph(&[("src/main.rs", MAIN)]);
+        let (cur, d2) = graph(&[
+            ("src/main.rs", MAIN),
+            ("src/lib.rs", "pub mod helper;\n"),
+            ("src/helper.rs", "pub fn help() -> usize { 2 }\n"),
+        ]);
+        let (report, removed, _changed) = api_report(&base, &cur, "base", false);
+        assert_eq!(
+            removed, 0,
+            "a module rename was counted as a public removal:\n{report}"
+        );
+        assert!(
+            report.contains("## Moved"),
+            "no Moved section for the renamed item:\n{report}"
+        );
+        assert!(
+            report.contains("entry_point"),
+            "the moved item is not named:\n{report}"
+        );
+        let _ = fs::remove_dir_all(d1);
+        let _ = fs::remove_dir_all(d2);
+    }
+
+    /// The pairing must be unique or it is not a pairing. Two identical
+    /// signatures moving at once cannot be matched up, and guessing which
+    /// became which would turn a reported breakage into a silent one — so an
+    /// ambiguous group stays reported as removed, which is what it was.
+    #[test]
+    fn an_ambiguous_rename_stays_reported_as_removed() {
+        const F: &str = "pub fn make() -> usize { 1 }\n";
+        let (base, d1) = graph(&[("src/alpha.rs", F), ("src/beta.rs", F)]);
+        let (cur, d2) = graph(&[("src/gamma.rs", F), ("src/delta.rs", F)]);
+        let (report, removed, _changed) = api_report(&base, &cur, "base", false);
+        assert_eq!(
+            removed, 2,
+            "an undecidable rename was silently paired off as a move:\n{report}"
+        );
+        assert!(
+            !report.contains("## Moved"),
+            "guessed a move it could not know:\n{report}"
+        );
+        let _ = fs::remove_dir_all(d1);
+        let _ = fs::remove_dir_all(d2);
+    }
+
+    /// A real deletion must still fail a --strict gate. The whole point of
+    /// separating moves is that what remains is trustworthy.
+    #[test]
+    fn a_real_removal_is_still_a_removal() {
+        let (base, d1) = graph(&[("src/a.rs", "pub fn gone() -> usize { 1 }\n")]);
+        let (cur, d2) = graph(&[("src/a.rs", "fn gone() -> usize { 1 }\n")]);
+        let (report, removed, _changed) = api_report(&base, &cur, "base", false);
+        assert_eq!(removed, 1, "a genuine removal stopped counting:\n{report}");
+        let _ = fs::remove_dir_all(d1);
+        let _ = fs::remove_dir_all(d2);
     }
 }

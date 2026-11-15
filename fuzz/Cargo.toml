@@ -54,3 +54,17 @@ path = "fuzz_targets/extract_markdown.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "root_containment"
+path = "fuzz_targets/root_containment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "build_graph"
+path = "fuzz_targets/build_graph.rs"
+test = false
+doc = false
+bench = false
