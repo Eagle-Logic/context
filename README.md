@@ -66,7 +66,7 @@ branch of a dynamic-dispatch fan-out is marked `*`. And `ctx doctor` names
 
 ```
 ## Internal recall — the number to trust
-  1486/1570 = 94.6%   of call sites that could be internal, ctx pinned this many.
+  1497/1581 = 94.7%   of call sites that could be internal, ctx pinned this many.
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
@@ -822,21 +822,37 @@ paid in every turn for something that never varies within a session.
 
 ### What the server does not expose, and why
 
-Seven CLI commands have no tool, each for its own reason — not one rule:
+Eighteen CLI subcommands; ten tools. The eight without one are excluded for
+reasons that are properties of the command, not gaps waiting to be filled:
 
 | command | why |
 |---|---|
-| `changed`, `diff` | need a git ref and build a second graph in a worktree; stateful and slow for a per-call tool |
-| `core --churn` | git-backed. Every tool here is a pure function of the source tree, and that is worth keeping |
-| `parity` | takes two paths and an alias table — a different shape from "one path, one name" |
-| `move-plan`, `move-verify` | emit a plan for someone to carry out; the useful output is a checklist, not a query result |
-| `snippet` | produces text for a human to paste into AGENTS.md |
-| `mcp` | the server itself |
+| `parity` | takes two or more roots. The server pins itself to ONE and refuses a path outside it, which is a guarantee in [SECURITY.md](SECURITY.md). A two-root command cannot honour that |
+| `move-plan`, `move-verify` | write-adjacent: they exist to plan and check an edit. ctx does not write to the files it analyses, and the cheapest way to keep that true is not to carry the commands whose subject is modification |
+| `changed`, `diff` | git-backed. `changed` builds the base ref in a worktree, so it needs history a `--root`-pinned tree may not have — it need not be a repository at all. A tool that is sometimes unavailable for reasons the caller cannot see is worse than one never offered |
+| `snippet` | a setup step for a human: the block to append to AGENTS.md. A model that can already call these tools has no use for the text saying they exist |
+| `supported-exts` | introspection for `bench/run.sh`, which reads the extension list from the binary rather than restating it |
+| `mcp` | the server itself. Exposing it would let a model start another one |
 
-`--format json` is also absent on purpose. Every tool returns the markdown an
-LLM reads, which already carries its own legend; a JSON variant would duplicate
-it and cost a `format` property on all ten schemas, paid every turn, for
-consumers that an MCP client does not have.
+The ten that remain are the read-only, single-root queries. The set looks
+arbitrary until the shared property is named: a tool here reads one tree and
+answers a question about it.
+
+**One exception, and it is opt-in.** `core` accepts `churn: true`, which shells
+out to `git log` over the whole history. That breaks the otherwise-true claim
+that every tool is a pure function of the source tree, so it is off by default
+and a failure is reported rather than degraded to a churn-free ranking — a
+caller who asked for churn would otherwise read a different question's answer
+with no sign of it.
+
+`map` and `subtree` also accept `format: json`. This README argued against that
+for two releases, on the grounds that an LLM reads the markdown perfectly well
+and a `format` property is paid in every turn whether or not it is used. The
+measured price is **82 resident tokens**, and the figures above include it. It
+was added anyway, for callers that post-process rather than read — with the
+caveat that the JSON must never be less forthcoming than the markdown, which it
+was: `subtree` dropped its budget disclosure entirely under `format=json`
+before the property was exposed.
 
 Each tool takes a `path` argument (default `.`); `def`/`callers`/`context` also
 take `name`, and `subtree` takes `module`.

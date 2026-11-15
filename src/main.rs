@@ -11,7 +11,7 @@ mod view;
 // sibling module's `crate::model::` / `crate::extract::` path still resolves —
 // to the library's single copy, rather than to a second compilation of 9.8k
 // lines.
-pub use code_context::{est_tokens, extract, model, BYTES_PER_TOKEN};
+pub use code_context::{contain, est_tokens, extract, model, BYTES_PER_TOKEN};
 
 use std::collections::BTreeSet;
 use std::fs;
