@@ -66,11 +66,11 @@ branch of a dynamic-dispatch fan-out is marked `*`. And `ctx doctor` names
 
 ```
 ## Internal recall — the number to trust
-  1472/1556 = 94.6%   of call sites that could be internal, ctx pinned this many.
+  1490/1575 = 94.6%   of call sites that could be internal, ctx pinned this many.
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
-     49  walk
+     50  walk
      11  context
       8  group
       4  est_tokens
@@ -961,24 +961,40 @@ other.
 
 CommonJS is handled alongside ESM — `const { a, b: c } = require('./y')`,
 `require('./y').z`, bare `require('./y')`, `module.exports = { … }`, and
-`exports.name = …`, which is a *definition* rather than a re-export and reaches
-`defined` accordingly. Without that, a Node module has no import edges at all.
+`exports.name = …`, which is a *definition* rather than a re-export — when the
+right-hand side is a function it becomes a real item, not just a known name, so
+calls can resolve to it. Without any of this, a Node module has no import edges
+at all.
 
-**Where it is weak, measured.** Modern ESM JavaScript does about as well as
-TypeScript — `preactjs/preact` reports 78.1% internal recall. `expressjs/express`
-reports **44.0%**, and the gap is one feature: express defines its API by
-assignment onto objects and prototypes.
+**Assignment-defined methods are in the graph.** Pre-class JavaScript declares
+its API by assignment, not declaration:
 
 ```js
 View.prototype.render = function render(options, callback) { … }
-res.render = function render(view, options, callback) { … }
+exports.json = function json(options) { … }
 ```
 
-ctx sees definitions, not assignments, so those names are not in the graph and
-calls to them cannot resolve. It is the dominant pattern in pre-class Node code
-and untouched by this support. `ctx doctor` names every one of them rather than
-absorbing them into an average, which is the only reason the 44% above is
-quotable at all.
+Both forms now produce real items. Prototype methods are bucketed by their type
+into one synthetic `impl X` container per file — the same shape the Go extractor
+builds for `func (r *T) M()`, so a prototype method resolves by the same `T.M`
+path with no resolver change. On `expressjs/express` (`43fca52`) that moves
+internal recall from **42.6% to 46.8%**.
+
+**And it moved preact's number down, which is the more interesting half.**
+`preactjs/preact` went from 78.1% to **69.4%**, because `setState` alone went
+from invisible to 301 disclosed misses. Nothing got worse: `Component.prototype.
+setState` is defined in that tree, so those 301 calls were never external, and
+counting them as external asserted that *no internal edge could ever exist* for
+them. That was false. They are ambiguous — two real definitions compete,
+`BaseComponent.setState` in `src/component.js` and a debug-mode monkey-patch in
+`debug/src/debug.js` — and a call through an untyped `this` cannot be pinned to
+either, so ctx drops the edge and says so rather than guessing.
+
+So the earlier framing here was wrong in a way worth recording: the 34-point gap
+between preact and express was not all express's fault. Part of it was preact's
+figure flattering itself by classifying real misses as someone else's problem.
+`ctx doctor` names all 965 of them with the grep to confirm, which is the only
+reason either number is quotable.
 
 ## Go: the package is the unit
 

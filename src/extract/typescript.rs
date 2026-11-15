@@ -27,6 +27,9 @@ pub fn extract(src: &str, tsx: bool) -> Result<FileFacts> {
     let mut items = Vec::new();
     let root = tree.root_node();
     visit(root, src, &mut items, &mut facts);
+    for it in prototype_impls(root, src, &mut facts) {
+        items.push(it);
+    }
     if let Some(it) = module_level_item(root, src) {
         items.insert(0, it);
     }
@@ -91,7 +94,7 @@ fn visit(node: Node, src: &str, items: &mut Vec<Item>, facts: &mut FileFacts) {
             // most `.js` in the wild names its dependencies, and without it a
             // Node module has no import edges at all — free-function calls into
             // it become misses, because nothing binds the name.
-            "expression_statement" => parse_cjs(child, src, facts),
+            "expression_statement" => parse_cjs(child, src, items, facts),
             k if DECL_KINDS.contains(&k) => definition(child, child, src, items, facts, false),
             "lexical_declaration" | "variable_declaration" => {
                 lexical(child, child, src, items, facts, false)
@@ -391,6 +394,132 @@ fn lexical(
     }
 }
 
+/// `X.prototype.name = function (...)` — methods bucketed by `X` and emitted as
+/// one synthetic `impl X` container per type.
+///
+/// Pre-class JavaScript defines its API by assignment, so these never reached
+/// the graph: `expressjs/express` declares `View.prototype.render` and then
+/// calls `view.render(options, callback)` on a `new View(...)`, and the callee
+/// had nothing to resolve to (#36).
+///
+/// The container shape is the Go extractor's, deliberately. `func (r *T) M()`
+/// is not lexically inside `T` either, and `build_universe` already indexes
+/// methods from an `impl` item — so a prototype method becomes reachable by the
+/// same `T.M` path as a Go method or a Rust inherent one, with no resolver
+/// change at all.
+///
+/// Module level only. A prototype assignment inside a function body is
+/// conditional on that function running, and ctx does not model that; claiming
+/// the method unconditionally would be a guess about control flow rather than a
+/// fact about the source.
+fn prototype_impls(root: Node, src: &str, facts: &mut FileFacts) -> Vec<Item> {
+    let mut by_type: BTreeMap<String, Vec<Item>> = BTreeMap::new();
+    let mut cursor = root.walk();
+    for stmt in root.named_children(&mut cursor) {
+        if stmt.kind() != "expression_statement" {
+            continue;
+        }
+        let Some(expr) = stmt.named_children(&mut stmt.walk()).next() else {
+            continue;
+        };
+        if expr.kind() != "assignment_expression" {
+            continue;
+        }
+        let (Some(left), Some(right)) = (
+            expr.child_by_field_name("left"),
+            expr.child_by_field_name("right"),
+        ) else {
+            continue;
+        };
+        let target = collapse(text(left, src));
+        // `X.prototype.name`, and nothing deeper: `X.prototype.a.b` is a
+        // property of a method, not a method.
+        let Some((ty, name)) = target.split_once(".prototype.") else {
+            continue;
+        };
+        if ty.is_empty() || name.is_empty() || ty.contains('.') || name.contains('.') {
+            continue;
+        }
+        let Some(it) = fn_item_from_value(right, &format!("{ty}.prototype.{name}"), name, src)
+        else {
+            continue;
+        };
+        facts.defined.insert(name.to_string());
+        by_type.entry(ty.to_string()).or_default().push(it);
+    }
+
+    by_type
+        .into_iter()
+        .map(|(ty, children)| {
+            let line = children.iter().map(|c| c.line).min().unwrap_or(1);
+            let end_line = children.iter().map(|c| c.end_line).max().unwrap_or(line);
+            // Hashed over the method set, not a source span: prototype
+            // assignments for one type need not be contiguous, so there is no
+            // span to hash. Same reasoning as the Go extractor.
+            let joined: String = children
+                .iter()
+                .map(|c| format!("{}{}", c.signature, c.hash))
+                .collect();
+            Item {
+                kind: "impl".to_string(),
+                signature: format!("impl {ty}"),
+                line,
+                end_line,
+                hash: crate::model::content_hash(&joined),
+                doc: None,
+                calls: Vec::new(),
+                children,
+                arity: None,
+                name: Some(ty),
+                raw_calls: Vec::new(),
+                implements: Vec::new(),
+                field_types: BTreeMap::new(),
+            }
+        })
+        .collect()
+}
+
+/// An item for `<target> = function (...) {...}`, where the assignment IS the
+/// definition.
+///
+/// Returns None when the right-hand side is not a function: `exports.VERSION =
+/// '1.0'` is a value, not a callable, and inventing a callable item for it
+/// would put a name in the graph that no call could legitimately reach.
+///
+/// The signature is written `exports.name = (args) =>` rather than
+/// `const name = ...` because that is what the source says. It also reads as
+/// public to `view::is_public`, which asks whether a TypeScript signature
+/// starts with `export` — true of `exports.` by spelling, and right by meaning:
+/// an `exports.x` assignment IS the CommonJS public surface.
+fn fn_item_from_value(value: Node, sig_lhs: &str, name: &str, src: &str) -> Option<Item> {
+    if !matches!(
+        value.kind(),
+        "arrow_function" | "function_expression" | "function"
+    ) {
+        return None;
+    }
+    let body = value.child_by_field_name("body");
+    let params = value
+        .child_by_field_name("parameters")
+        .map(|p| collapse(text(p, src)))
+        .unwrap_or_else(|| "()".to_string());
+    let env = fn_env(value, src);
+    let calls = body
+        .map(|b| collect_calls(b, src, &env))
+        .unwrap_or_default();
+    let mut it = mk(
+        "fn",
+        clip(&format!("{sig_lhs} = {params} =>")),
+        value,
+        src,
+        Vec::new(),
+        Some(name.to_string()),
+    );
+    it.raw_calls = calls;
+    it.arity = arity_from(value);
+    Some(it)
+}
+
 /// Public methods of a class body (private/protected/`#` members dropped).
 fn class_members(body: Node, src: &str) -> Vec<Item> {
     let mut out = Vec::new();
@@ -645,7 +774,7 @@ fn bind_require(
 /// `exports.name = fn` is a *definition*, not just a re-export — it is the only
 /// place that name exists — so it has to reach `defined`, or every call into it
 /// from another module resolves to nothing.
-fn parse_cjs(stmt: Node, src: &str, facts: &mut FileFacts) {
+fn parse_cjs(stmt: Node, src: &str, items: &mut Vec<Item>, facts: &mut FileFacts) {
     let Some(expr) = stmt.named_children(&mut stmt.walk()).next() else {
         return;
     };
@@ -676,6 +805,17 @@ fn parse_cjs(stmt: Node, src: &str, facts: &mut FileFacts) {
                 path: name.to_string(),
                 public: true,
             });
+            // And when the right-hand side is the function itself, this is the
+            // only place that definition exists, so it needs an ITEM and not
+            // just a name. A name in `defined` is enough to classify a call as
+            // internal-and-unresolved; it is not enough for an edge to point
+            // at, because edges resolve to items. That is why `expressjs/
+            // express` reported 42.6% recall with `json` x72, `before` x59 and
+            // `static` x17 among its top misses: the names were all known and
+            // none of them was reachable (#36).
+            if let Some(it) = fn_item_from_value(right, &format!("exports.{name}"), name, src) {
+                items.push(it);
+            }
         }
         return;
     }
@@ -1057,5 +1197,109 @@ mod tests {
         let facts = extract("export function foo() {}\nexport class Bar {}\n", true).unwrap();
         assert!(facts.defined.contains("foo"));
         assert!(facts.defined.contains("Bar"));
+    }
+
+    /// #36: pre-class JavaScript defines its API by assignment, so these never
+    /// reached the graph. The container shape is the Go extractor's, so a
+    /// prototype method becomes reachable by the same `T.M` path as a Go method
+    /// with no resolver change.
+    #[test]
+    fn prototype_assignment_becomes_an_impl_container() {
+        let f = facts_of(
+            "function View(n) { this.n = n; }\n\
+             View.prototype.render = function render(opts) { return opts; };\n\
+             View.prototype.lookup = function lookup(p) { return p; };\n",
+        );
+        let impls: Vec<&Item> = f.items.iter().filter(|i| i.kind == "impl").collect();
+        assert_eq!(impls.len(), 1, "expected one impl container");
+        let imp = impls[0];
+        assert_eq!(imp.name.as_deref(), Some("View"));
+        assert_eq!(imp.signature, "impl View");
+        let mut names: Vec<&str> = imp
+            .children
+            .iter()
+            .filter_map(|c| c.name.as_deref())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["lookup", "render"]);
+        assert!(f.defined.contains("render"), "method name must be defined");
+    }
+
+    /// A method's body has to be walked, or the edges out of it are invisible —
+    /// which is the half of #36 that is about what ctx SEES, not what it
+    /// resolves.
+    #[test]
+    fn prototype_method_bodies_contribute_calls() {
+        let f = facts_of(
+            "function V() {}\n\
+             function helper(x) { return x; }\n\
+             V.prototype.go = function go(a) { return helper(a); };\n",
+        );
+        let imp = f.items.iter().find(|i| i.kind == "impl").expect("impl");
+        let m = &imp.children[0];
+        let paths: Vec<&str> = m.raw_calls.iter().map(|c| c.path.as_str()).collect();
+        assert!(
+            paths.iter().any(|p| p.contains("helper")),
+            "method body was not walked: {paths:?}"
+        );
+    }
+
+    /// Module level only. A prototype assignment inside a function body is
+    /// conditional on that function running, and claiming the method
+    /// unconditionally would be a guess about control flow.
+    #[test]
+    fn prototype_assignment_inside_a_function_is_not_hoisted() {
+        let f = facts_of(
+            "function V() {}\n\
+             function install() { V.prototype.late = function late() { return 1; }; }\n",
+        );
+        assert!(
+            !f.items.iter().any(|i| i.kind == "impl"),
+            "a conditional assignment was claimed as a method"
+        );
+    }
+
+    /// `exports.name = fn` was already a *name*; it needed to be an ITEM, or no
+    /// edge could point at it. A name in `defined` classifies a call as
+    /// internal-and-unresolved; only an item lets it resolve.
+    #[test]
+    fn exports_assignment_of_a_function_becomes_an_item() {
+        let f = facts_of("exports.json = function json(o) { return o; };\n");
+        let it = f
+            .items
+            .iter()
+            .find(|i| i.name.as_deref() == Some("json") && i.kind == "fn")
+            .expect("no item for exports.json");
+        assert!(
+            it.signature.starts_with("exports.json"),
+            "signature should say what the source says: {}",
+            it.signature
+        );
+        // `view::is_public` lives in the binary crate and cannot be reached
+        // from here, so assert the property it keys on: a TypeScript signature
+        // is public when it starts with `export`. True of `exports.` by
+        // spelling, and right by meaning — an `exports.x` assignment IS the
+        // CommonJS public surface. If that rule ever stops being a prefix
+        // check, this assertion is the thing that should fail.
+        assert!(
+            it.signature.starts_with("export"),
+            "exports.x must read as public surface: {}",
+            it.signature
+        );
+    }
+
+    /// A value is not a callable. Inventing an item for one would put a name in
+    /// the graph that no call could legitimately reach.
+    #[test]
+    fn exports_assignment_of_a_value_is_not_an_item() {
+        let f = facts_of("exports.VERSION = '1.2.3';\n");
+        assert!(
+            !f.items.iter().any(|i| i.name.as_deref() == Some("VERSION")),
+            "a string constant became a callable item"
+        );
+        assert!(
+            f.defined.contains("VERSION"),
+            "the name is still a definition, just not a callable one"
+        );
     }
 }

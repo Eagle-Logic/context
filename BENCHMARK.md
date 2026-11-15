@@ -33,7 +33,7 @@ could not pin — and `ctx doctor` names every one of them with a grep to confir
 | got | ts | `e1d87d2` | 88 | **1920/2184 = 87.9%** | 264 | `now` ×71, `setTimeout` ×55, `request` ×49 |
 | cobra | go | `adbc881` | 36 | **2278/2283 = 99.8%** | 5 | `string` ×3, `Len` ×2 |
 | chi | go | `3d1777a` | 84 | **1569/1752 = 89.6%** | 183 | `ServeHTTP` ×98, `Get` ×41, `Context` ×5 |
-| preact | ts | `8101ff8` | 223 | **2176/2787 = 78.1%** | 611 | `createElement` ×92, `render` ×79, `hydrate` ×40 |
+| preact | ts | `8101ff8` | 223 | **2189/3154 = 69.4%** | 965 | `setState` ×301, `createElement` ×92, `render` ×79 |
 | commons-lang | java | `66f9309` | 629 | **12213/14294 = 85.4%** | 2081 | `isEquals` ×243, `build` ×161, `appendSuper` ×65 |
 
 ## Cost of an answer: `ctx callers` vs a fair grep
@@ -75,9 +75,9 @@ callers, not a list of lines.
 | chi | `HandlerFunc` | 169 | 5402 | 153 | 35.3x | 2 | name collision |
 | chi | `testRequest` | 154 | 5177 | 1468 | 3.5x | 40 | ambiguous |
 | preact | `render` | 2087 | 49845 | 272 | 183.3x | 2 | incomplete |
+| preact | `setState` | 323 | 9389 | 230 | 40.8x | 0 | incomplete |
 | preact | `constructor` | 264 | 6043 | 193 | 31.3x | 0 | incomplete |
 | preact | `clearLog` | 214 | 4149 | 391 | 10.6x | 8 | **complete** |
-| preact | `div` | 98 | 2567 | 320 | 8.0x | 7 | incomplete |
 | commons-lang | `append` | 2484 | 133323 | 9668 | 13.8x | 126 | name collision |
 | commons-lang | `toString` | 2143 | 113287 | 16844 | 6.7x | 211 | ambiguous |
 | commons-lang | `isSameLength` | 1452 | 68708 | 187 | 367.4x | 0 | ambiguous |
