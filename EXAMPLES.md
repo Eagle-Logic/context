@@ -271,7 +271,7 @@ $ ctx doctor
 Modules: 33  (markdown 6, python 3, rust 24)
 
 ## Internal recall — the number to trust
-  1471/1552 = 94.8%   of call sites that could be internal, ctx pinned this many.
+  1460/1541 = 94.7%   of call sites that could be internal, ctx pinned this many.
 
 A call site is "could be internal" when the callee name is defined somewhere
 under this root. Calls into std or a third-party crate are excluded, because no
@@ -279,8 +279,8 @@ internal edge could exist for them however good the resolver gets.
 
 ## Every call site, bucketed
 call sites:            7075
-  internal edges:      1471   [29 heuristic (~), 0 dispatch fan-out (*)]
-  external (provable): 5523   (78.1%)  callee defined nowhere here — std/extern
+  internal edges:      1460   [29 heuristic (~), 0 dispatch fan-out (*)]
+  external (provable): 5534   (78.2%)  callee defined nowhere here — std/extern
   unresolved internal: 81     (1.1%)  the real misses — see below
 
 ## What ctx missed (callee names that exist here but went unpinned)
@@ -308,7 +308,7 @@ grep these; every other edge in the map is one ctx could prove.
 
 ## Low-confidence zones (edges to distrust — grep to confirm)
   parity                           18% heuristic (11/61 edges)
-  crate@main                       7% heuristic (9/135 edges)
+  crate@main                       7% heuristic (9/124 edges)
   refactor                         5% heuristic (1/20 edges)
   extract                          2% heuristic (4/229 edges)
   query                            0% heuristic (1/260 edges)
@@ -328,10 +328,10 @@ grep these; every other edge in the map is one ctx could prove.
   (supported: .rs .py .ts .tsx .js .jsx .mjs .cjs .go .java .md .markdown)
 ```
 
-94.8% recall comes with **the exact grep list for the other 5.2%** — ten
+94.7% recall comes with **the exact grep list for the other 5.3%** — ten
 names, with counts and the modules they live in.
 
-The denominator is honest too. 5,523 of 7,075 call sites go into `std` or a
+The denominator is honest too. 5,534 of 7,075 call sites go into `std` or a
 third-party crate, where no internal edge could ever exist, so they're excluded
 rather than quietly inflating the percentage. That classification is by evidence
 — *is this name defined anywhere under the root?* — not a hardcoded list.

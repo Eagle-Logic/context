@@ -148,8 +148,17 @@ jobs:
             exit 1
           fi
 
+      # --exclude scripts/** because ctx's public API is the CLI and the MCP
+      # server; the maintenance scripts are tooling, not anyone's API. Without
+      # it, moving a helper from regen-examples.py into the shared
+      # _staleness.py reads as a BREAKING REMOVAL — ctx tracks `def` sites, so
+      # the `from _staleness import refuse_if_stale` that keeps the name
+      # reachable does not count as a definition. A gate that fails on an
+      # internal file move is a gate maintainers learn to override, which
+      # costs more than the Python coverage was ever worth.
       - name: ctx changed --api --strict — public API removals vs the base
         if: github.event_name == 'pull_request'
         run: |
           ./target/debug/ctx changed --api --strict \
+            --exclude 'scripts/**' \
             --since "origin/${{ github.base_ref }}"

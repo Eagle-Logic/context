@@ -17,3 +17,16 @@
 
 pub mod extract;
 pub mod model;
+
+/// Bytes per token for budget arithmetic.
+///
+/// `len/4` is the familiar rule of thumb, but measured against a real tokenizer
+/// on this tool's own output it under-counts by 5-23% — code and Markdown are
+/// denser than prose English. A cap that overshoots is not a cap, so budgets use
+/// a conservative divisor: better to under-fill than to blow the window.
+pub const BYTES_PER_TOKEN: usize = 3;
+
+/// Estimated tokens for rendered output.
+pub fn est_tokens(text: &str) -> usize {
+    text.len() / BYTES_PER_TOKEN
+}
