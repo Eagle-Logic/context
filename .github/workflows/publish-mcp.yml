@@ -1,0 +1,156 @@
+# Announce the crate to the official MCP registry.
+#
+# Separate from publish-crate.yml, and gated on crates.io rather than on that
+# workflow, deliberately. The registry hosts no artifacts: it stores metadata
+# pointing at crates.io, then verifies the claim by fetching the crate's
+# rendered README and looking for an `mcp-name:` token matching server.json.
+# So the real precondition is "crates.io serves this version" — not "this run
+# published it".
+#
+# Written as `needs: publish` first, which would have made the FIRST listing
+# impossible: 0.28.0 is already on crates.io, so a dispatch would fail at
+# `cargo publish` on a version that exists and the registry job would never
+# run. Gating on the artifact instead of on the job that produced it means a
+# dispatch works for a version published at any point in the past, which is
+# exactly what is needed to list a crate that is already four releases old.
+#
+# Worth doing at all because the registry is the fan-out point: Glama, mcp.so,
+# PulseMCP, lobehub, playbooks and mcpservers.org mirror it. ctx was in none of
+# them, and searching its own category returned sixteen results with this
+# project in none of them either.
+name: Publish MCP server
+
+on:
+  push:
+    tags:
+      - '**[0-9]+.[0-9]+.[0-9]+*'
+  # Lists whatever version the checked out Cargo.toml declares, provided
+  # crates.io already serves it. This is the path for a first listing, and for
+  # retrying a failure in this workflow without moving a tag.
+  workflow_dispatch:
+
+jobs:
+  mcp-registry:
+    name: publish to the MCP registry
+    runs-on: ubuntu-latest
+    permissions:
+      # OIDC, and not a token, for a specific reason: `mcp-publisher login
+      # github` CANNOT reach an organization namespace. Its device flow
+      # authenticates against a GitHub App, GitHub App user tokens cannot read
+      # org memberships, so the registry sees no org this account owns and
+      # grants only the personal namespace — regardless of role, and whether or
+      # not the membership is public. The name here is
+      # `io.github.Eagle-Logic/ctx`, an org namespace, so the interactive path
+      # cannot publish it at all. OIDC carries the repository's own identity
+      # and is unaffected.
+      # https://github.com/modelcontextprotocol/registry/issues/1468
+      id-token: write
+      contents: read
+    env:
+      # Pinned deliberately, with the Sigstore bundle verified below. Not
+      # `releases/latest`, which is mutable: this job holds a token that can
+      # publish under the whole `io.github.Eagle-Logic/*` namespace, not just
+      # this one server, so the binary that uses it is not fetched from a
+      # moving target.
+      MCP_PUBLISHER_VERSION: v1.8.1
+    steps:
+      - uses: actions/checkout@v7
+
+      # Same reasoning as "Tag must match Cargo.toml" in publish-crate.yml, for
+      # the file the registry reads. Also asserts the ownership token is
+      # visible markdown rather than an HTML comment — crates.io strips
+      # comments, so the commented form documented for PyPI and NuGet renders
+      # to nothing here and verifies against a README that looks correct.
+      - name: server.json must be current
+        run: python3 scripts/check-server-json.py
+
+      # On a tag the tag is the authority; on a dispatch Cargo.toml is. Either
+      # way the version is derived rather than read from a file someone has to
+      # remember to edit.
+      - name: Resolve the version to publish
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version=$(cargo metadata --no-deps --format-version 1 \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          jq --arg v "$version" \
+            '.version = $v | (.packages[] | select(.registryType == "cargo") | .version) |= $v' \
+            server.json > server.tmp && mv server.tmp server.json
+          jq -r '"publishing \(.name) \(.version)"' server.json
+
+      # crates.io serves the rendered README from a CDN, so a version published
+      # moments ago is not necessarily readable yet. The registry fetching it
+      # too early fails ownership verification on a crate that is perfectly
+      # fine, so wait for the version to actually be visible rather than
+      # sleeping a guessed interval. Already-published versions pass on the
+      # first attempt.
+      - name: Wait for crates.io to serve the version
+        run: |
+          set -euo pipefail
+          version='${{ steps.version.outputs.version }}'
+          for attempt in $(seq 1 30); do
+            found=$(curl -sS \
+              -H 'User-Agent: ctx-release (https://github.com/Eagle-Logic/context)' \
+              "https://crates.io/api/v1/crates/code-context/$version" \
+              | jq -r '.version.num // empty')
+            if [ "$found" = "$version" ]; then
+              echo "crates.io is serving $version"
+              exit 0
+            fi
+            echo "attempt $attempt: crates.io does not serve $version yet"
+            sleep 10
+          done
+          echo "::error::crates.io never served $version, so the registry would fail ownership verification. Check that publish-crate.yml succeeded." >&2
+          exit 1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Download and verify mcp-publisher
+        run: |
+          set -euo pipefail
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          arch="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+          archive="mcp-publisher_${os}_${arch}.tar.gz"
+          base_url="https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}"
+
+          curl --fail --location --silent --show-error --output "$archive" "$base_url/$archive"
+          curl --fail --location --silent --show-error --output "$archive.sigstore.json" "$base_url/$archive.sigstore.json"
+          cosign verify-blob \
+            --bundle "$archive.sigstore.json" \
+            --certificate-identity "https://github.com/modelcontextprotocol/registry/.github/workflows/release.yml@refs/tags/${MCP_PUBLISHER_VERSION}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$archive"
+          tar xzf "$archive" mcp-publisher
+          rm -f "$archive" "$archive.sigstore.json"
+
+      - name: Authenticate to the MCP registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish
+        run: ./mcp-publisher publish
+
+      # The publish reports success before the entry is queryable, and a
+      # listing nobody can find is the problem this whole workflow exists to
+      # fix. Confirm it rather than trusting the exit code.
+      - name: Confirm the entry is live
+        run: |
+          set -euo pipefail
+          name=$(jq -r '.name' server.json)
+          for attempt in $(seq 1 12); do
+            found=$(curl -sS "https://registry.modelcontextprotocol.io/v0.1/servers?search=$name" \
+              | jq -r --arg n "$name" '.servers[]?.server | select(.name == $n) | .name' | head -1)
+            if [ "$found" = "$name" ]; then
+              echo "registry is serving $name"
+              exit 0
+            fi
+            echo "attempt $attempt: registry does not list $name yet"
+            sleep 10
+          done
+          echo "::error::published, but the registry never listed $name" >&2
+          exit 1
