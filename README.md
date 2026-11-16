@@ -66,13 +66,13 @@ branch of a dynamic-dispatch fan-out is marked `*`. And `ctx doctor` names
 
 ```
 ## Internal recall — the number to trust
-  1521/1608 = 94.6%   of call sites that could be internal, ctx pinned this many.
+  1521/1611 = 94.4%   of call sites that could be internal, ctx pinned this many.
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
      50  walk
+     13  group
      11  context
-     10  group
       4  est_tokens
 
 ## Low-confidence zones (edges to distrust — grep to confirm)
@@ -347,6 +347,16 @@ npx @eagle-logic/ctx doctor .
 The npm package wraps the same prebuilt binaries as the installers above, so it
 is the same tool, not a reimplementation. It exists because an agent evaluating
 ctx mid-session can run `npx` but cannot install a Rust toolchain.
+
+There is also a `Dockerfile`, which runs the MCP server over stdio against a
+mounted tree. No image is published, and it is slower and larger than every
+route above — it exists because MCP directory checks start a server in a
+container:
+
+```sh
+docker build -t ctx-mcp .
+docker run --rm -i -v "$PWD:/workspace:ro" ctx-mcp
+```
 
 With a Rust toolchain (1.90+):
 

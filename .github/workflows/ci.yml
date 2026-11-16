@@ -122,6 +122,12 @@ jobs:
       # a token in the rendered README. Both halves live in files nothing else
       # watches, and the only error surfaces as a failed release days later.
       - run: python3 scripts/check-server-json.py
+      # The Dockerfile is not built here: a docker build costs minutes for an
+      # image that is on nobody's install path. What it is built FOR is a
+      # directory check — Glama starts the server in a container and introspects
+      # it, and awesome-mcp-servers requires that listing. So the two values
+      # that rot silently, the MSRV pin and the entrypoint, are checked instead.
+      - run: python3 scripts/check-dockerfile.py
 
   # BENCHMARK.md was the last published artifact with nothing watching it, and
   # it is the one whose whole purpose is credibility: every measured claim in
