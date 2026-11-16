@@ -15,6 +15,12 @@ categories = ["command-line-utilities", "development-tools"]
 name = "ctx"
 path = "src/main.rs"
 
+# Name the npm package after the BINARY, as the Homebrew formula is, so the
+# command people type matches the thing they heard: `npx @eagle-logic/ctx`.
+# Without this the package would take the crate name, `code-context`.
+[package.metadata.dist]
+npm-package = "ctx"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

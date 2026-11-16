@@ -66,13 +66,13 @@ branch of a dynamic-dispatch fan-out is marked `*`. And `ctx doctor` names
 
 ```
 ## Internal recall — the number to trust
-  1521/1606 = 94.7%   of call sites that could be internal, ctx pinned this many.
+  1521/1608 = 94.6%   of call sites that could be internal, ctx pinned this many.
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
      50  walk
      11  context
-      8  group
+     10  group
       4  est_tokens
 
 ## Low-confidence zones (edges to distrust — grep to confirm)
@@ -337,6 +337,16 @@ irm https://github.com/Eagle-Logic/context/releases/latest/download/code-context
 # Homebrew
 brew install eagle-logic/tap/ctx
 ```
+
+**To try it without installing anything**, if you have node:
+
+```sh
+npx @eagle-logic/ctx doctor .
+```
+
+The npm package wraps the same prebuilt binaries as the installers above, so it
+is the same tool, not a reimplementation. It exists because an agent evaluating
+ctx mid-session can run `npx` but cannot install a Rust toolchain.
 
 With a Rust toolchain (1.90+):
 
@@ -803,6 +813,13 @@ standard protocol, so any MCP client works:
 
 ```sh
 claude mcp add ctx -- ctx mcp     # or your client's equivalent
+```
+
+With nothing installed, `npx` works the same way — slower on first call, because
+it fetches the binary before the server starts:
+
+```sh
+claude mcp add ctx -- npx -y @eagle-logic/ctx mcp
 ```
 
 Registry name: `mcp-name: io.github.Eagle-Logic/ctx` — listed in the [official

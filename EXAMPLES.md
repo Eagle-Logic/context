@@ -12,7 +12,7 @@ current — this file had drifted a whole minor version before anyone noticed.
 Regenerate it in the release commit instead.
 
 The repo under analysis: **27 Rust files, 6 Markdown files, 4 Python files, 37 modules,
-7,491 call sites.** Small enough to read in a sitting, which makes it a fair place to
+7,501 call sites.** Small enough to read in a sitting, which makes it a fair place to
 check whether the answers are actually right.
 
 Timings are best-of-five on a warm page cache. The graph is rebuilt from source
@@ -274,23 +274,23 @@ $ ctx doctor
 Modules: 37  (markdown 6, python 4, rust 27)
 
 ## Internal recall — the number to trust
-  1521/1606 = 94.7%   of call sites that could be internal, ctx pinned this many.
+  1521/1608 = 94.6%   of call sites that could be internal, ctx pinned this many.
 
 A call site is "could be internal" when the callee name is defined somewhere
 under this root. Calls into std or a third-party crate are excluded, because no
 internal edge could exist for them however good the resolver gets.
 
 ## Every call site, bucketed
-call sites:            7491
+call sites:            7501
   internal edges:      1521   [29 heuristic (~), 0 dispatch fan-out (*)]
-  external (provable): 5885   (78.6%)  callee defined nowhere here — std/extern
-  unresolved internal: 85     (1.1%)  the real misses — see below
+  external (provable): 5893   (78.6%)  callee defined nowhere here — std/extern
+  unresolved internal: 87     (1.2%)  the real misses — see below
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
      50  walk
      11  context
-      8  group
+     10  group
       4  est_tokens
       3  path
       2  flatten
@@ -333,10 +333,10 @@ grep these; every other edge in the map is one ctx could prove.
   (supported: .rs .py .ts .tsx .js .jsx .mjs .cjs .go .java .md .markdown)
 ```
 
-94.7% recall comes with **the exact grep list for the other 5.3%** — twelve
+94.6% recall comes with **the exact grep list for the other 5.4%** — twelve
 names, with counts and the modules they live in.
 
-The denominator is honest too. 5,885 of 7,491 call sites go into `std` or a
+The denominator is honest too. 5,893 of 7,501 call sites go into `std` or a
 third-party crate, where no internal edge could ever exist, so they're excluded
 rather than quietly inflating the percentage. That classification is by evidence
 — *is this name defined anywhere under the root?* — not a hardcoded list.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guard the three facts that make the MCP registry listing work.
+"""Guard the facts that make the MCP registry listing and the npm route work.
 
 `server.json` is metadata about a crate that lives somewhere else: the registry
 hosts no artifacts, it points at crates.io and then verifies that the crate
@@ -76,6 +76,49 @@ else:
             )
             break
 
+# 4. The npm package name the README tells people to run must be the one dist
+#    actually publishes. The name is assembled from two files — `npm-scope` in
+#    dist-workspace.toml and `npm-package` in Cargo.toml — and spelled out a
+#    third time in README.md, so changing the scope or the package silently
+#    leaves the README advertising a package that does not exist. The install
+#    line is the first thing a reader runs, and `npx` on a wrong name fails
+#    with a 404 rather than anything that points at the cause.
+#
+#    Deliberately NOT asserting an npm entry in server.json: the registry
+#    proves npm ownership from an `mcpName` field in the published
+#    package.json, and dist's package.json template has no seam for a custom
+#    field, so the npm package cannot currently carry it. Declaring the package
+#    in server.json before that is solved would fail the whole publish and
+#    strand the cargo listing with it.
+dist_cfg = (ROOT / "dist-workspace.toml").read_text(encoding="utf-8")
+scope_match = re.search(r'^npm-scope = "([^"]+)"', dist_cfg, re.M)
+pkg_match = re.search(r'^npm-package = "([^"]+)"', cargo, re.M)
+
+if scope_match and pkg_match:
+    npm_name = f"{scope_match.group(1)}/{pkg_match.group(1)}"
+    if npm_name not in readme:
+        problems.append(
+            f"dist publishes the npm package `{npm_name}`, but README.md never "
+            "names it. The install instructions would point at nothing."
+        )
+elif scope_match or pkg_match:
+    problems.append(
+        "npm-scope (dist-workspace.toml) and npm-package (Cargo.toml) must be "
+        "set together; one without the other publishes under a name nobody "
+        "documented."
+    )
+else:
+    npm_name = None
+
+for pkg in server.get("packages", []):
+    if pkg.get("registryType") == "npm":
+        problems.append(
+            "server.json declares an npm package. The registry proves npm "
+            "ownership from an `mcpName` field in the published package.json, "
+            "which dist does not emit — verify the published package carries "
+            "it before listing it here, or the publish fails entirely."
+        )
+
 if problems:
     print("server.json / README.md registry metadata is WRONG:")
     for p in problems:
@@ -86,3 +129,5 @@ print(
     f"server.json current: {name} {crate_version}, "
     "ownership token present as visible text"
 )
+if npm_name:
+    print(f"npm route current: README documents {npm_name}")
