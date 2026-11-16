@@ -12,7 +12,19 @@ ci = "github"
 # `shell`/`powershell` are the primary install routes: unlike a browser-downloaded
 # archive, they do not set macOS's com.apple.quarantine attribute, so an unsigned
 # binary still runs. See the Gatekeeper note in README.md.
-installers = ["shell", "powershell", "homebrew"]
+#
+# `npm` is here for a reason that has nothing to do with JavaScript. Every
+# comparable MCP server is distributed on npm or PyPI, which means an agent can
+# TRY it in one command with nothing pre-installed: `npx -y <server>` or
+# `uvx <server>`. Measured across 800 registry servers, 131 of 141 packaged
+# entries are npm and 6 are PyPI; cargo had none. A crate-only tool asks for
+# `cargo install` plus a Rust toolchain BEFORE anything can be evaluated, and an
+# agent mid-session cannot conjure a toolchain. The npm package wraps the same
+# prebuilt archives these targets already produce, so `npx @eagle-logic/ctx mcp`
+# needs nothing but node.
+installers = ["shell", "powershell", "homebrew", "npm"]
+# Scoped because bare `ctx` and `code-context` are both already taken on npm.
+npm-scope = "@eagle-logic"
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = [
     "x86_64-unknown-linux-gnu",
@@ -31,7 +43,7 @@ tap = "Eagle-Logic/homebrew-tap"
 # Name the formula after the BINARY, not the crate, so the install line is
 # `brew install eagle-logic/tap/ctx` — what someone who heard "ctx" will type.
 formula = "ctx"
-publish-jobs = ["homebrew"]
+publish-jobs = ["homebrew", "npm"]
 # Where the shell/powershell installers put the binary
 install-path = "CARGO_HOME"
 # Publish jobs run on tag push; the GitHub Release is created by the workflow
