@@ -11,7 +11,7 @@ Not a regenerator: the table is prose with emphasis and thousands separators,
 and rewriting it mechanically is more fragile than checking it. Run from the
 repo root; the snippet figure is measured for this repo.
 """
-from _staleness import refuse_if_stale
+from _staleness import DOGFOOD_SCOPE, refuse_if_stale
 import json, pathlib, re, subprocess, sys
 
 CTX = "./target/release/ctx"
@@ -57,14 +57,34 @@ def doctor_excerpt_errors(readme: str) -> list[str]:
     picture tidier — so the quoted rows must be a contiguous PREFIX of the real
     ones, not merely a subset of them. A subset check would have called that
     dropped row fine.
+
+    It must also carry doctor's own `SCOPE:` line. The figures are measured at
+    `DOGFOOD_SCOPE`, which excludes the maintenance scripts and so reads HIGHER
+    than a whole-repo run. Publishing the narrowed number without the line that
+    names the filter would be the exact failure this file exists to prevent, and
+    a disclosure that lives only in prose is one edit from being gone. So it is
+    quoted from the real output and verified against it like any other row.
     """
-    out = subprocess.run([CTX, "doctor"], capture_output=True, text=True, check=True).stdout
+    out = subprocess.run([CTX, "doctor", *DOGFOOD_SCOPE], capture_output=True, text=True, check=True).stdout
     real = out.split("\n")
 
-    block = re.search(r"```\n(## Internal recall.*?)```", readme, re.S)
-    if not block:
+    # The fenced block that holds the excerpt, located from the heading outwards
+    # rather than by pairing fences. Pairing with a regex is wrong here: this
+    # file has ```sh blocks, whose OPENING fence carries a language tag and so
+    # does not match a bare ``` opener, while their CLOSING fence does — which
+    # offsets every pair after it and silently captured the wrong block. Walking
+    # out from a line that can only occur once is unambiguous.
+    lines = readme.split("\n")
+    try:
+        anchor = next(n for n, ln in enumerate(lines) if ln.startswith("## Internal recall"))
+    except StopIteration:
         return ["the `## Internal recall` doctor block is no longer in README.md"]
-    quoted = [ln for ln in block.group(1).split("\n") if ln.strip()]
+
+    opens = [n for n in range(anchor, -1, -1) if lines[n].strip() == "```"]
+    closes = [n for n in range(anchor, len(lines)) if lines[n].strip() == "```"]
+    if not opens or not closes:
+        return ["the `## Internal recall` block in README.md is not inside a ``` fence"]
+    quoted = [ln for ln in lines[opens[0] + 1 : closes[0]] if ln.strip()]
 
     def section(heading: str, row: str) -> list[str]:
         """Rows under `heading` in real output, until the first non-matching line."""
@@ -87,6 +107,21 @@ def doctor_excerpt_errors(readme: str) -> list[str]:
     real_zone = section("## Low-confidence zones", ZONE)
 
     errors = []
+
+    real_scope = next((ln for ln in real if ln.startswith("SCOPE:")), None)
+    quoted_scope = next((ln for ln in quoted if ln.startswith("SCOPE:")), None)
+    if real_scope and quoted_scope is None:
+        errors.append(
+            "the excerpt is missing doctor's `SCOPE:` line. These figures are "
+            "measured at a narrowed scope and read higher than a whole-repo "
+            f"run, so the disclosure has to travel with them:\n      {real_scope}"
+        )
+    elif quoted_scope and real_scope != quoted_scope:
+        errors.append(
+            "the quoted `SCOPE:` line does not match what doctor prints:\n"
+            f"      README: {quoted_scope}\n      actual: {real_scope or '(no filter)'}"
+        )
+
     for ln in quoted:
         if ln.startswith("#") or ln.startswith("grep these"):
             if ln not in real:

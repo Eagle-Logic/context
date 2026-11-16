@@ -17,8 +17,8 @@ leaves the remainder of the old output in place. That produced a block with two
 The three git-ref-dependent blocks are pinned at 0.20.0 by the file's own
 header and are left untouched.
 """
-from _staleness import refuse_if_stale
-import pathlib, re, subprocess, sys
+from _staleness import DOGFOOD_SCOPE, refuse_if_stale
+import pathlib, re, shlex, subprocess, sys
 
 CTX = "./target/release/ctx"
 PINNED = ("changed", "move-plan", "parity")
@@ -45,7 +45,11 @@ while i < len(lines):
         print(f"no opening fence before: {line}", file=sys.stderr)
         sys.exit(1)
     out.append(line)
-    argv = line[2:].split()
+    # shlex, not .split(): a block's command can carry a quoted glob such as
+    # --exclude 'scripts/**', and splitting on whitespace would pass the quote
+    # characters through as part of the pattern, so the filter would silently
+    # match nothing. The displayed line stays a command someone can paste.
+    argv = shlex.split(line[2:])
     if argv[1] in PINNED:
         skipped.append(" ".join(argv))
         i += 1
@@ -79,7 +83,7 @@ def rewrite_prose_figures(text: str) -> str:
     the same duplicated-fact bug the extension list had in five places; the fix
     is the same one, which is to derive it.
     """
-    doc = subprocess.run([CTX, "doctor"], capture_output=True, text=True)
+    doc = subprocess.run([CTX, "doctor", *DOGFOOD_SCOPE], capture_output=True, text=True)
     if doc.returncode != 0:
         print(f"ctx doctor failed:\n{doc.stderr}", file=sys.stderr)
         sys.exit(1)
@@ -117,9 +121,17 @@ def rewrite_prose_figures(text: str) -> str:
         f"{n} {display.get(k, k)} file{'s' if n != 1 else ''}"
         for k, n in sorted(per_lang, key=lambda kv: -kv[1])
     )
+    # Named, because these counts are measured at DOGFOOD_SCOPE and the sentence
+    # otherwise reads as a description of the whole repository — which has
+    # Python files in it that this scope does not count.
+    #
+    # Deliberately one line with no newline in it: the regex below replaces to
+    # the end of the line, so a note that wrapped would survive the replacement
+    # and a second regeneration would append another copy. That happened.
+    scope_note = f" Scope: `{' '.join(DOGFOOD_SCOPE)}`." if DOGFOOD_SCOPE else ""
     new = (
         f"The repo under analysis: **{parts}, {total} modules,\n"
-        f"{int(sites.group(1)):,} call sites.**"
+        f"{int(sites.group(1)):,} call sites.**{scope_note}"
     )
     recall = re.search(r"^\s+(\d+)/(\d+) = ([\d.]+)%", doc.stdout, re.M)
     external = re.search(r"^\s+external \(provable\):\s+(\d+)", doc.stdout, re.M)
@@ -148,7 +160,10 @@ def rewrite_prose_figures(text: str) -> str:
 
     edits = [
         (
-            r"The repo under analysis: \*\*.*?call sites\.\*\*",
+            # `[^\n]*` so the scope note appended after `call sites.**` is part
+            # of what gets replaced. Without it the note is outside the match
+            # and every regeneration adds another.
+            r"The repo under analysis: \*\*.*?call sites\.\*\*[^\n]*",
             new,
             "the 'repo under analysis' sentence",
         ),
