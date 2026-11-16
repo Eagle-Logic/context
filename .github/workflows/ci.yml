@@ -201,9 +201,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked
 
+      # --exclude 'scripts/**' to match DOGFOOD_SCOPE in scripts/_staleness.py,
+      # which is what the README excerpt is measured and checked at. The reason
+      # is written out there; the reason it matters HERE is that a floor on a
+      # different number than the one published is two measurements that can
+      # drift apart, and the one with a threshold on it is the one nobody reads.
       - name: ctx doctor — coverage must not silently collapse
         run: |
-          ./target/debug/ctx doctor . | tee doctor.txt
+          ./target/debug/ctx doctor . --exclude 'scripts/**' | tee doctor.txt
           recall=$(sed -n 's#.*  \([0-9]*\)/\([0-9]*\) = \([0-9]*\)\.[0-9]*%.*#\3#p' doctor.txt | head -1)
           echo "internal recall: ${recall}%"
           # A floor, not a target. Catches a resolver regression that drops
@@ -214,6 +219,8 @@ jobs:
             exit 1
           fi
 
+      # NOT scoped. A broken link is a broken link wherever it is, and nothing
+      # about the recall-churn argument applies to markdown this repo ships.
       - name: ctx doctor — no broken links in the docs
         run: |
           if ./target/debug/ctx doctor . | grep -q "Broken links"; then

@@ -65,15 +65,17 @@ branch of a dynamic-dispatch fan-out is marked `*`. And `ctx doctor` names
 **every callee it could not pin at all**, with counts:
 
 ```
+SCOPE: FILTERED (--exclude 'scripts/**'). Files outside this filter were never scanned and are NOT counted as blind spots below. Re-run without filters for whole-repo coverage.
+
 ## Internal recall — the number to trust
-  1521/1611 = 94.4%   of call sites that could be internal, ctx pinned this many.
+  1508/1585 = 95.1%   of call sites that could be internal, ctx pinned this many.
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
      50  walk
-     13  group
      11  context
       4  est_tokens
+      3  path
 
 ## Low-confidence zones (edges to distrust — grep to confirm)
   parity                           18% heuristic (11/61 edges)
@@ -81,6 +83,15 @@ grep these; every other edge in the map is one ctx could prove.
   refactor                         5% heuristic (1/20 edges)
   extract                          2% heuristic (4/235 edges)
 ```
+
+**That first line is the point, not boilerplate.** This run excludes
+`scripts/**`, the Python tooling that writes and checks the figures in this
+file, because ctx's public surface is the CLI and the MCP server and a figure
+that moved every time a helper script changed taught only that the figure was
+noise. Excluding those files reads **higher** — 95.1% against 94.4% whole-repo —
+so ctx says so itself, naming the exact filter, and `ctx doctor .` with no flags
+still reports the unfiltered number. The excerpt is checked against live output
+including that line, so the narrowed scope cannot be published without it.
 
 The recall number comes with the exact grep list for everything it doesn't
 cover. The denominator is honest too: a call into `std` or a third-party crate

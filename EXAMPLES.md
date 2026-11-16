@@ -11,8 +11,8 @@ tree they were run against, so a version string dates them without making them
 current — this file had drifted a whole minor version before anyone noticed.
 Regenerate it in the release commit instead.
 
-The repo under analysis: **27 Rust files, 6 Markdown files, 5 Python files, 38 modules,
-7,517 call sites.** Small enough to read in a sitting, which makes it a fair place to
+The repo under analysis: **27 Rust files, 6 Markdown files, 33 modules,
+7,294 call sites.** Scope: `--exclude scripts/**`.
 check whether the answers are actually right.
 
 Timings are best-of-five on a warm page cache. The graph is rebuilt from source
@@ -268,28 +268,29 @@ visible. `--strict` exits non-zero for CI.
 The differentiator. Every tool guesses; this one tells you where.
 
 ```
-$ ctx doctor
+$ ctx doctor --exclude 'scripts/**'
 # ctx coverage report — /home/steve/projects/context
 
-Modules: 38  (markdown 6, python 5, rust 27)
+SCOPE: FILTERED (--exclude 'scripts/**'). Files outside this filter were never scanned and are NOT counted as blind spots below. Re-run without filters for whole-repo coverage.
+
+Modules: 33  (markdown 6, rust 27)
 
 ## Internal recall — the number to trust
-  1521/1611 = 94.4%   of call sites that could be internal, ctx pinned this many.
+  1508/1585 = 95.1%   of call sites that could be internal, ctx pinned this many.
 
 A call site is "could be internal" when the callee name is defined somewhere
 under this root. Calls into std or a third-party crate are excluded, because no
 internal edge could exist for them however good the resolver gets.
 
 ## Every call site, bucketed
-call sites:            7517
-  internal edges:      1521   [29 heuristic (~), 0 dispatch fan-out (*)]
-  external (provable): 5906   (78.6%)  callee defined nowhere here — std/extern
-  unresolved internal: 90     (1.2%)  the real misses — see below
+call sites:            7294
+  internal edges:      1508   [29 heuristic (~), 0 dispatch fan-out (*)]
+  external (provable): 5709   (78.3%)  callee defined nowhere here — std/extern
+  unresolved internal: 77     (1.1%)  the real misses — see below
 
 ## What ctx missed (callee names that exist here but went unpinned)
 grep these; every other edge in the map is one ctx could prove.
      50  walk
-     13  group
      11  context
       4  est_tokens
       3  path
@@ -307,9 +308,9 @@ grep these; every other edge in the map is one ctx could prove.
   extract::rust                      13 unresolved   (module recall 92%)
   extract::python                    10 unresolved   (module recall 85%)
   mcp                                10 unresolved   (module recall 89%)
-  scripts.regen-examples              7 unresolved   (module recall 42%)
   extract                             5 unresolved   (module recall 98%)
-  scripts.check-dockerfile            3 unresolved   (module recall 0%)
+  extract::java                       2 unresolved   (module recall 97%)
+  git                                 1 unresolved   (module recall 97%)
 
 ## Low-confidence zones (edges to distrust — grep to confirm)
   parity                           18% heuristic (11/61 edges)
@@ -333,10 +334,10 @@ grep these; every other edge in the map is one ctx could prove.
   (supported: .rs .py .ts .tsx .js .jsx .mjs .cjs .go .java .md .markdown)
 ```
 
-94.4% recall comes with **the exact grep list for the other 5.6%** — twelve
+95.1% recall comes with **the exact grep list for the other 4.9%** — eleven
 names, with counts and the modules they live in.
 
-The denominator is honest too. 5,906 of 7,517 call sites go into `std` or a
+The denominator is honest too. 5,709 of 7,294 call sites go into `std` or a
 third-party crate, where no internal edge could ever exist, so they're excluded
 rather than quietly inflating the percentage. That classification is by evidence
 — *is this name defined anywhere under the root?* — not a hardcoded list.
@@ -344,7 +345,7 @@ rather than quietly inflating the percentage. That classification is by evidence
 The honest bit isn't that coverage is high. It's that the gaps are enumerable.
 
 > `ctx` treats Markdown as part of the graph, which is why this file counts
-> toward the 38 modules above — a document about the tool is a node in the
+> toward the 33 modules above — a document about the tool is a node in the
 > graph the tool builds.
 
 ---

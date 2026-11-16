@@ -21,6 +21,36 @@ import pathlib
 import subprocess
 import sys
 
+# The scope every published self-measurement is taken at.
+#
+# ctx's public surface is the CLI and the MCP server — Rust. `scripts/` is the
+# maintenance tooling that writes and checks the figures, and ctx resolves it
+# badly: the 13 unresolved `group` call sites in the whole-repo report were all
+# in here, and `scripts/check-dockerfile.py` scored 0% module recall the day it
+# was added. So every edit to a helper moved the README's headline number and
+# failed CI until someone re-copied an excerpt, which taught exactly one lesson
+# — that the number is noise. A figure that moves for reasons unrelated to the
+# thing it measures stops being read.
+#
+# `--exclude 'scripts/**'` and not `--lang rust`: this keeps every LANGUAGE ctx
+# supports in scope, including the Markdown graph, so no extractor is hidden
+# from its own report. It removes files, not capabilities. Markdown was measured
+# and makes no difference to recall either way (94.4% with it, 94.4% without),
+# so there is no case for dropping it beyond the churn, and it is the subject of
+# a README section.
+#
+# This raises the published figure, 94.4% -> 95.1%, which is the direction that
+# deserves suspicion. Two things keep it honest: ctx prints `SCOPE: FILTERED`
+# naming the exact filter, and that line is part of the README excerpt the
+# checker verifies — so the narrowed scope cannot be published without the
+# disclosure next to it. The same `--exclude 'scripts/**'` already scopes the
+# `changed --api --strict` gate in CI, for the same reason written out there.
+#
+# What is NOT scoped this way: the broken-link check, which should cover every
+# file, and BENCHMARK.md, which measures seven third-party repositories and is
+# where ctx's Python quality is actually reported.
+DOGFOOD_SCOPE = ["--exclude", "scripts/**"]
+
 
 def refuse_if_stale(ctx: str) -> None:
     """Exit non-zero unless `ctx` was built from the sources now on disk."""
